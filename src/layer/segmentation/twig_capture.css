@@ -230,9 +230,14 @@
 /* The candidate a shared link was pointing at. Marked rather than selected:
    the reviewer may well disagree with the sender, so it is a signpost, not a
    state. */
+/* The row being looked at -- clicked here, or arrived at from a shared link.
+   Stronger than it was: at 0.09 alpha with a 2px bar it was easy to lose
+   while scrolling a few hundred rows, which is the one moment it has to be
+   findable. Still a tint rather than a block of colour, so the probability
+   and the chips stay readable on top of it. */
 .neuroglancer-twig-capture-row-shared {
-  box-shadow: inset 2px 0 0 #9cf;
-  background: rgba(100, 160, 220, 0.09);
+  box-shadow: inset 3px 0 0 #9cf;
+  background: rgba(100, 160, 220, 0.18);
 }
 
 /* "N syn" -- what a merge recovers. Green and brighter than the mito flag:

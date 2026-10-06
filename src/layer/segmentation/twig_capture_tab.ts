@@ -59,7 +59,10 @@ import type {
   DecisionTarget,
   Verdict,
 } from "#src/layer/segmentation/twig_capture_decisions.js";
-import { DecisionStore } from "#src/layer/segmentation/twig_capture_decisions.js";
+import {
+  DecisionStore,
+  decisionsAllowed,
+} from "#src/layer/segmentation/twig_capture_decisions.js";
 import { StatusMessage } from "#src/status.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { NullarySignal } from "#src/util/signal.js";
@@ -85,10 +88,13 @@ export const TWIG_CAPTURE_JSON_KEY = "twigCapture";
  *                runs, and a followed-forward root means the file may be
  *                named after a successor. This is what makes the tab
  *                non-empty.
- *   minProb, hideMito, mitoOnly, sortKey
+ *   minProb, mito, review, sortKey
  *                four scalars that decide WHICH rows are shown and in what
  *                order. Share "the top one by orphan synapses" without the
- *                sort and the row you meant is forty down.
+ *                sort and the row you meant is forty down. mito and review
+ *                are facets ("any" / ...); mito replaced an older pair of
+ *                hideMito/mitoOnly booleans, which restoreState still reads
+ *                so that links made before 2026-10-06 keep working.
  *   candidate    the candidate's target_segment_id, so the row can be
  *                highlighted. The segment id and not `cand_22`, because the
  *                cand_N numbering shifts with ordering and threshold.
@@ -107,8 +113,10 @@ export class TwigCaptureState {
   file = "";
   candidate = "";
   minProb = 0.75;
-  hideMito = false;
-  mitoOnly = false;
+  /** "any" | "hide" | "only" -- replaced the hideMito/mitoOnly pair. */
+  mito = "any";
+  /** "any" | "none" | "done" | "merge" | "no_merge" | "unsure". */
+  review = "any";
   sortKey = "prob";
 
   toJSON() {
@@ -120,8 +128,8 @@ export class TwigCaptureState {
     if (this.file) x.file = this.file;
     if (this.candidate) x.candidate = this.candidate;
     if (this.minProb !== 0.75) x.minProb = this.minProb;
-    if (this.hideMito) x.hideMito = true;
-    if (this.mitoOnly) x.mitoOnly = true;
+    if (this.mito !== "any") x.mito = this.mito;
+    if (this.review !== "any") x.review = this.review;
     if (this.sortKey !== "prob") x.sortKey = this.sortKey;
     return Object.keys(x).length ? x : undefined;
   }
@@ -140,8 +148,22 @@ export class TwigCaptureState {
     if (typeof o.candidate === "string") this.candidate = o.candidate;
     if (typeof o.minProb === "number" && Number.isFinite(o.minProb))
       this.minProb = o.minProb;
-    this.hideMito = o.hideMito === true;
-    this.mitoOnly = o.mitoOnly === true;
+    // Links made before 2026-10-06 carry the hideMito/mitoOnly booleans, and
+    // those links are already pasted into chats and tickets. Read them, then
+    // let the new key win if both somehow appear.
+    this.mito =
+      o.hideMito === true ? "hide" : o.mitoOnly === true ? "only" : "any";
+    if (["any", "hide", "only"].includes(o.mito)) this.mito = o.mito;
+    this.review = [
+      "any",
+      "none",
+      "done",
+      "merge",
+      "no_merge",
+      "unsure",
+    ].includes(o.review)
+      ? o.review
+      : "any";
     if (["prob", "size", "contact", "synapses"].includes(o.sortKey))
       this.sortKey = o.sortKey;
     this.changed.dispatch();
@@ -438,8 +460,8 @@ export class TwigCaptureTab extends Tab {
   private catalogStatus = document.createElement("span");
   private catalog: CatalogEntry[] = [];
   private catalogUrl = "";
-  private hideMitoBox: HTMLInputElement | undefined;
-  private mitoOnlyBox: HTMLInputElement | undefined;
+  private mitoSelect: HTMLSelectElement | undefined;
+  private reviewSelect: HTMLSelectElement | undefined;
   private mergeAllButton = document.createElement("button");
   /** candidate id -> outcome, so a row is not offered twice. */
   private mergeStatus = new Map<
@@ -486,8 +508,8 @@ export class TwigCaptureTab extends Tab {
 
   // filters
   private minProb = 0.75;
-  private hideMito = false;
-  private mitoOnly = false;
+  private mito = "any";
+  private review = "any";
   private sortKey: "prob" | "size" | "contact" | "synapses" = "prob";
 
   /**
@@ -502,8 +524,8 @@ export class TwigCaptureTab extends Tab {
     t.catalogUrl = this.catalogUrl;
     t.file = this.active?.name ?? "";
     t.minProb = this.minProb;
-    t.hideMito = this.hideMito;
-    t.mitoOnly = this.mitoOnly;
+    t.mito = this.mito;
+    t.review = this.review;
     t.sortKey = this.sortKey;
     t.changed.dispatch();
   }
@@ -514,8 +536,8 @@ export class TwigCaptureTab extends Tab {
     // the shared link's values rather than snapping to them afterwards.
     const saved = layer.twigCapture;
     this.minProb = saved.minProb;
-    this.hideMito = saved.hideMito;
-    this.mitoOnly = saved.mitoOnly;
+    this.mito = saved.mito;
+    this.review = saved.review;
     this.sortKey = saved.sortKey as typeof this.sortKey;
     const { element } = this;
     element.classList.add("neuroglancer-twig-capture-tab");
@@ -765,45 +787,75 @@ export class TwigCaptureTab extends Tab {
       },
       "Minimum merge probability",
     );
-    // hide-mito and mito-only are opposite views of the same flag, so ticking
-    // one clears the other rather than producing an empty list.
-    const mitoNote =
-      "likely_mito = enclosure > 0.6 and mean EM < 100. Provisional: derived " +
-      "from the GT distribution, not from a reviewed sample.";
-    const addMitoToggle = (
+    // Two facets, each a SELECT rather than checkboxes.
+    //
+    // hide-mito and mito-only were a pair of booleans that could both be
+    // ticked, which showed nothing at all and needed each to clear the other
+    // on change. A tri-state cannot express the contradiction in the first
+    // place. The same argument rules out a multi-select for review state:
+    // "reviewed" and "not reviewed" together mean either everything or
+    // nothing, depending on how you read it, and neither reading is useful.
+    //
+    // Review folds the verdicts in as extra options rather than a third
+    // control, because "show me the unsure ones" is the question a reviewer
+    // actually asks, and it is mutually exclusive with the others anyway.
+    const addFacet = (
       label: string,
-      get: () => boolean,
-      set: (v: boolean) => void,
-      clear: () => void,
+      title: string,
+      options: [string, string][],
+      get: () => string,
+      set: (v: string) => void,
     ) => {
       const wrap = document.createElement("label");
-      wrap.title = mitoNote;
-      const box = document.createElement("input");
-      box.type = "checkbox";
-      box.checked = get();
-      box.addEventListener("change", () => {
-        set(box.checked);
-        if (box.checked) clear();
+      wrap.textContent = label;
+      wrap.title = title;
+      const sel = document.createElement("select");
+      for (const [value, text] of options) {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = text;
+        sel.appendChild(opt);
+      }
+      sel.value = get();
+      sel.addEventListener("change", () => {
+        set(sel.value);
         this.publish();
-        this.renderFilters();
         this.render();
       });
-      wrap.appendChild(box);
-      wrap.appendChild(document.createTextNode(label));
+      wrap.appendChild(sel);
       row.appendChild(wrap);
-      return box;
+      return sel;
     };
-    this.hideMitoBox = addMitoToggle(
-      "hide mito",
-      () => this.hideMito,
-      (v) => (this.hideMito = v),
-      () => (this.mitoOnly = false),
+
+    this.mitoSelect = addFacet(
+      "mito",
+      "likely_mito = enclosure > 0.6 and mean EM < 100. Provisional: derived " +
+        "from the GT distribution, not from a reviewed sample.",
+      [
+        ["any", "any"],
+        ["hide", "hide mito"],
+        ["only", "mito only"],
+      ],
+      () => this.mito,
+      (v) => (this.mito = v),
     );
-    this.mitoOnlyBox = addMitoToggle(
-      "mito only",
-      () => this.mitoOnly,
-      (v) => (this.mitoOnly = v),
-      () => (this.hideMito = false),
+
+    this.reviewSelect = addFacet(
+      "review",
+      "Filters on decisions recorded in twig_capture_decisions (CAVE) for " +
+        "this neuron, including other people's. Disabled when decisions are " +
+        "not enabled for this segmentation source, since nothing is loaded " +
+        "and every row would look unreviewed.",
+      [
+        ["any", "any"],
+        ["none", "not reviewed"],
+        ["done", "reviewed"],
+        ["merge", "merge"],
+        ["no_merge", "not a merge"],
+        ["unsure", "unsure"],
+      ],
+      () => this.review,
+      (v) => (this.review = v),
     );
 
     const sortWrap = document.createElement("label");
@@ -900,6 +952,17 @@ export class TwigCaptureTab extends Tab {
     // numbering shifts with threshold and sort order, the id does not.
     this.layer.twigCapture.candidate = candidate.target_segment_id;
     this.layer.twigCapture.changed.dispatch();
+    // Re-render so the row marks itself as the one being looked at. Nothing
+    // listens to twigCapture.changed here, so without this the highlight only
+    // appeared on the NEXT render -- after a merge or a filter change -- which
+    // made it look like it was tracking something else entirely.
+    //
+    // scrolledToShared is set first: the reader just clicked this row, so it
+    // is on screen, and scrolling it to centre would yank the list under the
+    // cursor for no reason. The once-only scroll exists for shared links,
+    // where the row may be hundreds down.
+    this.scrolledToShared = true;
+    this.render();
     const position = this.nmToPosition(candidate.coordinate_nm);
     if (position === undefined) {
       StatusMessage.showTemporaryMessage(
@@ -924,7 +987,7 @@ export class TwigCaptureTab extends Tab {
         this.activeTargetRoot ?? BigInt(this.active!.root_id),
         BigInt(candidate.target_segment_id),
       ];
-    } catch (e) {
+    } catch {
       StatusMessage.showTemporaryMessage(
         `Twig Capture: "${candidate.target_segment_id}" is not a valid segment id.`,
         4000,
@@ -976,12 +1039,16 @@ export class TwigCaptureTab extends Tab {
     }
   }
 
-  /** Re-sync the checkboxes after one of them clears the other. */
+  /**
+   * Re-sync the facet selects with state restored from a link, and grey out
+   * the review facet when there are no decisions to filter on.
+   */
   private renderFilters() {
-    if (this.hideMitoBox !== undefined)
-      this.hideMitoBox.checked = this.hideMito;
-    if (this.mitoOnlyBox !== undefined)
-      this.mitoOnlyBox.checked = this.mitoOnly;
+    if (this.mitoSelect !== undefined) this.mitoSelect.value = this.mito;
+    if (this.reviewSelect !== undefined) {
+      this.reviewSelect.value = this.review;
+      this.reviewSelect.disabled = !this.decisionsAllowed();
+    }
   }
 
   /**
@@ -1201,6 +1268,22 @@ export class TwigCaptureTab extends Tab {
     return undefined;
   }
 
+  /** Every data source URL on this layer. */
+  private sourceUrls(): string[] {
+    return this.layer.dataSources.map((ds) => ds.spec?.url ?? "");
+  }
+
+  /**
+   * Is this layer one we are allowed to record decisions for?
+   *
+   * See DECISION_ALLOWLIST. Decisions are ground truth, and a row posted
+   * against the wrong volume is a false label nothing in the row would
+   * reveal, so an un-vouched-for volume gets no verdict control and no write.
+   */
+  private decisionsAllowed(): boolean {
+    return decisionsAllowed(this.sourceUrls());
+  }
+
   /** The decision store for the active result, or undefined with a reason. */
   private store(): DecisionStore | undefined {
     const datastack = this.active?.dataset;
@@ -1223,11 +1306,45 @@ export class TwigCaptureTab extends Tab {
    * review, not a prerequisite for doing any. A reviewer with no CAVE
    * credentials can still read candidates and merge.
    */
+  /**
+   * The neuron's root TODAY, for querying CAVE.
+   *
+   * NOT result.root_id. That is a snapshot from when inference ran, and a
+   * root is a version rather than an identity: one merge in this tab retires
+   * it. CAVE's live query rejects a retired root outright --
+   * "Some root_ids passed are not valid at the query timestamp" -- so using
+   * the file's id made decisions fail to load immediately after any merge.
+   *
+   * Resolved the same way refreshAgainstGraph does it: from a sink
+   * SUPERVOXEL, which is immutable. activeTargetRoot is preferred when set
+   * because it reflects merges made in this session without another round
+   * trip. Falls back to the file's root only when there is no graph to ask,
+   * which is also the only case where it can still be stale.
+   */
+  private async currentNeuronRoot(result: TwigResult): Promise<string> {
+    if (this.activeTargetRoot !== undefined)
+      return String(this.activeTargetRoot);
+    const graph = this.graphene();
+    const anySink = result.candidates.find((c) => c.merge_sink)?.merge_sink;
+    if (graph?.getRoot !== undefined && anySink) {
+      try {
+        return String(await graph.getRoot(BigInt(anySink.supervoxel_id)));
+      } catch {
+        // Fall through: a failed lookup should cost the decisions panel, not
+        // the refresh that is about to run anyway.
+      }
+    }
+    return result.root_id;
+  }
+
   private async loadDecisions(result: TwigResult) {
+    if (!this.decisionsAllowed()) return;
     const store = this.store();
     if (store === undefined) return;
     try {
-      const found = await store.fetchForNeuron(result.root_id);
+      const root = await this.currentNeuronRoot(result);
+      if (this.active !== result) return;
+      const found = await store.fetchForNeuron(root);
       if (this.active !== result) return;
       this.decisions = found;
       this.render();
@@ -1252,6 +1369,17 @@ export class TwigCaptureTab extends Tab {
     verdict: Verdict,
     op?: string,
   ): Promise<boolean> {
+    if (!this.decisionsAllowed()) {
+      // The control is hidden for these layers, so reaching here means a
+      // stale render or a caller that did not check. Refuse loudly rather
+      // than write ground truth against an unvouched volume.
+      StatusMessage.showTemporaryMessage(
+        "Twig Capture: decisions are not enabled for this segmentation " +
+          "source, so nothing was written. See DECISION_ALLOWLIST.",
+        6000,
+      );
+      return false;
+    }
     const result = this.active;
     const store = this.store();
     if (result === undefined || store === undefined) {
@@ -1446,7 +1574,14 @@ export class TwigCaptureTab extends Tab {
       // than an opinion. Deliberately not awaited into the merge's own
       // success: a failed POST must not make a completed merge look failed.
       // recordDecision reports its own failure loudly.
-      void this.recordDecision(candidate, "merge", operationId);
+      //
+      // Skipped silently on a volume that is not in DECISION_ALLOWLIST: the
+      // merge is perfectly valid there, there is simply nowhere vouched-for
+      // to record it, and an error toast after every successful merge would
+      // train people to ignore toasts.
+      if (this.decisionsAllowed()) {
+        void this.recordDecision(candidate, "merge", operationId);
+      }
       if (operationId !== undefined) {
         this.history.set(candidate.id, { operationId, undone: false });
       }
@@ -1481,8 +1616,23 @@ export class TwigCaptureTab extends Tab {
       // num_l2_nodes is still shown on every row, and the changed-hands
       // dialog still quotes it.
       const mito = c.likely_mito === true;
-      if (this.hideMito && mito) return false;
-      if (this.mitoOnly && !mito) return false;
+      if (this.mito === "hide" && mito) return false;
+      if (this.mito === "only" && !mito) return false;
+      // Review state. Skipped entirely when decisions are not enabled for
+      // this layer: this.decisions is then empty by construction, and
+      // filtering on it would hide every row while claiming they are all
+      // unreviewed, which is a lie rather than an empty result.
+      if (this.review !== "any" && this.decisionsAllowed()) {
+        const d = this.decisions.get(c.target_segment_id);
+        if (this.review === "none" && d !== undefined) return false;
+        if (this.review === "done" && d === undefined) return false;
+        if (
+          ["merge", "no_merge", "unsure"].includes(this.review) &&
+          d?.tag !== this.review
+        ) {
+          return false;
+        }
+      }
       return true;
     });
     const key = this.sortKey;
@@ -1503,6 +1653,9 @@ export class TwigCaptureTab extends Tab {
   }
 
   private render() {
+    // Keeps the facet selects in step with state restored from a link, and
+    // disables `review` once we know whether any decisions can be loaded.
+    this.renderFilters();
     // file chooser
     removeChildren(this.fileSelect);
     for (const result of this.results) {
@@ -1577,7 +1730,9 @@ export class TwigCaptureTab extends Tab {
     if (candidate.likely_mito) {
       row.classList.add("neuroglancer-twig-capture-row-mito");
     }
-    // The row a shared link was pointing at. Marked, and scrolled to once --
+    // The row being looked at: either clicked here, or pointed at by a shared
+    // link. Both are the same thing -- twigCapture.candidate is what a link
+    // carries and what goTo sets. Marked, and scrolled to once --
     // a link that says "look at this one" should not land the reader at the
     // top of four hundred rows. Cleared after scrolling so that later
     // re-renders, e.g. after a merge, do not keep yanking the list back.
@@ -1724,6 +1879,7 @@ export class TwigCaptureTab extends Tab {
     // a reviewer is actually scanning. The select is revealed on hover (see
     // twig_capture.css); the chip above is what shows a recorded verdict at
     // rest, so nothing is hidden, only the means of changing it.
+    const allowed = this.decisionsAllowed();
     const verdictWrap = document.createElement("span");
     verdictWrap.classList.add("neuroglancer-twig-capture-verdict");
     const select = document.createElement("select");
@@ -1740,9 +1896,21 @@ export class TwigCaptureTab extends Tab {
       const opt = document.createElement("option");
       opt.value = value;
       opt.textContent = label;
+      if (value === "") {
+        // The placeholder is a LABEL for the closed select, not a choice.
+        // `disabled` stops it being picked, `hidden` keeps it out of the open
+        // list; a hidden option that is selected still shows its text while
+        // the select is closed, which is the whole trick. Without both it sat
+        // in the menu as a third, meaningless item.
+        opt.disabled = true;
+        opt.hidden = true;
+      }
       select.appendChild(opt);
     }
-    select.value = "";
+    // selectedIndex rather than value="": `disabled` does not block a
+    // programmatic selection, but going through the index says plainly that
+    // we mean "back to the placeholder" and does not depend on that nuance.
+    select.selectedIndex = 0;
     select.addEventListener("click", (event: MouseEvent) => {
       // The row's own click handler jumps the viewer; opening the select
       // should not also move the camera.
@@ -1754,12 +1922,12 @@ export class TwigCaptureTab extends Tab {
       // Back to the placeholder straight away: the select is a verb, not a
       // state display. What was recorded is shown by the chip, which is the
       // only thing that reflects what is actually in CAVE.
-      select.value = "";
+      select.selectedIndex = 0;
       if (chosen === "") return;
       void this.recordDecision(candidate, chosen);
     });
     verdictWrap.appendChild(select);
-    main.appendChild(verdictWrap);
+    if (allowed) main.appendChild(verdictWrap);
 
     if (status === "failed") {
       row.classList.add("neuroglancer-twig-capture-row-failed");

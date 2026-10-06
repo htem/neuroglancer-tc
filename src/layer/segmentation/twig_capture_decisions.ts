@@ -45,6 +45,46 @@
 
 const TABLE = "twig_capture_decisions";
 
+/**
+ * The ONLY segmentation sources whose decisions may be written to CAVE.
+ *
+ * Decisions are ground truth. A row posted against the wrong volume is not
+ * merely useless, it is a false label in a table someone will later train on,
+ * and nothing in the row itself would reveal the mistake -- the supervoxels
+ * would resolve, the positions would look plausible, and the datastack name
+ * comes from the result file rather than from the layer.
+ *
+ * So the rule is an allowlist, not a denylist: a volume nobody has vouched
+ * for gets no verdict control and is refused by the writer. Add an entry
+ * deliberately, after checking that twig_capture_decisions exists on that
+ * datastack.
+ *
+ * Matched as a substring of the layer's data source URL, which for a graphene
+ * layer looks like
+ *   graphene://middleauth+https://cave.fanc-fly.com/segmentation/table/<table>
+ */
+export const DECISION_ALLOWLIST: readonly string[] = [
+  // BANC
+  "https://cave.fanc-fly.com/segmentation/table/wclee_fly_cns_001",
+];
+
+/**
+ * May decisions be recorded for a layer with these data source URLs?
+ *
+ * Checked in TWO places on purpose: the tab hides the verdict control, and
+ * the writer refuses the post. Hiding a button is a courtesy, not a
+ * safeguard -- a stale render, a keyboard path or a future caller would walk
+ * straight past it.
+ */
+export function decisionsAllowed(urls: readonly string[]): boolean {
+  for (const url of urls) {
+    for (const allowed of DECISION_ALLOWLIST) {
+      if (url.includes(allowed)) return true;
+    }
+  }
+  return false;
+}
+
 export type Verdict = "merge" | "no_merge" | "unsure";
 
 export interface DecisionRow {
@@ -80,6 +120,26 @@ function ctrVoxels(nm: readonly number[]): string {
 export function candOf(tag2: string): string {
   const m = /(?:^|;)cand=([^;]*)/.exec(tag2);
   return m === null ? "" : m[1];
+}
+
+/**
+ * The useful sentence out of a CAVE error body.
+ *
+ * These responses carry the server's own Python traceback in a JSON array,
+ * so the raw text is thousands of characters of stack frames with the actual
+ * complaint at the front. A toast showing the first 200 characters showed
+ * mostly `{"code": 500, "traceback": ["Traceback (most recent call last)...`
+ * and cut off before anything a reader could act on.
+ */
+async function caveError(response: Response): Promise<string> {
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed?.message === "string") return parsed.message;
+  } catch {
+    // Not JSON; fall through to the raw text.
+  }
+  return text.slice(0, 200);
 }
 
 export class DecisionStore {
@@ -173,7 +233,7 @@ export class DecisionStore {
     if (!response.ok) {
       throw new Error(
         `CAVE refused the decision (${response.status}): ` +
-          `${(await response.text()).slice(0, 200)}`,
+          `${await caveError(response)}`,
       );
     }
     const out = await response.json();
@@ -212,7 +272,7 @@ export class DecisionStore {
     if (!response.ok) {
       throw new Error(
         `CAVE query failed (${response.status}): ` +
-          `${(await response.text()).slice(0, 200)}`,
+          `${await caveError(response)}`,
       );
     }
     const rows = await response.json();
