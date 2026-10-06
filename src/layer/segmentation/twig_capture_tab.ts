@@ -42,9 +42,24 @@
  * run_twigcapture.py recorded, which is a real edit to shared data, attributed
  * to whoever clicked and visible to everyone. Undo is itself a further edit,
  * not a retraction. Treat every button in here as live.
+ *
+ * DECISIONS are written to the CAVE table twig_capture_decisions -- see
+ * twig_capture_decisions.ts. "Not a merge" and "Unsure" record a judgement
+ * and change nothing else; merging records `merge` WITH the operation id, so
+ * every row claiming a merge is backed by a real edit. Decisions for the
+ * loaded neuron are fetched on load and on Refresh, which is what stops ten
+ * reviewers redoing each other's work. A failure to read or write them is
+ * reported but never blocks reviewing: the table is a record of review, not a
+ * prerequisite for it.
  */
 
 import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
+import type {
+  DecisionRow,
+  DecisionTarget,
+  Verdict,
+} from "#src/layer/segmentation/twig_capture_decisions.js";
+import { DecisionStore } from "#src/layer/segmentation/twig_capture_decisions.js";
 import { StatusMessage } from "#src/status.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { NullarySignal } from "#src/util/signal.js";
@@ -432,6 +447,16 @@ export class TwigCaptureTab extends Tab {
     "merging" | "done" | "failed" | "already"
   >();
   private refreshButton = document.createElement("button");
+
+  /**
+   * Decisions already recorded in CAVE for the active neuron, keyed by
+   * target_segment_id. Refilled on load and on Refresh, so a reviewer sees
+   * what other people have already judged instead of redoing it.
+   */
+  private decisions = new Map<string, DecisionRow>();
+  private decisionStore: DecisionStore | undefined;
+  /** Candidates whose decision POST is in flight, so the row can show it. */
+  private deciding = new Set<string>();
   /** The target neuron's root TODAY; changes with every merge in this tab. */
   private activeTargetRoot: bigint | undefined;
   /**
@@ -1053,6 +1078,10 @@ export class TwigCaptureTab extends Tab {
     const graph = this.graphene();
     const result = loadedFor ?? this.active;
     if (result === undefined) return;
+    // Decisions are independent of the graph check: they come from CAVE, not
+    // the chunkedgraph, and a layer with no graph can still show what other
+    // reviewers have already judged. Kick it off before the early return.
+    void this.loadDecisions(result);
     if (graph?.getRoot === undefined) {
       if (loadedFor === undefined) {
         StatusMessage.showTemporaryMessage(
@@ -1150,6 +1179,127 @@ export class TwigCaptureTab extends Tab {
       this.checking = undefined;
       this.refreshButton.disabled = false;
       this.refreshButton.textContent = "Refresh";
+      this.render();
+    }
+  }
+
+  /**
+   * The CAVE server this layer talks to, taken from the data source URL.
+   *
+   * A graphene source looks like
+   *   graphene://middleauth+https://cave.fanc-fly.com/segmentation/...
+   * so the first http(s) origin in any source is the CAVE deployment. Derived
+   * rather than hardcoded because Aedes and BANC are different datastacks,
+   * and a wrong server would write decisions into someone else's project.
+   */
+  private caveServer(): string | undefined {
+    for (const ds of this.layer.dataSources) {
+      const url = ds.spec?.url ?? "";
+      const m = /https?:\/\/[^/\s]+/.exec(url);
+      if (m !== null) return m[0];
+    }
+    return undefined;
+  }
+
+  /** The decision store for the active result, or undefined with a reason. */
+  private store(): DecisionStore | undefined {
+    const datastack = this.active?.dataset;
+    const server = this.caveServer();
+    if (datastack === undefined || server === undefined) return undefined;
+    if (
+      this.decisionStore === undefined ||
+      this.decisionStore.datastack !== datastack ||
+      this.decisionStore.server !== server
+    ) {
+      this.decisionStore = new DecisionStore(server, datastack);
+    }
+    return this.decisionStore;
+  }
+
+  /**
+   * Load every decision recorded against this neuron.
+   *
+   * Failure is reported but never fatal: the decision table is a record of
+   * review, not a prerequisite for doing any. A reviewer with no CAVE
+   * credentials can still read candidates and merge.
+   */
+  private async loadDecisions(result: TwigResult) {
+    const store = this.store();
+    if (store === undefined) return;
+    try {
+      const found = await store.fetchForNeuron(result.root_id);
+      if (this.active !== result) return;
+      this.decisions = found;
+      this.render();
+    } catch (e) {
+      StatusMessage.showTemporaryMessage(
+        `Twig Capture: could not read decisions: ${e}`,
+        5000,
+      );
+    }
+  }
+
+  /**
+   * Record one verdict in CAVE.
+   *
+   * `op` is set only when the merge was actually executed, so a row carrying
+   * op= is evidence an edit happened and a row without it is a judgement
+   * alone. The table is append-only: reviewing the same candidate twice
+   * leaves both rows and the later one wins, which keeps the audit trail.
+   */
+  private async recordDecision(
+    candidate: TwigCandidate,
+    verdict: Verdict,
+    op?: string,
+  ): Promise<boolean> {
+    const result = this.active;
+    const store = this.store();
+    if (result === undefined || store === undefined) {
+      StatusMessage.showTemporaryMessage(
+        "Twig Capture: no CAVE datastack for this layer; decision not saved.",
+        5000,
+      );
+      return false;
+    }
+    const sink = candidate.merge_sink;
+    const source = candidate.merge_source;
+    if (!sink || !source) {
+      StatusMessage.showTemporaryMessage(
+        "Twig Capture: this result file has no merge_sink / merge_source, so " +
+          "the two sides cannot be bound. Re-run run_twigcapture.py.",
+        6000,
+      );
+      return false;
+    }
+    // The result file stem, which is what src= has to point at.
+    const src = result.name.replace(/\.json$/, "");
+    const target: DecisionTarget = {
+      sink,
+      source,
+      coordinate_nm: candidate.coordinate_nm,
+      cand: candidate.target_segment_id,
+      src,
+    };
+    this.deciding.add(candidate.target_segment_id);
+    this.render();
+    try {
+      const id = await store.post(target, verdict, op);
+      this.decisions.set(candidate.target_segment_id, {
+        id,
+        tag: verdict,
+        cand: candidate.target_segment_id,
+        tag2: `src=${src};cand=${candidate.target_segment_id}`,
+        created: Date.now(),
+      });
+      return true;
+    } catch (e) {
+      StatusMessage.showTemporaryMessage(
+        `Twig Capture: decision NOT saved: ${e}`,
+        7000,
+      );
+      return false;
+    } finally {
+      this.deciding.delete(candidate.target_segment_id);
       this.render();
     }
   }
@@ -1291,6 +1441,12 @@ export class TwigCaptureTab extends Tab {
       });
       this.activeTargetRoot = newRoot;
       this.mergeStatus.set(candidate.id, "done");
+      // The edit happened; record the judgement that caused it, carrying the
+      // operation id so the row is evidence of a real graph change rather
+      // than an opinion. Deliberately not awaited into the merge's own
+      // success: a failed POST must not make a completed merge look failed.
+      // recordDecision reports its own failure loudly.
+      void this.recordDecision(candidate, "merge", operationId);
       if (operationId !== undefined) {
         this.history.set(candidate.id, { operationId, undone: false });
       }
@@ -1537,6 +1693,73 @@ export class TwigCaptureTab extends Tab {
       });
       main.appendChild(undo);
     }
+
+    // ---- the recorded verdict, and the two buttons that set it -----------
+    //
+    // There is no "merge" button here on purpose. Merging IS the merge
+    // verdict: doMerge records it with the operation id, so a row claiming
+    // `merge` is always backed by a real graph edit. A separate button that
+    // said "merge" without merging would produce rows nobody could tell
+    // apart from executed ones.
+    const decided = this.decisions.get(candidate.target_segment_id);
+    const pending = this.deciding.has(candidate.target_segment_id);
+    if (decided !== undefined) {
+      const chip = document.createElement("span");
+      chip.classList.add("neuroglancer-twig-capture-tag");
+      if (decided.tag === "no_merge") {
+        chip.classList.add("neuroglancer-twig-capture-tag-warn");
+      }
+      chip.textContent = decided.tag;
+      chip.title =
+        `Recorded in CAVE as "${decided.tag}" (annotation ${decided.id}). ` +
+        "Reviewing again adds a new row; the latest wins.";
+      main.appendChild(chip);
+    }
+    // The non-merge verdicts live in a select, not in buttons.
+    //
+    // Merge stays a button because it is the primary action and it writes to
+    // the shared graph -- a destructive edit should not be one mis-click
+    // inside a list. The other two are rarer and were costing every one of
+    // several hundred rows two permanent controls, which drowned the numbers
+    // a reviewer is actually scanning. The select is revealed on hover (see
+    // twig_capture.css); the chip above is what shows a recorded verdict at
+    // rest, so nothing is hidden, only the means of changing it.
+    const verdictWrap = document.createElement("span");
+    verdictWrap.classList.add("neuroglancer-twig-capture-verdict");
+    const select = document.createElement("select");
+    select.classList.add("neuroglancer-twig-capture-merge");
+    select.disabled = pending;
+    select.title =
+      "Record a verdict in twig_capture_decisions (CAVE), attributed to you. " +
+      "This does not change the segmentation.";
+    for (const [value, label] of [
+      ["", pending ? "\u2026" : "Mark\u2026"],
+      ["no_merge", "Not a merge"],
+      ["unsure", "Unsure"],
+    ]) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = label;
+      select.appendChild(opt);
+    }
+    select.value = "";
+    select.addEventListener("click", (event: MouseEvent) => {
+      // The row's own click handler jumps the viewer; opening the select
+      // should not also move the camera.
+      event.stopPropagation();
+    });
+    select.addEventListener("change", (event: Event) => {
+      event.stopPropagation();
+      const chosen = select.value as Verdict | "";
+      // Back to the placeholder straight away: the select is a verb, not a
+      // state display. What was recorded is shown by the chip, which is the
+      // only thing that reflects what is actually in CAVE.
+      select.value = "";
+      if (chosen === "") return;
+      void this.recordDecision(candidate, chosen);
+    });
+    verdictWrap.appendChild(select);
+    main.appendChild(verdictWrap);
 
     if (status === "failed") {
       row.classList.add("neuroglancer-twig-capture-row-failed");

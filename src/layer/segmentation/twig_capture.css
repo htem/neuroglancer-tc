@@ -241,3 +241,24 @@
   color: #7fd;
   border-color: #275;
 }
+
+/*
+ * The verdict select is revealed on hover, not shown permanently.
+ *
+ * Several hundred rows each carrying two extra controls buried the numbers a
+ * reviewer scans. Hidden with opacity rather than display:none so the row's
+ * layout does not shift when the pointer arrives -- a row that reflows under
+ * the cursor is how you mis-click Merge.
+ *
+ * :focus-within keeps it visible for keyboard users and while the dropdown is
+ * open, since the pointer may leave the row to reach the option list.
+ */
+.neuroglancer-twig-capture-verdict {
+  opacity: 0;
+  transition: opacity 0.08s linear;
+}
+
+.neuroglancer-twig-capture-row:hover .neuroglancer-twig-capture-verdict,
+.neuroglancer-twig-capture-verdict:focus-within {
+  opacity: 1;
+}
