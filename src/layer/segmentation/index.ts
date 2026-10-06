@@ -15,6 +15,7 @@
  */
 
 import "#src/layer/segmentation/style.css";
+import "#src/layer/segmentation/twig_capture.css";
 
 import type { CoordinateTransformSpecification } from "#src/coordinate_transform.js";
 import { emptyValidCoordinateSpace } from "#src/coordinate_transform.js";
@@ -72,6 +73,11 @@ import type {
   SegmentationGraphSource,
   SegmentationGraphSourceConnection,
 } from "#src/segmentation_graph/source.js";
+import {
+  TWIG_CAPTURE_JSON_KEY,
+  TwigCaptureState,
+  TwigCaptureTab,
+} from "#src/layer/segmentation/twig_capture_tab.js";
 import { SegmentationGraphSourceTab } from "#src/segmentation_graph/source.js";
 import { SharedDisjointUint64Sets } from "#src/shared_disjoint_sets.js";
 import { SharedWatchableValue } from "#src/shared_watchable_value.js";
@@ -621,6 +627,8 @@ interface SegmentationActionContext extends LayerActionContext {
 
 const Base = UserLayerWithAnnotationsMixin(UserLayer);
 export class SegmentationUserLayer extends Base {
+  /** Shareable Twig Capture state; see TwigCaptureState. */
+  twigCapture = new TwigCaptureState();
   sliceViewRenderScaleHistogram = new RenderScaleHistogram();
   sliceViewRenderScaleTarget = trackableRenderScaleTarget(1);
   codeVisible = new TrackableBoolean(true);
@@ -749,6 +757,19 @@ export class SegmentationUserLayer extends Base {
       label: "Graph",
       order: -25,
       getter: () => new SegmentationGraphSourceTab(this),
+      hidden: hideGraphTab,
+    });
+    // Twig Capture rides on the same condition as the Graph tab: a layer with
+    // no segmentation graph cannot be proofread, so merge proposals against it
+    // would have nothing to merge into.
+    // The Twig Capture tab's shareable state. Owned by the layer because the
+    // tab is built lazily below and so may never exist, while the layer must
+    // serialise regardless. See TwigCaptureState for what it holds and why.
+    this.twigCapture.changed.add(this.specificationChanged.dispatch);
+    this.tabs.add("twigCapture", {
+      label: "Twig Capture",
+      order: -20,
+      getter: () => new TwigCaptureTab(this),
       hidden: hideGraphTab,
     });
     this.tabs.default = "rendering";
@@ -1012,6 +1033,7 @@ export class SegmentationUserLayer extends Base {
 
   restoreState(specification: any) {
     super.restoreState(specification);
+    this.twigCapture.restoreState(specification[TWIG_CAPTURE_JSON_KEY]);
     this.displayState.selectedAlpha.restoreState(
       specification[json_keys.SELECTED_ALPHA_JSON_KEY],
     );
@@ -1120,6 +1142,8 @@ export class SegmentationUserLayer extends Base {
       x[json_keys.LINKED_SEGMENTATION_COLOR_GROUP_JSON_KEY] =
         linkedSegmentationColorGroup.toJSON() ?? false;
     }
+    const twig = this.twigCapture.toJSON();
+    if (twig !== undefined) x[TWIG_CAPTURE_JSON_KEY] = twig;
     x[json_keys.EQUIVALENCES_JSON_KEY] =
       this.displayState.originalSegmentationGroupState.localGraph.toJSON();
     if (linkedSegmentationGroup.root.value === this) {

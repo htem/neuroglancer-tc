@@ -1,0 +1,243 @@
+/**
+ * @license
+ * Copyright 2026 Kevin Delgado
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+.neuroglancer-twig-capture-tab {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  font-size: 10pt;
+}
+
+.neuroglancer-twig-capture-controls,
+.neuroglancer-twig-capture-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+}
+
+.neuroglancer-twig-capture-filters label {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: #bbb;
+}
+
+.neuroglancer-twig-capture-filters input[type="number"] {
+  width: 4em;
+  background-color: #222;
+  color: #fff;
+  border: 1px solid #444;
+}
+
+.neuroglancer-twig-capture-url {
+  flex: 1;
+  min-width: 8em;
+  background-color: #222;
+  color: #fff;
+  border: 1px solid #444;
+}
+
+.neuroglancer-twig-capture-select {
+  background-color: #222;
+  color: #fff;
+  border: 1px solid #444;
+  max-width: 100%;
+}
+
+.neuroglancer-twig-capture-summary {
+  color: #9cf;
+  padding: 2px 0;
+  word-break: break-all;
+}
+
+.neuroglancer-twig-capture-count {
+  color: #888;
+  padding-bottom: 2px;
+}
+
+.neuroglancer-twig-capture-list {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.neuroglancer-twig-capture-hint {
+  color: #888;
+  padding: 6px 2px;
+}
+
+.neuroglancer-twig-capture-row {
+  border-top: 1px solid #333;
+  padding: 3px 2px;
+  cursor: pointer;
+}
+
+.neuroglancer-twig-capture-row:hover {
+  background-color: #333;
+}
+
+/* Flagged as a possible organelle rather than a twig. Tinted, never hidden:
+   the threshold is provisional and the reviewer decides. */
+.neuroglancer-twig-capture-row-mito {
+  background-color: #2a2018;
+}
+
+.neuroglancer-twig-capture-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.neuroglancer-twig-capture-prob {
+  font-family: monospace;
+  color: #7f7;
+  min-width: 3.5em;
+}
+
+.neuroglancer-twig-capture-id {
+  font-family: monospace;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.neuroglancer-twig-capture-tag {
+  color: #fc6;
+  border: 1px solid #653;
+  border-radius: 3px;
+  padding: 0 3px;
+  font-size: 8pt;
+}
+
+.neuroglancer-twig-capture-merge {
+  background-color: #333;
+  color: #ddd;
+  border: 1px solid #555;
+  cursor: pointer;
+}
+
+.neuroglancer-twig-capture-merge:hover {
+  background-color: #444;
+}
+
+.neuroglancer-twig-capture-meta {
+  color: #999;
+  font-size: 9pt;
+  padding-left: 3.5em;
+}
+
+.neuroglancer-twig-capture-status {
+  color: #888;
+  font-size: 9pt;
+  white-space: nowrap;
+}
+
+.neuroglancer-twig-capture-countrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding-bottom: 2px;
+}
+
+.neuroglancer-twig-capture-merge:disabled {
+  color: #777;
+  border-color: #444;
+  cursor: default;
+}
+
+.neuroglancer-twig-capture-row-done {
+  opacity: 0.55;
+}
+
+.neuroglancer-twig-capture-row-failed {
+  background-color: #3a2020;
+}
+
+/* Synapse counts sit under the geometry line and are dimmer: they are
+   context for a judgement, not the judgement. */
+.neuroglancer-twig-capture-syn {
+  color: #7a8f7a;
+  font-size: 8.5pt;
+}
+
+/* "N syn A<->B" -- counter-evidence, so it must not read like the mito flag,
+   which is merely a triage hint. */
+.neuroglancer-twig-capture-tag-warn {
+  color: #f88;
+  border-color: #733;
+}
+
+/* The load-time chunkedgraph check. Occupies the list's place rather than
+   sitting above it, because the list is withheld until it finishes. */
+.neuroglancer-twig-capture-checking {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  color: #ccc;
+  font-size: 9pt;
+  padding: 0.6em 0 0.3em 0;
+}
+
+.neuroglancer-twig-capture-spinner {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border: 2px solid #555;
+  border-top-color: #9cf;
+  border-radius: 50%;
+  animation: neuroglancer-twig-capture-spin 0.8s linear infinite;
+}
+
+@keyframes neuroglancer-twig-capture-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Respect a reviewer who has asked the OS for less motion: the spinner is
+   decoration, the text carries the information. */
+@media (prefers-reduced-motion: reduce) {
+  .neuroglancer-twig-capture-spinner {
+    animation: none;
+    border-top-color: #9cf;
+  }
+}
+
+/* Version footer: present so a reviewer can quote it, quiet enough to ignore. */
+.neuroglancer-twig-capture-version {
+  color: #666;
+  font-size: 8pt;
+  text-align: right;
+  padding: 0.5em 0.2em 0.2em 0;
+  user-select: text;
+}
+
+/* The candidate a shared link was pointing at. Marked rather than selected:
+   the reviewer may well disagree with the sender, so it is a signpost, not a
+   state. */
+.neuroglancer-twig-capture-row-shared {
+  box-shadow: inset 2px 0 0 #9cf;
+  background: rgba(100, 160, 220, 0.09);
+}
+
+/* "N syn" -- what a merge recovers. Green and brighter than the mito flag:
+   this one is a reason TO merge, not a caution. */
+.neuroglancer-twig-capture-tag-syn {
+  color: #7fd;
+  border-color: #275;
+}

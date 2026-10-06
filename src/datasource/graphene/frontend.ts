@@ -1990,6 +1990,78 @@ class GrapheneGraphServerInterface {
     }
   }
 
+  /**
+   * As mergeSegments, but also returns the operation id.
+   *
+   * The chunkedgraph's /merge response carries `operation_id` alongside
+   * `new_root_ids`; mergeSegments discards it. That id is the ONLY handle on
+   * an edit afterwards -- /undo takes nothing else -- so a caller that may
+   * need to undo has to capture it at submit time. Kept separate from
+   * mergeSegments so existing callers are untouched.
+   */
+  async mergeSegmentsWithOperation(
+    first: SegmentSelection,
+    second: SegmentSelection,
+  ): Promise<{ newRoot: bigint; operationId: string | undefined }> {
+    const { fetchOkImpl, baseUrl } = this.httpSource;
+    const promise = fetchOkImpl(`${baseUrl}/merge?int64_as_str=1`, {
+      method: "POST",
+      body: JSON.stringify([
+        [String(first.segmentId), ...first.position],
+        [String(second.segmentId), ...second.position],
+      ]),
+    });
+    try {
+      const response = await promise;
+      const jsonResp = await response.json();
+      return {
+        newRoot: parseUint64(jsonResp.new_root_ids[0]),
+        operationId:
+          jsonResp.operation_id === undefined
+            ? undefined
+            : String(jsonResp.operation_id),
+      };
+    } catch (e) {
+      if (e instanceof HttpError) {
+        throw new Error(await parseGrapheneError(e));
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Undo one operation by id.
+   *
+   * An undo is itself a new operation with its own id, which is what makes
+   * redo possible: undoing the undo re-applies the original edit. Nothing is
+   * erased from the log either way -- the graph only moves forward.
+   */
+  async undoOperation(
+    operationId: string,
+  ): Promise<{ newRoots: bigint[]; operationId: string | undefined }> {
+    const { fetchOkImpl, baseUrl } = this.httpSource;
+    try {
+      const response = await fetchOkImpl(`${baseUrl}/undo?int64_as_str=1`, {
+        method: "POST",
+        body: JSON.stringify({ operation_id: operationId }),
+      });
+      const jsonResp = await response.json();
+      const roots = (jsonResp.new_root_ids ?? []) as string[];
+      return {
+        newRoots: roots.map((x) => parseUint64(x)),
+        operationId:
+          jsonResp.operation_id === undefined
+            ? undefined
+            : String(jsonResp.operation_id),
+      };
+    } catch (e) {
+      if (e instanceof HttpError) {
+        throw new Error(await parseGrapheneError(e));
+      }
+      throw e;
+    }
+  }
+
   async splitSegments(
     first: SegmentSelection[],
     second: SegmentSelection[],

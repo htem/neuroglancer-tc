@@ -20,6 +20,56 @@ declare const STATE_SERVERS: StateServers | undefined;
 export const stateShareEnabled =
   typeof STATE_SERVERS !== "undefined" && Object.keys(STATE_SERVERS).length > 0;
 
+/**
+ * Put the share link where the user can get at it.
+ *
+ * The clipboard is tried first, but it is only AVAILABLE in a secure
+ * context: https, or http on localhost/127.0.0.1. An ordinary http origin --
+ * an internal hostname on a private address, say -- has no
+ * navigator.clipboard at all, so the write throws.
+ *
+ * This used to live inside the POST's promise chain, under a single catch
+ * that reported "Could not access state server." The state had in fact been
+ * saved; only the copy failed, and the link was then lost with a message
+ * blaming the wrong thing. Testing on localhost could not reveal it, because
+ * localhost is one of the origins the browser treats as secure.
+ *
+ * So: copy when we can, and otherwise show the link in a selectable field
+ * and say why. The state exists either way -- that is the part that matters.
+ */
+async function copyOrShowLink(link: string) {
+  try {
+    await navigator.clipboard.writeText(link);
+    StatusMessage.showTemporaryMessage("Share link copied to clipboard");
+    return;
+  } catch {
+    // fall through to the manual path
+  }
+  const msg = StatusMessage.showMessage("");
+  const text = document.createElement("div");
+  text.textContent = window.isSecureContext
+    ? "State saved. Could not reach the clipboard -- copy the link:"
+    : "State saved. The clipboard needs https (or localhost), so copy the " +
+      "link by hand:";
+  const field = document.createElement("input");
+  field.type = "text";
+  field.readOnly = true;
+  field.value = link;
+  field.style.width = "100%";
+  field.style.marginTop = "4px";
+  const close = document.createElement("button");
+  close.textContent = "Close";
+  close.style.marginTop = "4px";
+  close.addEventListener("click", () => msg.dispose());
+  msg.element.appendChild(text);
+  msg.element.appendChild(field);
+  msg.element.appendChild(close);
+  // Selected and focused, so one ctrl-C is enough. Not auto-dismissed: a
+  // timeout here would take the link away mid-copy.
+  field.focus();
+  field.select();
+}
+
 export class StateShare extends RefCounted {
   // call it a widget? no because it doesn't pop out?
   element = document.createElement("div");
@@ -105,16 +155,14 @@ export class StateShare extends RefCounted {
             );
             const protocol = new URL(selectedStateServer).protocol;
             const link = `${window.location.origin}/#!${protocol}${stateUrlWithoutProtocol}`;
-            navigator.clipboard.writeText(link).then(() => {
-              StatusMessage.showTemporaryMessage(
-                "Share link copied to clipboard",
-              );
-            });
+            void copyOrShowLink(link);
           })
-          .catch(() => {
+          .catch((e) => {
+            // Now genuinely about the POST: the clipboard is handled above
+            // and no longer reports itself as a server failure.
             StatusMessage.showTemporaryMessage(
-              "Could not access state server.",
-              4000,
+              `Could not post the state to ${selectedStateServer}: ${e}`,
+              6000,
             );
           }),
         {
