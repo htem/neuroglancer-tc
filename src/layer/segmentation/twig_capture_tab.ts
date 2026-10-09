@@ -475,6 +475,11 @@ export class TwigCaptureTab extends Tab {
    * target_segment_id. Refilled on load and on Refresh, so a reviewer sees
    * what other people have already judged instead of redoing it.
    */
+  /**
+   * Which result file the list was last rendered for, so render() can tell a
+   * re-render of the SAME list from a switch to a different one.
+   */
+  private lastRenderedFile: string | undefined;
   private decisions = new Map<string, DecisionRow>();
   private decisionStore: DecisionStore | undefined;
   /** Candidates whose decision POST is in flight, so the row can show it. */
@@ -1656,6 +1661,30 @@ export class TwigCaptureTab extends Tab {
     // Keeps the facet selects in step with state restored from a link, and
     // disables `review` once we know whether any decisions can be loaded.
     this.renderFilters();
+
+    // PRESERVE THE SCROLL POSITION ACROSS A RE-RENDER.
+    //
+    // listEl is the scroller, and render() empties it with removeChildren
+    // before rebuilding every row, which resets scrollTop to 0. Every merge
+    // and every verdict calls render(), so acting on a row two hundred down
+    // threw the reviewer back to the top and they had to find their place
+    // again -- on a list of several hundred candidates that is the difference
+    // between a usable tool and an infuriating one.
+    //
+    // Only when the SAME file is still loaded. Switching files should start
+    // at the top, and a restored scrollTop from the previous neuron's list
+    // would be meaningless. This also keeps out of the way of the
+    // scrollIntoView that a shared link performs on first render, which runs
+    // exactly when the file has just changed.
+    const sameFile =
+      this.active !== undefined && this.lastRenderedFile === this.active.name;
+    const keptScrollTop = this.listEl.scrollTop;
+    const restoreScroll = () => {
+      // The browser clamps to the new scrollHeight, so a list that shrank
+      // under a filter change lands at the bottom rather than out of bounds.
+      if (sameFile) this.listEl.scrollTop = keptScrollTop;
+      this.lastRenderedFile = this.active?.name;
+    };
     // file chooser
     removeChildren(this.fileSelect);
     for (const result of this.results) {
@@ -1675,6 +1704,7 @@ export class TwigCaptureTab extends Tab {
     const result = this.active;
     if (result === undefined) {
       this.countEl.textContent = "";
+      restoreScroll();
       return;
     }
 
@@ -1710,6 +1740,7 @@ export class TwigCaptureTab extends Tab {
         "anything already merged is marked before you can click it.";
       this.listEl.appendChild(wait);
       this.listEl.appendChild(why);
+      restoreScroll();
       return;
     }
 
@@ -1722,6 +1753,7 @@ export class TwigCaptureTab extends Tab {
       empty.textContent = "No candidates pass the current filters.";
       this.listEl.appendChild(empty);
     }
+    restoreScroll();
   }
 
   private makeRow(candidate: TwigCandidate): HTMLElement {
