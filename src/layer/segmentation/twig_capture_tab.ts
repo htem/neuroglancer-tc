@@ -1012,8 +1012,23 @@ export class TwigCaptureTab extends Tab {
    * graph for today's root fixes that; a layer with no graph (or an id already
    * current) falls through unchanged.
    */
+  /**
+   * Show EXACTLY these segments, replacing whatever was displayed.
+   *
+   * This used to only add. Clicking down a list therefore accumulated every
+   * candidate visited, so after a handful of rows the viewer showed a pile of
+   * neurons and the pair actually under consideration was indistinguishable
+   * among them -- which defeats the point of clicking a row.
+   *
+   * Both sets are cleared, not just visibleSegments: selectedSegments is what
+   * keeps a segment in the visible set, and showSegments is what put the
+   * earlier ones there, so leaving it would re-accumulate the same pile one
+   * layer down.
+   */
   private async showSegments(ids: bigint[]) {
     const group = this.layer.displayState.segmentationGroupState.value;
+    group.visibleSegments.clear();
+    group.selectedSegments.clear();
     // getRoot is on GrapheneGraphSource, not on the abstract base, so probe
     // for it structurally rather than widening the base class.
     const graph = group.graph.value as
@@ -1842,6 +1857,41 @@ export class TwigCaptureTab extends Tab {
     }
 
     const status = this.mergeStatus.get(candidate.id);
+    const decided = this.decisions.get(candidate.target_segment_id);
+    const pending = this.deciding.has(candidate.target_segment_id);
+    const allowed = this.decisionsAllowed();
+
+    // The recorded verdict stays on the TOP row, beside the other chips: it
+    // is a fact about the candidate, like the synapse count, and belongs with
+    // the things a reviewer scans rather than with the controls.
+    if (decided !== undefined) {
+      const chip = document.createElement("span");
+      chip.classList.add("neuroglancer-twig-capture-tag");
+      if (decided.tag === "no_merge") {
+        chip.classList.add("neuroglancer-twig-capture-tag-warn");
+      }
+      chip.textContent = decided.tag;
+      chip.title =
+        `Recorded in CAVE as "${decided.tag}" (annotation ${decided.id}). ` +
+        "Reviewing again adds a new row; the latest wins.";
+      main.appendChild(chip);
+    }
+    row.appendChild(main);
+
+    // ---- SECOND LINE: the actions ----------------------------------------
+    //
+    // Three buttons, on their own row. They were briefly a hover-revealed
+    // select, which kept the list compact but hid the primary workflow behind
+    // a pointer and a second click; reviewers asked for the buttons back.
+    //
+    // They are NOT on the top row. That row carries the probability, the
+    // synapse count and whether the candidate has already been judged -- what
+    // you read while scanning. Controls mixed in among them made both harder:
+    // the numbers were interrupted by buttons, and the buttons moved sideways
+    // as chips appeared and disappeared.
+    const actions = document.createElement("div");
+    actions.classList.add("neuroglancer-twig-capture-actions");
+
     const merge = document.createElement("button");
     merge.classList.add("neuroglancer-twig-capture-merge");
     merge.textContent =
@@ -1858,12 +1908,51 @@ export class TwigCaptureTab extends Tab {
       status === "done" || status === "merging" || status === "already";
     merge.title =
       "Writes to the chunkedgraph: adds an edge joining this candidate to the " +
-      "neuron, attributed to you and visible to everyone.";
+      "neuron, attributed to you and visible to everyone." +
+      (allowed
+        ? " The decision is also recorded in twig_capture_decisions, with the " +
+          "operation id."
+        : "");
     merge.addEventListener("click", (event: MouseEvent) => {
       event.stopPropagation();
       void this.doMerge(candidate);
     });
-    main.appendChild(merge);
+    actions.appendChild(merge);
+
+    // Merging IS the merge verdict -- doMerge records it with the operation
+    // id -- so these two only cover the cases that change nothing in the
+    // graph. A third button writing `merge` without merging would produce
+    // rows indistinguishable from executed ones.
+    if (allowed) {
+      // Already joined to the neuron -- merged here, merged by someone else
+      // before this list loaded, or mid-merge right now. "Not a merge" and
+      // "Unsure" are then incoherent: the two segments are one object, so
+      // the question the verdict answers no longer exists, and a row saying
+      // no_merge about an executed merge is a false label in the GT. Merge
+      // itself is already disabled in these states.
+      const joined =
+        status === "already" || status === "done" || status === "merging";
+      for (const [verdict, label, help] of [
+        ["no_merge", "Not a merge", "Record that these are different neurons."],
+        ["unsure", "Unsure", "Record that this one needs a second opinion."],
+      ] as [Verdict, string, string][]) {
+        const b = document.createElement("button");
+        b.classList.add("neuroglancer-twig-capture-merge");
+        b.textContent = pending ? "\u2026" : label;
+        b.disabled = pending || joined;
+        b.title = joined
+          ? "This candidate is already part of the neuron, so there is no " +
+            "merge decision left to record. Undo the merge first if it was " +
+            "wrong."
+          : `${help} Writes a row to twig_capture_decisions in CAVE, ` +
+            "attributed to you. It does not change the segmentation.";
+        b.addEventListener("click", (event: MouseEvent) => {
+          event.stopPropagation();
+          void this.recordDecision(candidate, verdict);
+        });
+        actions.appendChild(b);
+      }
+    }
 
     // Undo / Redo, only where this session actually holds an operation id.
     const entry = this.history.get(candidate.id);
@@ -1878,96 +1967,21 @@ export class TwigCaptureTab extends Tab {
         event.stopPropagation();
         void this.undoOrRedo(candidate);
       });
-      main.appendChild(undo);
+      actions.appendChild(undo);
     }
-
-    // ---- the recorded verdict, and the two buttons that set it -----------
-    //
-    // There is no "merge" button here on purpose. Merging IS the merge
-    // verdict: doMerge records it with the operation id, so a row claiming
-    // `merge` is always backed by a real graph edit. A separate button that
-    // said "merge" without merging would produce rows nobody could tell
-    // apart from executed ones.
-    const decided = this.decisions.get(candidate.target_segment_id);
-    const pending = this.deciding.has(candidate.target_segment_id);
-    if (decided !== undefined) {
-      const chip = document.createElement("span");
-      chip.classList.add("neuroglancer-twig-capture-tag");
-      if (decided.tag === "no_merge") {
-        chip.classList.add("neuroglancer-twig-capture-tag-warn");
-      }
-      chip.textContent = decided.tag;
-      chip.title =
-        `Recorded in CAVE as "${decided.tag}" (annotation ${decided.id}). ` +
-        "Reviewing again adds a new row; the latest wins.";
-      main.appendChild(chip);
-    }
-    // The non-merge verdicts live in a select, not in buttons.
-    //
-    // Merge stays a button because it is the primary action and it writes to
-    // the shared graph -- a destructive edit should not be one mis-click
-    // inside a list. The other two are rarer and were costing every one of
-    // several hundred rows two permanent controls, which drowned the numbers
-    // a reviewer is actually scanning. The select is revealed on hover (see
-    // twig_capture.css); the chip above is what shows a recorded verdict at
-    // rest, so nothing is hidden, only the means of changing it.
-    const allowed = this.decisionsAllowed();
-    const verdictWrap = document.createElement("span");
-    verdictWrap.classList.add("neuroglancer-twig-capture-verdict");
-    const select = document.createElement("select");
-    select.classList.add("neuroglancer-twig-capture-merge");
-    select.disabled = pending;
-    select.title =
-      "Record a verdict in twig_capture_decisions (CAVE), attributed to you. " +
-      "This does not change the segmentation.";
-    for (const [value, label] of [
-      ["", pending ? "\u2026" : "Mark\u2026"],
-      ["no_merge", "Not a merge"],
-      ["unsure", "Unsure"],
-    ]) {
-      const opt = document.createElement("option");
-      opt.value = value;
-      opt.textContent = label;
-      if (value === "") {
-        // The placeholder is a LABEL for the closed select, not a choice.
-        // `disabled` stops it being picked, `hidden` keeps it out of the open
-        // list; a hidden option that is selected still shows its text while
-        // the select is closed, which is the whole trick. Without both it sat
-        // in the menu as a third, meaningless item.
-        opt.disabled = true;
-        opt.hidden = true;
-      }
-      select.appendChild(opt);
-    }
-    // selectedIndex rather than value="": `disabled` does not block a
-    // programmatic selection, but going through the index says plainly that
-    // we mean "back to the placeholder" and does not depend on that nuance.
-    select.selectedIndex = 0;
-    select.addEventListener("click", (event: MouseEvent) => {
-      // The row's own click handler jumps the viewer; opening the select
-      // should not also move the camera.
-      event.stopPropagation();
-    });
-    select.addEventListener("change", (event: Event) => {
-      event.stopPropagation();
-      const chosen = select.value as Verdict | "";
-      // Back to the placeholder straight away: the select is a verb, not a
-      // state display. What was recorded is shown by the chip, which is the
-      // only thing that reflects what is actually in CAVE.
-      select.selectedIndex = 0;
-      if (chosen === "") return;
-      void this.recordDecision(candidate, chosen);
-    });
-    verdictWrap.appendChild(select);
-    if (allowed) main.appendChild(verdictWrap);
 
     if (status === "failed") {
       row.classList.add("neuroglancer-twig-capture-row-failed");
     } else if (status === "done" || status === "already") {
       row.classList.add("neuroglancer-twig-capture-row-done");
     }
-    row.appendChild(main);
 
+    // The metadata and the buttons SHARE a line: text left, controls pinned
+    // right. They were briefly separate rows, which cost a whole extra line
+    // of height on every one of several hundred candidates for a row that
+    // was already half empty.
+    const metaLine = document.createElement("div");
+    metaLine.classList.add("neuroglancer-twig-capture-metaline");
     const meta = document.createElement("div");
     meta.classList.add("neuroglancer-twig-capture-meta");
     const parts: string[] = [`${candidate.num_l2_nodes} L2`];
@@ -1982,7 +1996,9 @@ export class TwigCaptureTab extends Tab {
     if (candidate.cand_em_mean != null)
       parts.push(`EM ${fmt(candidate.cand_em_mean, 0)}`);
     meta.textContent = parts.join("  ·  ");
-    row.appendChild(meta);
+    metaLine.appendChild(meta);
+    metaLine.appendChild(actions);
+    row.appendChild(metaLine);
 
     const syn = this.makeSynapseLine(candidate);
     if (syn !== undefined) row.appendChild(syn);

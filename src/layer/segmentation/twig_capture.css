@@ -130,7 +130,10 @@
   cursor: pointer;
 }
 
-.neuroglancer-twig-capture-merge:hover {
+/* :not(:disabled) matters. :hover fires on disabled buttons too, so without
+   it a greyed-out "Not a merge" still lit up under the cursor and read as
+   clickable -- the one thing the disabled state exists to deny. */
+.neuroglancer-twig-capture-merge:not(:disabled):hover {
   background-color: #444;
 }
 
@@ -155,6 +158,10 @@
 }
 
 .neuroglancer-twig-capture-merge:disabled {
+  /* Pinned explicitly rather than inherited: the base rule's background is
+     what hover was overriding, so stating it here keeps the button flat
+     whatever else is in play. */
+  background-color: #2b2b2b;
   color: #777;
   border-color: #444;
   cursor: default;
@@ -248,22 +255,46 @@
 }
 
 /*
- * The verdict select is revealed on hover, not shown permanently.
+ * SECOND LINE: the action buttons.
  *
- * Several hundred rows each carrying two extra controls buried the numbers a
- * reviewer scans. Hidden with opacity rather than display:none so the row's
- * layout does not shift when the pointer arrives -- a row that reflows under
- * the cursor is how you mis-click Merge.
+ * Their own row, under the probability/chips line. Previously they sat among
+ * the chips, which meant the controls shifted sideways as a "N syn" or a
+ * verdict chip appeared -- a button that moves between rows is a button you
+ * mis-click. Here their position is fixed whatever the row carries.
  *
- * :focus-within keeps it visible for keyboard users and while the dropdown is
- * open, since the pointer may leave the row to reach the option list.
+ * RIGHT-ALIGNED, to the row's right edge. Aligning them under the chips
+ * instead was the other option and is not stable: the chips flow left after
+ * the segment id, so their position moves with the id's width and with
+ * whether the row has a "mito?" or verdict chip. The right edge does not
+ * move, so the buttons land in the same place on every row -- which is what
+ * makes them safe to click quickly down a long list.
+ *
+ * Not hover-revealed: hiding them kept the list shorter, but a row that grows
+ * under the pointer shifts everything below it, and these are the primary
+ * workflow rather than an occasional extra.
  */
-.neuroglancer-twig-capture-verdict {
-  opacity: 0;
-  transition: opacity 0.08s linear;
+.neuroglancer-twig-capture-actions {
+  display: flex;
+  gap: 4px;
+  /* Never squeezed: the metadata text yields first, because a truncated
+     "95 nm thick" still reads while a clipped button cannot be clicked. */
+  flex: 0 0 auto;
 }
 
-.neuroglancer-twig-capture-row:hover .neuroglancer-twig-capture-verdict,
-.neuroglancer-twig-capture-verdict:focus-within {
-  opacity: 1;
+/* Metadata on the left, controls pinned right, one line. */
+.neuroglancer-twig-capture-metaline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 2px 2px 0;
+}
+
+/* The text is what gives when the tab is narrow. */
+.neuroglancer-twig-capture-metaline .neuroglancer-twig-capture-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
