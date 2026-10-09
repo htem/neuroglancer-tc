@@ -64,8 +64,10 @@ const TABLE = "twig_capture_decisions";
  *   graphene://middleauth+https://cave.fanc-fly.com/segmentation/table/<table>
  */
 export const DECISION_ALLOWLIST: readonly string[] = [
-  // BANC
+  // BANC -- twig_capture_decisions created 2026-10-06
   "https://cave.fanc-fly.com/segmentation/table/wclee_fly_cns_001",
+  // Aedes -- twig_capture_decisions created 2026-10-06
+  "https://cave.fanc-fly.com/segmentation/table/wclee_aedes_brain",
 ];
 
 /**
@@ -270,10 +272,18 @@ export class DecisionStore {
       body,
     });
     if (!response.ok) {
-      throw new Error(
-        `CAVE query failed (${response.status}): ` +
-          `${await caveError(response)}`,
-      );
+      const detail = await caveError(response);
+      // A table nobody has written to yet has no SEGMENTATION table --
+      // `<table>__<datastack>`, which carries the resolved supervoxel and
+      // root columns. CAVE creates it lazily on the first post, so the live
+      // query's join fails with `relation ... does not exist` until then.
+      //
+      // That is not an error worth shouting about: it means "no decisions
+      // yet", which is exactly what a fresh datastack should report. Shown
+      // as a red toast it looked like the feature was broken on Aedes when
+      // it was simply unused.
+      if (/does not exist/i.test(detail)) return new Map();
+      throw new Error(`CAVE query failed (${response.status}): ${detail}`);
     }
     const rows = await response.json();
     const out = new Map<string, DecisionRow>();

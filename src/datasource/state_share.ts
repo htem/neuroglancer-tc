@@ -154,7 +154,16 @@ export class StateShare extends RefCounted {
               stateUrlProtcol.length,
             );
             const protocol = new URL(selectedStateServer).protocol;
-            const link = `${window.location.origin}/#!${protocol}${stateUrlWithoutProtocol}`;
+            // origin + PATHNAME, not origin alone.
+            //
+            // window.location.origin is scheme://host and deliberately drops
+            // the path, which is right only when Neuroglancer is served at
+            // the site root. Served from a sub-path -- radagast hosts this at
+            // /twigcapture/ -- the shared link pointed at the site root and
+            // landed the reader on an unrelated page. pathname keeps it,
+            // collapses to "/" at the root, and so is correct either way.
+            const base = window.location.origin + window.location.pathname;
+            const link = `${base}${base.endsWith("/") ? "" : "/"}#!${protocol}${stateUrlWithoutProtocol}`;
             void copyOrShowLink(link);
           })
           .catch((e) => {
