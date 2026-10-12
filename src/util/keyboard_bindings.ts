@@ -155,6 +155,12 @@ export class KeyboardEventBinder<
   }
 
   private handleKeyDown(event: KeyboardEvent) {
+    // Chrome emits a keydown with NO `code` when a <datalist> suggestion is
+    // chosen with the mouse. getEventKeyName then threw
+    // "Cannot read properties of undefined (reading 'toLowerCase')", uncaught,
+    // on every pick in the Twig Capture root-id box. It is not a key press and
+    // must not dispatch a shortcut, so drop it before anything reads it.
+    if (event.code === undefined) return;
     const key = getEventKeyName(event);
     if (this.shouldIgnoreEvent(key, event)) {
       return;

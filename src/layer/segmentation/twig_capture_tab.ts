@@ -625,10 +625,32 @@ export class TwigCaptureTab extends Tab {
     button.textContent = "Connect";
     button.addEventListener("click", connect);
 
+    // Re-fetch the catalog.
+    //
+    // loadCatalog otherwise runs ONCE, when this row is built, so a tab left
+    // open showed whatever index.json held at page load. Results arriving
+    // from a running batch were invisible until the whole viewer was
+    // reloaded, which looked like make_results_index.py had not run -- it
+    // had; nothing was asking for it again.
+    //
+    // cache: "reload" because index.json is served with an ETag and no
+    // Cache-Control, so an ordinary fetch may revalidate and the browser can
+    // hand back the copy it already has. A refresh button that returns the
+    // same stale list is worse than no button.
+    const reload = document.createElement("button");
+    reload.textContent = "↻";
+    reload.title =
+      "Re-read index.json. New results from a running batch do " +
+      "not appear on their own.";
+    reload.addEventListener("click", () => {
+      if (this.catalogUrl) void this.loadCatalog(this.catalogUrl, true);
+    });
+
     this.catalogStatus.classList.add("neuroglancer-twig-capture-status");
 
     row.appendChild(urlInput);
     row.appendChild(button);
+    row.appendChild(reload);
     row.appendChild(this.catalogStatus);
 
     // Type-ahead over root ids. A datalist gives native filtering as the
@@ -642,6 +664,51 @@ export class TwigCaptureTab extends Tab {
     this.rootList.id = `neuroglancer-twig-roots-${Math.random().toString(36).slice(2)}`;
     this.rootInput.setAttribute("list", this.rootList.id);
     const open = () => this.openFromCatalog(this.rootInput.value.trim());
+    // Open as soon as a suggestion is PICKED, but not while typing or pasting.
+    //
+    // Picking from a datalist fires `input` at once but defers `change` until
+    // the field is committed -- usually a blur. Bound to `change` alone,
+    // clicking a suggestion did nothing until the reviewer clicked somewhere
+    // else, which reads as the tab being broken rather than a focus rule.
+    //
+    // Distinguished by what PRECEDED the input event, not by the event's own
+    // inputType. Two earlier attempts failed on that: matching "the value is
+    // an exact catalog hit" fired mid-paste, and `inputType ===
+    // "insertReplacementText"` -- which the spec gives for a datalist
+    // selection -- never matched in Chrome here, so the delay came back.
+    //
+    // A mouse pick is the only one of the three that arrives with no
+    // keystroke and no paste just before it, and that holds whatever the
+    // browser reports.
+    // Open as soon as the field holds a root id the catalog knows, however it
+    // got there.
+    //
+    // Three narrower rules were tried and all failed, so this is written from
+    // a logged event trace rather than from the spec:
+    //
+    //   inputType === "insertReplacementText"  never fired in Chrome here
+    //   "no keystroke just before the input"   same
+    //   wait for `change`                      only fires on blur, so a pick
+    //                                          did nothing until you clicked
+    //                                          somewhere else
+    //
+    // The reason none of them can work: when the id is already complete --
+    // pasted, or fully typed -- CLICKING THE MATCHING SUGGESTION FIRES NO
+    // EVENT AT ALL, because the value does not change. The trace shows only a
+    // keyless `keydown` artifact and then `change` on blur. There is no
+    // "picked it" signal to wait for, so waiting for one means waiting
+    // forever.
+    //
+    // Hence: react to the value, not to the gesture. Pasting a complete id
+    // opens it immediately and the suggestion click becomes unnecessary
+    // rather than required; picking after typing a few digits also lands an
+    // exact match and opens. Partial input never matches, so nothing fires
+    // mid-type. openFromCatalog ignores a file already shown, so the later
+    // `change` on blur cannot load it twice.
+    this.rootInput.addEventListener("input", () => {
+      const value = this.rootInput.value.trim();
+      if (value && this.catalog.some((e) => e.root_id === value)) open();
+    });
     this.rootInput.addEventListener("change", open);
     this.rootInput.addEventListener("keydown", (event: KeyboardEvent) => {
       if (event.key === "Enter") open();
@@ -654,13 +721,21 @@ export class TwigCaptureTab extends Tab {
     return row;
   }
 
-  private async loadCatalog(url: string) {
+  /**
+   * @param force bypass the HTTP cache. index.json is served with an ETag and
+   *   no Cache-Control, so a plain fetch may be answered from cache; the
+   *   refresh button passes true so it cannot return the same stale list.
+   */
+  private async loadCatalog(url: string, force = false) {
     const base = url.endsWith("/") ? url : url + "/";
     this.catalogStatus.textContent = "loading\u2026";
     try {
       let index: any;
       try {
-        const response = await fetch(base + "index.json");
+        const response = await fetch(
+          base + "index.json",
+          force ? { cache: "reload" } : {},
+        );
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         index = await response.json();
       } catch {
@@ -723,6 +798,11 @@ export class TwigCaptureTab extends Tab {
       );
       return;
     }
+    // Already showing it. Both `input` and `change` reach here for a single
+    // pick -- the second on blur -- and re-fetching would restart the graph
+    // check and throw away the reviewer's scroll position for no gain. The
+    // Refresh button is how you deliberately re-read a file.
+    if (this.active?.name === entry.file) return;
     const base = this.catalogUrl.endsWith("/")
       ? this.catalogUrl
       : this.catalogUrl + "/";
@@ -926,6 +1006,14 @@ export class TwigCaptureTab extends Tab {
     this.mergeStatus.clear();
     this.history.clear();
     this.activeTargetRoot = undefined;
+    // And fresh decisions. These are keyed by candidate id, which says
+    // nothing about which neuron they belong to, so leaving them showed the
+    // PREVIOUS neuron's verdicts against the new one's candidates until
+    // loadDecisions returned. Where decisions are not enabled for the layer
+    // loadDecisions returns early, so they would have persisted indefinitely
+    // -- a chip claiming a candidate had been judged when it had not.
+    this.decisions.clear();
+    this.deciding.clear();
     // Re-loading the same file replaces it rather than stacking duplicates.
     const existing = this.results.findIndex((r) => r.name === result.name);
     if (existing >= 0) {
