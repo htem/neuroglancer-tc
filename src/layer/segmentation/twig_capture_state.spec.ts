@@ -93,3 +93,19 @@ describe("TwigCaptureState legacy links", () => {
     expect(restored({ probOp: "<" }).probOp).toBe(">=");
   });
 });
+
+describe("TwigCaptureState neuron filters", () => {
+  it("round-trips set filters and omits empty ones", () => {
+    const s = new TwigCaptureState();
+    expect(s.toJSON()).toBeUndefined();
+    s.neuron = { super_class: "descending", flow: "" };
+    expect(s.toJSON()).toEqual({ neuron: { super_class: "descending" } });
+    expect(restored(s.toJSON()).neuron).toEqual({ super_class: "descending" });
+  });
+  it("drops unknown fields and non-string values", () => {
+    expect(
+      restored({ neuron: { super_class: 3, bogus: "x", status: "OK" } }).neuron,
+    ).toEqual({ status: "OK" });
+    expect(restored({ neuron: "descending" }).neuron).toEqual({});
+  });
+});
