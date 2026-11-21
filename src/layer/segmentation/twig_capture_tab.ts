@@ -1128,6 +1128,18 @@ export class TwigCaptureTab extends Tab {
     this.publish();
     this.renderNeuronFilters();
     this.rebuildRootList();
+    // Neuron filters choose NEURONS, so choosing one with a single neuron
+    // open goes to the all-neurons list, narrowed to the matching neurons:
+    // otherwise the filter visibly does nothing, since one neuron's own
+    // candidates are not narrowed by what that neuron is. Not mid-run.
+    if (
+      this.active !== undefined &&
+      this.batch === undefined &&
+      hasNeuronFilters(this.neuronFilters)
+    ) {
+      this.showAll();
+      return;
+    }
     this.render();
   }
 
