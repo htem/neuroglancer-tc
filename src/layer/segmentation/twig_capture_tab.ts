@@ -629,8 +629,8 @@ export class TwigCaptureTab extends Tab {
    * Candidates of ONE neuron staged for a sequential merge. `rows` is frozen
    * when staged -- what is listed is exactly what Merge staged will act on,
    * whatever the filters do meanwhile -- and `selected` is what is still
-   * ticked. `roots` holds each candidate's root today, for showing it;
-   * `shown` the ones this stage made visible, so clearing hides only those.
+   * ticked. `roots` holds each candidate's root today, for showing it, and
+   * `neuron` the neuron's, which stays shown whatever is unticked.
    */
   private stage:
     | {
@@ -638,7 +638,7 @@ export class TwigCaptureTab extends Tab {
         rows: TwigCandidate[];
         selected: Set<string>;
         roots: Map<string, bigint>;
-        shown: Set<bigint>;
+        neuron: bigint | undefined;
       }
     | undefined;
   /** A Merge staged run in progress. */
@@ -2583,7 +2583,26 @@ export class TwigCaptureTab extends Tab {
       "staged.";
   }
 
-  /** Freeze the listed, mergeable candidates into a ticked list; show them. */
+  /** Select-and-show one segment: the segment list keeps only selected ones visible. */
+  private showSegment(root: bigint) {
+    const group = this.layer.displayState.segmentationGroupState.value;
+    group.selectedSegments.add(root);
+    group.visibleSegments.set(root, true);
+  }
+
+  private hideSegment(root: bigint) {
+    const group = this.layer.displayState.segmentationGroupState.value;
+    group.visibleSegments.delete(root);
+    group.selectedSegments.delete(root);
+  }
+
+  /**
+   * Freeze the listed, mergeable candidates into a ticked list, and make the
+   * view show exactly the proposal: everything else in the layer is
+   * deselected, then the neuron (at its root today) and every staged
+   * candidate (at ITS root today, from its own supervoxel -- the file's
+   * segment ids may be retired) are selected.
+   */
   private async stageAll() {
     const result = this.active;
     if (result === undefined || this.stage !== undefined) return;
@@ -2594,18 +2613,19 @@ export class TwigCaptureTab extends Tab {
       rows,
       selected: new Set(rows.map(rowKey)),
       roots: new Map<string, bigint>(),
-      shown: new Set<bigint>(),
+      neuron: undefined as bigint | undefined,
     };
     this.stage = stage;
     this.render();
-    // Show every staged candidate as it is TODAY, resolved from its own
-    // supervoxel -- the file's segment ids may be retired roots. Only roots
-    // that were not already visible are added (and later removed), so the
-    // neuron and anything the reviewer had open are never hidden.
     const graph = this.graphene();
     if (graph?.getRoot === undefined) return;
-    const visible =
-      this.layer.displayState.segmentationGroupState.value.visibleSegments;
+    const group = this.layer.displayState.segmentationGroupState.value;
+    group.visibleSegments.clear();
+    group.selectedSegments.clear();
+    const consensus = await this.neuronRootConsensus(result);
+    if (this.stage !== stage) return;
+    stage.neuron = consensus?.root ?? this.targetRoots.get(result.name);
+    if (stage.neuron !== undefined) this.showSegment(stage.neuron);
     const queue = [...rows];
     const worker = async () => {
       for (;;) {
@@ -2616,17 +2636,20 @@ export class TwigCaptureTab extends Tab {
             BigInt(c.merge_source!.supervoxel_id),
           );
           if (this.stage !== stage) return;
-          stage.roots.set(rowKey(c), root);
-          if (stage.selected.has(rowKey(c)) && !visible.has(root)) {
-            visible.set(root, true);
-            stage.shown.add(root);
+          if (root === stage.neuron) {
+            // Already part of the neuron: nothing to merge.
+            this.mergeStatus.set(rowKey(c), "already");
+            continue;
           }
+          stage.roots.set(rowKey(c), root);
+          if (stage.selected.has(rowKey(c))) this.showSegment(root);
         } catch {
           // not shown; the merge re-resolves it anyway
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(8, rows.length) }, worker));
+    if (this.stage === stage) this.render();
   }
 
   /** Tick or untick one staged row; its segment is shown or hidden to match. */
@@ -2637,27 +2660,24 @@ export class TwigCaptureTab extends Tab {
     if (on) stage.selected.add(key);
     else stage.selected.delete(key);
     const root = stage.roots.get(key);
-    if (root !== undefined) {
-      const visible =
-        this.layer.displayState.segmentationGroupState.value.visibleSegments;
-      if (on && !visible.has(root)) {
-        visible.set(root, true);
-        stage.shown.add(root);
-      } else if (!on && stage.shown.has(root)) {
-        visible.set(root, false);
-        stage.shown.delete(root);
-      }
+    if (root !== undefined && root !== stage.neuron && !this.isJoined(c)) {
+      if (on) this.showSegment(root);
+      else this.hideSegment(root);
     }
     this.render();
   }
 
-  /** Drop the staged list, hiding what staging showed and was not merged. */
+  /**
+   * Drop the staged list. Candidates not merged are deselected; the neuron
+   * (with whatever was merged into it) stays.
+   */
   private clearStage() {
     const stage = this.stage;
     if (stage === undefined || this.batch !== undefined) return;
-    const visible =
-      this.layer.displayState.segmentationGroupState.value.visibleSegments;
-    for (const root of stage.shown) visible.set(root, false);
+    for (const c of stage.rows) {
+      const root = stage.roots.get(rowKey(c));
+      if (root !== undefined && !this.isJoined(c)) this.hideSegment(root);
+    }
     this.stage = undefined;
     this.render();
   }
@@ -2969,8 +2989,9 @@ export class TwigCaptureTab extends Tab {
       note.classList.add("neuroglancer-twig-capture-stage-note");
       note.textContent =
         `Staged: ${rows.length} candidate(s) of this neuron, frozen from the ` +
-        "filters when staged and shown in the view. Untick any you do not " +
-        "want, then Merge staged. Clear returns to the filtered list.";
+        "filters when staged. The view shows only the neuron and the ticked " +
+        "candidates. Untick any you do not want, then Merge staged. Clear " +
+        "returns to the filtered list.";
       this.listEl.appendChild(note);
     }
     for (const candidate of rows) {
