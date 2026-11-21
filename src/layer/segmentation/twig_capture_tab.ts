@@ -63,6 +63,22 @@ import {
   DecisionStore,
   decisionsAllowed,
 } from "#src/layer/segmentation/twig_capture_decisions.js";
+import type {
+  NeuronField,
+  NeuronFilters,
+  NeuronMeta,
+} from "#src/layer/segmentation/twig_capture_neurons.js";
+import {
+  fetchNeuronMeta,
+  fieldOptions,
+  hasNeuronFilters,
+  NEURON_FIELD_LABELS,
+  NEURON_FIELDS,
+  NEURON_META_FILE,
+  neuronLabel,
+  neuronTooltip,
+  passesNeuronFilters,
+} from "#src/layer/segmentation/twig_capture_neurons.js";
 import type { CandidateTable } from "#src/layer/segmentation/twig_capture_table.js";
 import {
   CANDIDATE_TABLE_FILE,
@@ -104,6 +120,10 @@ export const TWIG_CAPTURE_JSON_KEY = "twigCapture";
  *                are facets ("any" / ...); mito replaced an older pair of
  *                hideMito/mitoOnly booleans, which restoreState still reads
  *                so that links made before 2026-10-06 keep working.
+ *   neuron       SeaTable filters on the neuron (super_class, cell_class,
+ *                cell_type, status, flow -> chosen value), from the
+ *                catalog's neurons.json. Narrow the all-neurons list and the
+ *                root-id picker.
  *   candidate    the candidate's target_segment_id, so the row can be
  *                highlighted. The segment id and not `cand_22`, because the
  *                cand_N numbering shifts with ordering and threshold.
@@ -129,6 +149,8 @@ export class TwigCaptureState {
   /** "any" | "none" | "done" | "merge" | "no_merge" | "unsure". */
   review = "any";
   sortKey = "prob";
+  /** SeaTable neuron filters: field -> value; absent means any. */
+  neuron: NeuronFilters = {};
 
   toJSON() {
     // Only the fields that differ from a fresh tab, so an untouched layer
@@ -143,6 +165,11 @@ export class TwigCaptureState {
     if (this.mito !== "any") x.mito = this.mito;
     if (this.review !== "any") x.review = this.review;
     if (this.sortKey !== "prob") x.sortKey = this.sortKey;
+    if (hasNeuronFilters(this.neuron)) {
+      const n: { [k: string]: string } = {};
+      for (const f of NEURON_FIELDS) if (this.neuron[f]) n[f] = this.neuron[f]!;
+      x.neuron = n;
+    }
     return Object.keys(x).length ? x : undefined;
   }
 
@@ -179,6 +206,15 @@ export class TwigCaptureState {
       : "any";
     if (["prob", "size", "contact", "synapses"].includes(o.sortKey))
       this.sortKey = o.sortKey;
+    // Only known fields with string values; anything else is dropped.
+    const neuron: NeuronFilters = {};
+    if (o.neuron !== null && typeof o.neuron === "object") {
+      for (const f of NEURON_FIELDS) {
+        const v = o.neuron[f];
+        if (typeof v === "string" && v !== "") neuron[f] = v;
+      }
+    }
+    this.neuron = neuron;
     this.changed.dispatch();
   }
 }
@@ -250,6 +286,12 @@ interface TwigCandidate {
 function rowKey(c: TwigCandidate): string {
   return `${c._file ?? ""}#${c.id}`;
 }
+
+/**
+ * How one merge attempt ended. `skipped` is a staged run declining a row it
+ * would otherwise have to ask about; `cancelled` is a reviewer saying no.
+ */
+type MergeOutcome = "merged" | "already" | "skipped" | "failed" | "cancelled";
 
 /** A full candidate record together with the result file it belongs to. */
 interface RowRef {
@@ -399,8 +441,13 @@ const CATALOG_URL_KEY = "neuroglancer-twig-capture-catalog-url";
  * v1.1 (2026-11-21): an all-neurons view when no root id is chosen (every
  * candidate in the catalog that passes the filters, from candidates.json.gz,
  * with merge and verdicts inline), and a p >= / p <= toggle.
+ *
+ * v1.2 (2026-11-21): Stage all -> review -> Merge staged, one neuron at a
+ * time, replacing the never-enabled Merge all; and optional neuron filters
+ * (super class, class, type, status, flow) from the catalog's neurons.json,
+ * a cache of the project's SeaTable.
  */
-const TWIG_CAPTURE_VERSION = "v1.1";
+const TWIG_CAPTURE_VERSION = "v1.2";
 const TWIG_CAPTURE_DATE = "20261121";
 
 const DEFAULT_CATALOG_URL =
@@ -521,8 +568,10 @@ export class TwigCaptureTab extends Tab {
   /** candidate id -> outcome, so a row is not offered twice. */
   private mergeStatus = new Map<
     string,
-    "merging" | "done" | "failed" | "already"
+    "merging" | "done" | "failed" | "already" | "skipped"
   >();
+  /** Why a staged merge was skipped rather than made, by rowKey. */
+  private skipReason = new Map<string, string>();
   private refreshButton = document.createElement("button");
 
   /**
@@ -566,6 +615,35 @@ export class TwigCaptureTab extends Tab {
   /** Full result files fetched to act on table rows, by file name. */
   private fileCache = new Map<string, Promise<TwigResult>>();
   private allButton = document.createElement("button");
+
+  // ---- SeaTable neuron filters ----------------------------------------------
+  /** The catalog's neurons.json, once fetched; undefined when it has none. */
+  private neuronMeta: NeuronMeta | undefined;
+  /** Which catalog neuronMeta belongs to. */
+  private neuronMetaFor = "";
+  private neuronFilters: NeuronFilters = {};
+  private neuronRow = document.createElement("div");
+
+  // ---- stage, review, merge staged ------------------------------------------
+  /**
+   * Candidates of ONE neuron staged for a sequential merge. `rows` is frozen
+   * when staged -- what is listed is exactly what Merge staged will act on,
+   * whatever the filters do meanwhile -- and `selected` is what is still
+   * ticked. `roots` holds each candidate's root today, for showing it;
+   * `shown` the ones this stage made visible, so clearing hides only those.
+   */
+  private stage:
+    | {
+        file: string;
+        rows: TwigCandidate[];
+        selected: Set<string>;
+        roots: Map<string, bigint>;
+        shown: Set<bigint>;
+      }
+    | undefined;
+  /** A Merge staged run in progress. */
+  private batch: { stop: boolean; done: number; total: number } | undefined;
+  private clearStageButton = document.createElement("button");
   /**
    * Progress of the check that runs on load, or undefined when not running.
    *
@@ -614,6 +692,7 @@ export class TwigCaptureTab extends Tab {
     t.mito = this.mito;
     t.review = this.review;
     t.sortKey = this.sortKey;
+    t.neuron = { ...this.neuronFilters };
     t.changed.dispatch();
   }
 
@@ -627,20 +706,22 @@ export class TwigCaptureTab extends Tab {
     this.mito = saved.mito;
     this.review = saved.review;
     this.sortKey = saved.sortKey as typeof this.sortKey;
+    this.neuronFilters = { ...saved.neuron };
     const { element } = this;
     element.classList.add("neuroglancer-twig-capture-tab");
     element.appendChild(this.makeCatalogRow());
     element.appendChild(this.makeResultSelectRow());
     element.appendChild(this.makeFilterRow());
+    this.neuronRow.classList.add("neuroglancer-twig-capture-filters");
+    this.neuronRow.classList.add("neuroglancer-twig-capture-neuron-filters");
+    this.neuronRow.style.display = "none";
+    element.appendChild(this.neuronRow);
     this.summary.classList.add("neuroglancer-twig-capture-summary");
     element.appendChild(this.summary);
     const countRow = document.createElement("div");
     countRow.classList.add("neuroglancer-twig-capture-countrow");
     this.countEl.classList.add("neuroglancer-twig-capture-count");
     countRow.appendChild(this.countEl);
-    // Disabled until merging exists. It stays visible so the review workflow
-    // reads the same as it will once merging is wired up -- and because a
-    // bulk graph edit is the one action that most needs to be deliberate.
     this.refreshButton.classList.add("neuroglancer-twig-capture-merge");
     this.refreshButton.textContent = "Refresh";
     this.refreshButton.title =
@@ -652,13 +733,37 @@ export class TwigCaptureTab extends Tab {
       () => void this.refreshAgainstGraph(),
     );
     countRow.appendChild(this.refreshButton);
+    // BULK MERGING, IN TWO DELIBERATE STEPS, ONE NEURON AT A TIME.
+    //
+    // "Stage all" edits nothing: it freezes the listed candidates of the
+    // open neuron into a ticked list and shows them in the view, so the
+    // reviewer sees every proposed join at once and unticks the wrong ones.
+    // Only then does the same button read "Merge staged", which merges the
+    // ticked ones sequentially -- each one re-resolved and re-checked first,
+    // because every merge changes the neuron's root. While that runs the
+    // button is "Stop". Never across neurons: a bulk edit to many neurons at
+    // once is too much to have checked by eye.
     this.mergeAllButton.classList.add("neuroglancer-twig-capture-merge");
-    this.mergeAllButton.textContent = "Merge all";
-    this.mergeAllButton.disabled = true;
-    this.mergeAllButton.title =
-      "Not yet implemented -- this would edit the chunkedgraph for every " +
-      "candidate currently listed.";
+    this.mergeAllButton.textContent = "Stage all";
+    this.mergeAllButton.addEventListener("click", () => {
+      if (this.batch !== undefined) {
+        this.batch.stop = true;
+        this.updateBulkButtons();
+      } else if (this.stage !== undefined) {
+        void this.mergeStaged();
+      } else {
+        void this.stageAll();
+      }
+    });
     countRow.appendChild(this.mergeAllButton);
+    this.clearStageButton.classList.add("neuroglancer-twig-capture-merge");
+    this.clearStageButton.textContent = "Clear";
+    this.clearStageButton.title =
+      "Drop the staged list and go back to the filtered candidates. Nothing " +
+      "is edited; merges already made stay.";
+    this.clearStageButton.style.display = "none";
+    this.clearStageButton.addEventListener("click", () => this.clearStage());
+    countRow.appendChild(this.clearStageButton);
     element.appendChild(countRow);
     this.listEl.classList.add("neuroglancer-twig-capture-list");
     element.appendChild(this.listEl);
@@ -851,6 +956,7 @@ export class TwigCaptureTab extends Tab {
         this.tableState = "none";
         this.tableFor = base;
       }
+      void this.loadNeuronMeta(base, force);
       this.catalogStatus.textContent = `${this.catalog.length} file(s)`;
       this.catalogStatus.title = index?.generated
         ? `index generated ${index.generated}`
@@ -866,17 +972,7 @@ export class TwigCaptureTab extends Tab {
         // No neuron named: the all-neurons view.
         void this.loadTable(force);
       }
-      removeChildren(this.rootList);
-      for (const entry of this.catalog) {
-        const option = document.createElement("option");
-        option.value = entry.root_id;
-        const bits = [`${entry.candidate_count ?? "?"} cands`];
-        if (entry.n_review !== undefined)
-          bits.push(`${entry.n_review} to review`);
-        if (entry.timestamp) bits.push(entry.timestamp.slice(0, 10));
-        option.label = bits.join(", ");
-        this.rootList.appendChild(option);
-      }
+      this.rebuildRootList();
     } catch (e) {
       this.catalog = [];
       this.rootInput.disabled = true;
@@ -888,6 +984,151 @@ export class TwigCaptureTab extends Tab {
         6000,
       );
     }
+  }
+
+  /**
+   * The root-id picker's options: the catalog's neurons that pass the neuron
+   * filters, labelled with their SeaTable type where there is one.
+   */
+  private rebuildRootList() {
+    removeChildren(this.rootList);
+    for (const entry of this.catalog) {
+      if (!this.neuronPasses(entry.root_id)) continue;
+      const option = document.createElement("option");
+      option.value = entry.root_id;
+      const bits: string[] = [];
+      const label = neuronLabel(this.neuronMeta?.neurons.get(entry.root_id));
+      if (label) bits.push(label);
+      bits.push(`${entry.candidate_count ?? "?"} cands`);
+      if (entry.n_review !== undefined)
+        bits.push(`${entry.n_review} to review`);
+      if (entry.timestamp) bits.push(entry.timestamp.slice(0, 10));
+      option.label = bits.join(", ");
+      this.rootList.appendChild(option);
+    }
+  }
+
+  // ---- SeaTable neuron filters ----------------------------------------------
+
+  /** Fetch the catalog's neurons.json (optional) and show its filters. */
+  private async loadNeuronMeta(base: string, force: boolean) {
+    if (!force && this.neuronMetaFor === base) return;
+    this.neuronMetaFor = base;
+    this.neuronMeta = undefined;
+    try {
+      const meta = await fetchNeuronMeta(base, force);
+      if (this.neuronMetaFor !== base) return; // catalog switched meanwhile
+      this.neuronMeta = meta;
+    } catch (e) {
+      if (this.neuronMetaFor !== base) return;
+      // Optional: without it the tab simply has no neuron filters.
+      console.warn(`[twig-capture] could not read ${NEURON_META_FILE}: ${e}`);
+    }
+    this.renderNeuronFilters();
+    this.rebuildRootList();
+    this.render();
+  }
+
+  /** Neuron filters in force: chosen, and a neurons.json to apply them to. */
+  private neuronFiltersActive(): boolean {
+    return (
+      this.neuronMeta !== undefined && hasNeuronFilters(this.neuronFilters)
+    );
+  }
+
+  private neuronPasses(root: string): boolean {
+    if (!this.neuronFiltersActive()) return true;
+    return passesNeuronFilters(
+      this.neuronMeta!.neurons.get(root),
+      this.neuronFilters,
+    );
+  }
+
+  private catalogRoots(): string[] {
+    return [...new Set(this.catalog.map((e) => e.root_id))];
+  }
+
+  /**
+   * One select per annotated field, each offering only values that some
+   * neuron has under the other choices, with how many. A second row, so the
+   * candidate filters above keep their place whether or not a catalog has
+   * annotations.
+   */
+  private renderNeuronFilters() {
+    const row = this.neuronRow;
+    removeChildren(row);
+    const meta = this.neuronMeta;
+    if (meta === undefined || meta.fields.length === 0) {
+      row.style.display = "none";
+      return;
+    }
+    row.style.display = "";
+    const roots = this.catalogRoots();
+    const head = document.createElement("span");
+    head.classList.add("neuroglancer-twig-capture-neuron-head");
+    head.textContent = "neuron";
+    head.title =
+      `Filter neurons by their ${meta.source ?? "SeaTable"} annotations ` +
+      `(${NEURON_META_FILE}${meta.generated ? `, ${meta.generated.slice(0, 16)}` : ""}). ` +
+      "Narrows the all-neurons list and the root-id picker. A neuron edited " +
+      "since inference is matched through its latest root; one not in the " +
+      "table counts as blank.";
+    row.appendChild(head);
+    for (const field of NEURON_FIELDS) {
+      if (!meta.fields.includes(field)) continue;
+      const wrap = document.createElement("label");
+      wrap.textContent = NEURON_FIELD_LABELS[field];
+      const sel = document.createElement("select");
+      const any = document.createElement("option");
+      any.value = "";
+      any.textContent = "any";
+      sel.appendChild(any);
+      const current = this.neuronFilters[field] ?? "";
+      const options = fieldOptions(meta, field, roots, this.neuronFilters);
+      if (current && !options.some(([v]) => v === current)) {
+        options.unshift([current, 0]);
+      }
+      for (const [value, n] of options) {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = `${value} (${n})`;
+        sel.appendChild(opt);
+      }
+      sel.value = current;
+      sel.addEventListener("change", () => {
+        this.setNeuronFilter(field, sel.value);
+      });
+      wrap.appendChild(sel);
+      row.appendChild(wrap);
+    }
+    const matching = roots.filter((r) => this.neuronPasses(r)).length;
+    const count = document.createElement("span");
+    count.classList.add("neuroglancer-twig-capture-neuron-count");
+    count.textContent = `${matching} of ${roots.length} neurons`;
+    row.appendChild(count);
+    if (hasNeuronFilters(this.neuronFilters)) {
+      const clear = document.createElement("button");
+      clear.classList.add("neuroglancer-twig-capture-merge");
+      clear.textContent = "any";
+      clear.title = "Clear the neuron filters.";
+      clear.addEventListener("click", () => this.setNeuronFilter());
+      row.appendChild(clear);
+    }
+  }
+
+  /** Set one neuron filter ("" = any), or clear them all with no field. */
+  private setNeuronFilter(field?: NeuronField, value = "") {
+    if (field === undefined) this.neuronFilters = {};
+    else if (value) this.neuronFilters = { ...this.neuronFilters, [field]: value };
+    else {
+      const next = { ...this.neuronFilters };
+      delete next[field];
+      this.neuronFilters = next;
+    }
+    this.publish();
+    this.renderNeuronFilters();
+    this.rebuildRootList();
+    this.render();
   }
 
   private async openFromCatalog(rootId: string) {
@@ -1928,7 +2169,10 @@ export class TwigCaptureTab extends Tab {
    * server rejects a stale root. Supervoxels never change, which is why
    * run_twigcapture.py records them.
    */
-  private async doMerge(row: TwigCandidate): Promise<boolean> {
+  private async doMerge(
+    row: TwigCandidate,
+    batch?: { neuron: bigint },
+  ): Promise<MergeOutcome> {
     const graph = this.graphene();
     const server = graph?.graphServer;
     if (server === undefined) {
@@ -1936,18 +2180,28 @@ export class TwigCaptureTab extends Tab {
         "Twig Capture: this layer has no graphene graph to merge on.",
         4000,
       );
-      return false;
+      return "failed";
     }
     const key = rowKey(row);
+    this.skipReason.delete(key);
     this.mergeStatus.set(key, "merging");
     this.render();
+    // In a staged run nothing ever asks: whatever would need a confirm on a
+    // single merge is SKIPPED instead, with the reason on the row, and left
+    // for the reviewer to merge by hand.
+    const skip = (reason: string): MergeOutcome => {
+      this.mergeStatus.set(key, "skipped");
+      this.skipReason.set(key, reason);
+      this.render();
+      return "skipped";
+    };
     // The full record: a row from the all-neurons table has no merge
     // endpoints of its own.
     const ref = await this.ensureFull(row);
     if (ref === undefined) {
       this.mergeStatus.delete(key);
       this.render();
-      return false;
+      return "failed";
     }
     const { candidate, result } = ref;
     // SAFEGUARD: the record fetched for a table row must be the same
@@ -1955,6 +2209,7 @@ export class TwigCaptureTab extends Tab {
     // agree too, or the table and the file are out of step and the merge
     // endpoints may belong to a different candidate.
     if (candidate.target_segment_id !== row.target_segment_id) {
+      if (batch) return skip("the catalog and the result file disagree");
       StatusMessage.showTemporaryMessage(
         `Twig Capture: NOT merged. ${row.id} in ${result.name} is ` +
           `${candidate.target_segment_id}, but the list says ` +
@@ -1963,11 +2218,12 @@ export class TwigCaptureTab extends Tab {
       );
       this.mergeStatus.delete(key);
       this.render();
-      return false;
+      return "cancelled";
     }
     const sink = candidate.merge_sink;
     const source = candidate.merge_source;
     if (!sink || !source) {
+      if (batch) return skip("no merge endpoints in the result file");
       StatusMessage.showTemporaryMessage(
         "Twig Capture: this result file predates the merge endpoints " +
           "(merge_sink / merge_source). Re-run run_twigcapture.py to add them.",
@@ -1975,7 +2231,7 @@ export class TwigCaptureTab extends Tab {
       );
       this.mergeStatus.delete(key);
       this.render();
-      return false;
+      return "failed";
     }
 
     try {
@@ -1993,7 +2249,7 @@ export class TwigCaptureTab extends Tab {
           4000,
         );
         this.render();
-        return true;
+        return "already";
       }
       // HAS THE CANDIDATE CHANGED HANDS SINCE INFERENCE?
       //
@@ -2010,6 +2266,12 @@ export class TwigCaptureTab extends Tab {
       // refuses. It is the one case in this tab where proceeding silently
       // could produce an arbitrarily large edit.
       if (String(sourceRoot) !== candidate.target_segment_id) {
+        if (batch) {
+          return skip(
+            `changed hands since inference: now part of ${sourceRoot}, ` +
+              "which may be far larger than the twig scored",
+          );
+        }
         const ok = window.confirm(
           `Candidate ${candidate.target_segment_id} has been edited since ` +
             `this file was written -- it is now part of ${sourceRoot}.\n\n` +
@@ -2021,7 +2283,7 @@ export class TwigCaptureTab extends Tab {
         if (!ok) {
           this.mergeStatus.delete(key);
           this.render();
-          return false;
+          return "cancelled";
         }
       }
       // SAFEGUARD: IS THE CONTACT STILL ON THE NEURON?
@@ -2034,7 +2296,18 @@ export class TwigCaptureTab extends Tab {
       // stale the file); a sink that disagrees with them is refused from the
       // all-neurons list and needs explicit confirmation on the one-neuron
       // view, where the reviewer is looking at the neuron.
-      const neuron = await this.neuronRootConsensus(result, candidate);
+      // A staged run checks against the neuron root it is tracking instead:
+      // established by the same consensus before the run, then advanced to
+      // each merge's new root. A sink anywhere else is skipped.
+      if (batch && sinkRoot !== batch.neuron) {
+        return skip(
+          `its contact is on segment ${sinkRoot}, not on the neuron ` +
+            `(${batch.neuron})`,
+        );
+      }
+      const neuron = batch
+        ? undefined
+        : await this.neuronRootConsensus(result, candidate);
       const fromAll = this.active !== result;
       if (neuron !== undefined && neuron.root !== sinkRoot) {
         const why =
@@ -2049,17 +2322,17 @@ export class TwigCaptureTab extends Tab {
           );
           this.mergeStatus.delete(key);
           this.render();
-          return false;
+          return "cancelled";
         }
         if (!window.confirm(`${why}\n\nMerge onto ${sinkRoot} anyway?`)) {
           this.mergeStatus.delete(key);
           this.render();
-          return false;
+          return "cancelled";
         }
       }
       // SAFEGUARD: from the all-neurons list every row is a different
       // neuron, so say which one before editing.
-      if (fromAll) {
+      if (fromAll && !batch) {
         const syn = candidate.cand_synapses_total;
         const ok = window.confirm(
           `Merge candidate ${candidate.target_segment_id}\n` +
@@ -2072,7 +2345,7 @@ export class TwigCaptureTab extends Tab {
         if (!ok) {
           this.mergeStatus.delete(key);
           this.render();
-          return false;
+          return "cancelled";
         }
       }
       // positions are already in nanometres in the file, which is the unit
@@ -2147,7 +2420,7 @@ export class TwigCaptureTab extends Tab {
         5000,
       );
       this.render();
-      return true;
+      return "merged";
     } catch (e) {
       this.mergeStatus.set(key, "failed");
       // Full object, not just the message: graphene wraps HttpError and the
@@ -2158,7 +2431,7 @@ export class TwigCaptureTab extends Tab {
         6000,
       );
       this.render();
-      return false;
+      return "failed";
     }
   }
 
@@ -2169,11 +2442,11 @@ export class TwigCaptureTab extends Tab {
    */
   private async neuronRootConsensus(
     result: TwigResult,
-    except: TwigCandidate,
+    except?: TwigCandidate,
   ): Promise<{ root: bigint; agree: number; total: number } | undefined> {
     const graph = this.graphene();
     if (graph?.getRoot === undefined) return undefined;
-    const own = except.merge_sink?.supervoxel_id;
+    const own = except?.merge_sink?.supervoxel_id;
     const svs = [
       ...new Set(
         result.candidates
@@ -2212,6 +2485,270 @@ export class TwigCaptureTab extends Tab {
     return { root: best, agree, total };
   }
 
+  // ---- stage, review, merge staged ------------------------------------------
+
+  /** The staged list, if it belongs to the neuron on screen. */
+  private activeStage() {
+    const stage = this.stage;
+    return stage !== undefined && stage.file === this.active?.name
+      ? stage
+      : undefined;
+  }
+
+  private isJoined(c: TwigCandidate): boolean {
+    const st = this.mergeStatus.get(rowKey(c));
+    return st === "done" || st === "already" || st === "merging";
+  }
+
+  /**
+   * What Stage all would take: the listed candidates of the open neuron that
+   * can still be merged. Leaves out rows already joined, rows someone has
+   * judged "no_merge", and rows without merge endpoints.
+   */
+  private stageable(): TwigCandidate[] {
+    if (this.active === undefined) return [];
+    return this.filtered().filter(
+      (c) =>
+        !this.isJoined(c) &&
+        this.decisionFor(c)?.tag !== "no_merge" &&
+        !!c.merge_sink &&
+        !!c.merge_source,
+    );
+  }
+
+  /** Staged, still ticked, and not merged yet. */
+  private stagedPicks(): TwigCandidate[] {
+    const stage = this.activeStage();
+    if (stage === undefined) return [];
+    return stage.rows.filter(
+      (c) => stage.selected.has(rowKey(c)) && !this.isJoined(c),
+    );
+  }
+
+  private updateBulkButtons() {
+    const b = this.mergeAllButton;
+    const stage = this.activeStage();
+    this.clearStageButton.style.display = stage ? "" : "none";
+    this.clearStageButton.disabled = this.batch !== undefined;
+    if (this.batch !== undefined) {
+      const { done, total, stop } = this.batch;
+      b.textContent = stop ? "Stopping\u2026" : `Stop (${done}/${total})`;
+      b.disabled = stop;
+      b.title =
+        "Stop after the merge in progress. Merges already made stay; each " +
+        "has its own Undo.";
+      return;
+    }
+    if (stage !== undefined) {
+      const n = this.stagedPicks().length;
+      b.textContent = `Merge staged (${n})`;
+      b.disabled = n === 0;
+      b.title =
+        "Merge the ticked candidates into this neuron, one at a time. Each is " +
+        "re-resolved from its supervoxels first; one that changed hands " +
+        "since inference, or whose contact is no longer on the neuron, is " +
+        "skipped and left for you. A failed merge stops the run.";
+      return;
+    }
+    if (this.active === undefined) {
+      b.textContent = "Stage all";
+      b.disabled = true;
+      b.title =
+        "Pick one neuron (root id above) to stage its candidates. Bulk " +
+        "merging works one neuron at a time.";
+      return;
+    }
+    const n = this.stageable().length;
+    b.textContent = `Stage all (${n})`;
+    b.disabled =
+      n === 0 ||
+      this.checking !== undefined ||
+      this.graphene()?.graphServer === undefined;
+    b.title =
+      "Stage every listed candidate of this neuron that can still be merged " +
+      "(not already joined, not judged no_merge) and show them all in the " +
+      "view. Nothing is edited: untick the ones you do not want, then Merge " +
+      "staged.";
+  }
+
+  /** Freeze the listed, mergeable candidates into a ticked list; show them. */
+  private async stageAll() {
+    const result = this.active;
+    if (result === undefined || this.stage !== undefined) return;
+    const rows = this.stageable();
+    if (rows.length === 0) return;
+    const stage = {
+      file: result.name,
+      rows,
+      selected: new Set(rows.map(rowKey)),
+      roots: new Map<string, bigint>(),
+      shown: new Set<bigint>(),
+    };
+    this.stage = stage;
+    this.render();
+    // Show every staged candidate as it is TODAY, resolved from its own
+    // supervoxel -- the file's segment ids may be retired roots. Only roots
+    // that were not already visible are added (and later removed), so the
+    // neuron and anything the reviewer had open are never hidden.
+    const graph = this.graphene();
+    if (graph?.getRoot === undefined) return;
+    const visible =
+      this.layer.displayState.segmentationGroupState.value.visibleSegments;
+    const queue = [...rows];
+    const worker = async () => {
+      for (;;) {
+        const c = queue.shift();
+        if (c === undefined || this.stage !== stage) return;
+        try {
+          const root = await graph.getRoot!(
+            BigInt(c.merge_source!.supervoxel_id),
+          );
+          if (this.stage !== stage) return;
+          stage.roots.set(rowKey(c), root);
+          if (stage.selected.has(rowKey(c)) && !visible.has(root)) {
+            visible.set(root, true);
+            stage.shown.add(root);
+          }
+        } catch {
+          // not shown; the merge re-resolves it anyway
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, rows.length) }, worker));
+  }
+
+  /** Tick or untick one staged row; its segment is shown or hidden to match. */
+  private toggleStaged(c: TwigCandidate, on: boolean) {
+    const stage = this.activeStage();
+    if (stage === undefined) return;
+    const key = rowKey(c);
+    if (on) stage.selected.add(key);
+    else stage.selected.delete(key);
+    const root = stage.roots.get(key);
+    if (root !== undefined) {
+      const visible =
+        this.layer.displayState.segmentationGroupState.value.visibleSegments;
+      if (on && !visible.has(root)) {
+        visible.set(root, true);
+        stage.shown.add(root);
+      } else if (!on && stage.shown.has(root)) {
+        visible.set(root, false);
+        stage.shown.delete(root);
+      }
+    }
+    this.render();
+  }
+
+  /** Drop the staged list, hiding what staging showed and was not merged. */
+  private clearStage() {
+    const stage = this.stage;
+    if (stage === undefined || this.batch !== undefined) return;
+    const visible =
+      this.layer.displayState.segmentationGroupState.value.visibleSegments;
+    for (const root of stage.shown) visible.set(root, false);
+    this.stage = undefined;
+    this.render();
+  }
+
+  /**
+   * Merge the ticked staged candidates, one after another.
+   *
+   * Sequential because each merge gives the neuron a new root, which the
+   * next merge must name. The neuron's root is established ONCE, up front,
+   * from several of its contact points, and the run refuses to start if they
+   * disagree (the neuron may have been split). From then on it is advanced
+   * to each merge's new root, and every candidate's contact must resolve to
+   * it -- anything else is skipped, never merged.
+   */
+  private async mergeStaged() {
+    const result = this.active;
+    const stage = this.activeStage();
+    if (result === undefined || stage === undefined) return;
+    if (this.batch !== undefined) return;
+    const picks = this.stagedPicks();
+    if (picks.length === 0) return;
+    const neuron = await this.neuronRootConsensus(result);
+    if (neuron === undefined) {
+      StatusMessage.showTemporaryMessage(
+        "Twig Capture: could not establish this neuron's root today from " +
+          "its contact points, so nothing was merged. Merge one at a time.",
+        8000,
+      );
+      return;
+    }
+    if (neuron.agree !== neuron.total) {
+      StatusMessage.showTemporaryMessage(
+        `Twig Capture: nothing merged. Only ${neuron.agree} of ` +
+          `${neuron.total} of this neuron's contact points are on ` +
+          `${neuron.root}; it may have been split since inference. Check ` +
+          "it, then merge one at a time.",
+        10000,
+      );
+      return;
+    }
+    const syn = picks.reduce((a, c) => a + (c.cand_synapses_total ?? 0), 0);
+    const ok = window.confirm(
+      `Merge ${picks.length} staged candidate(s) into neuron ` +
+        `${result.root_id}` +
+        `${String(neuron.root) !== result.root_id ? ` (today ${neuron.root})` : ""}?\n` +
+        `  ${syn} synapses on them in total.\n\n` +
+        "They are merged one at a time. Before each, both sides are " +
+        "re-resolved from their supervoxels; a candidate that has changed " +
+        "hands since inference, or whose contact is no longer on this " +
+        "neuron, is SKIPPED and left for you. A failed merge stops the run, " +
+        "and Stop ends it after the current merge.\n\n" +
+        "Each merge edits the shared segmentation and is attributed to you.",
+    );
+    if (!ok) return;
+
+    const batch = { stop: false, done: 0, total: picks.length };
+    this.batch = batch;
+    const tally = { merged: 0, already: 0, skipped: 0 };
+    let failed: TwigCandidate | undefined;
+    let expected = neuron.root;
+    try {
+      for (const c of picks) {
+        if (batch.stop) break;
+        // Unticked while the run was going.
+        if (!stage.selected.has(rowKey(c))) {
+          batch.total--;
+          continue;
+        }
+        const out = await this.doMerge(c, { neuron: expected });
+        batch.done++;
+        if (out === "merged") {
+          tally.merged++;
+          expected = this.targetRoots.get(result.name) ?? expected;
+        } else if (out === "already") {
+          tally.already++;
+        } else if (out === "skipped") {
+          tally.skipped++;
+        } else {
+          failed = c;
+          break;
+        }
+        this.updateBulkButtons();
+      }
+    } finally {
+      this.batch = undefined;
+      this.render();
+    }
+    const bits = [`${tally.merged} merged`];
+    if (tally.already) bits.push(`${tally.already} already joined`);
+    if (tally.skipped) bits.push(`${tally.skipped} skipped (see rows)`);
+    const left = this.stagedPicks().length;
+    StatusMessage.showTemporaryMessage(
+      `Twig Capture: ${bits.join(", ")}` +
+        (failed
+          ? `; stopped at ${failed.target_segment_id}, which failed`
+          : batch.stop
+            ? "; stopped"
+            : "") +
+        (left ? `. ${left} still staged.` : "."),
+      10000,
+    );
+  }
+
   /** The rows to filter: the active neuron's, else the all-neurons table. */
   private sourceRows(): TwigCandidate[] {
     if (this.active !== undefined) return this.active.candidates;
@@ -2224,27 +2761,27 @@ export class TwigCaptureTab extends Tab {
     // every merge or verdict re-renders, so its filtered + sorted list is
     // cached until a filter, the table or the decisions change.
     if (this.active === undefined && this.table !== undefined) {
-      const key = [
+      const filterKey = JSON.stringify([
         this.probOp,
         this.minProb,
         this.mito,
         this.review,
         this.sortKey,
-        this.decisionsAllowed() ? this.allDecisionsVersion : -1,
-      ].join("|");
+        this.neuronFiltersActive() ? this.neuronFilters : null,
+        this.neuronMeta?.generated ?? null,
+      ]);
+      const key =
+        filterKey +
+        `|${this.decisionsAllowed() ? this.allDecisionsVersion : -1}`;
       const cached = this.allFiltered;
       if (cached?.table === this.table && cached.key === key) {
         return cached.rows;
       }
       const rows = this.filterAndSort(this.sourceRows());
       this.allFiltered = { table: this.table, key, rows };
-      // New filters or new decisions: start again at the first page, unless
-      // only decisions changed (a verdict just recorded) -- then keep the
-      // reviewer's place.
-      if (
-        cached?.key.split("|").slice(0, 5).join("|") !==
-        key.split("|").slice(0, 5).join("|")
-      ) {
+      // New filters: start again at the first page. Only new decisions (a
+      // verdict just recorded): keep the reviewer's place.
+      if (cached?.key.slice(0, cached.key.lastIndexOf("|")) !== filterKey) {
         this.allShown = ALL_NEURONS_PAGE;
       }
       return rows;
@@ -2255,6 +2792,9 @@ export class TwigCaptureTab extends Tab {
   private filterAndSort(source: TwigCandidate[]): TwigCandidate[] {
     const rows = source.filter((c) => {
       if (!passesProb(c.prob_merge, this.probOp, this.minProb)) return false;
+      // Neuron filters pick neurons, so they apply to the all-neurons list
+      // only; an opened neuron was chosen explicitly.
+      if (c._lite && !this.neuronPasses(c._root ?? "")) return false;
       // No L2-node filter. The candidate search already caps it at
       // max_candidate_l2_nodes (20), so every row here is a twig by
       // construction and the control only ever hid real candidates.
@@ -2301,6 +2841,16 @@ export class TwigCaptureTab extends Tab {
     // Keeps the facet selects in step with state restored from a link, and
     // disables `review` once we know whether any decisions can be loaded.
     this.renderFilters();
+    // A staged list belongs to one neuron; leaving it drops the list (the
+    // segments it showed stay visible -- hiding them unasked would be worse).
+    if (
+      this.stage !== undefined &&
+      this.batch === undefined &&
+      this.stage.file !== this.active?.name
+    ) {
+      this.stage = undefined;
+    }
+    this.updateBulkButtons();
 
     // PRESERVE THE SCROLL POSITION ACROSS A RE-RENDER.
     //
@@ -2356,6 +2906,8 @@ export class TwigCaptureTab extends Tab {
     }
 
     const bits = [`neuron ${result.root_id}`];
+    const annot = this.neuronMeta?.neurons.get(result.root_id);
+    if (neuronLabel(annot)) bits.push(neuronLabel(annot));
     if (result.models_used) bits.push(`model ${result.models_used}`);
     if (result.connectivity !== undefined)
       bits.push(`${result.connectivity === 3 ? 26 : 6}-conn`);
@@ -2364,9 +2916,17 @@ export class TwigCaptureTab extends Tab {
     if (result.timestamp) bits.push(result.timestamp.slice(0, 16));
     this.summary.textContent = bits.join("  ·  ");
 
-    const rows = this.filtered();
-    this.countEl.textContent = `${rows.length} of ${result.candidates.length} candidates`;
-    this.mergeAllButton.textContent = `Merge all (${rows.length})`;
+    const stage = this.activeStage();
+    const rows = stage !== undefined ? stage.rows : this.filtered();
+    if (stage !== undefined) {
+      const picks = this.stagedPicks();
+      const syn = picks.reduce((a, c) => a + (c.cand_synapses_total ?? 0), 0);
+      this.countEl.textContent =
+        `${picks.length} of ${rows.length} staged to merge` +
+        (syn ? `  ·  ${syn} syn` : "");
+    } else {
+      this.countEl.textContent = `${rows.length} of ${result.candidates.length} candidates`;
+    }
 
     if (this.checking !== undefined) {
       const { done, total } = this.checking;
@@ -2391,6 +2951,16 @@ export class TwigCaptureTab extends Tab {
       return;
     }
 
+    if (stage !== undefined) {
+      const note = document.createElement("div");
+      note.classList.add("neuroglancer-twig-capture-hint");
+      note.classList.add("neuroglancer-twig-capture-stage-note");
+      note.textContent =
+        `Staged: ${rows.length} candidate(s) of this neuron, frozen from the ` +
+        "filters when staged and shown in the view. Untick any you do not " +
+        "want, then Merge staged. Clear returns to the filtered list.";
+      this.listEl.appendChild(note);
+    }
     for (const candidate of rows) {
       this.listEl.appendChild(this.makeRow(candidate));
     }
@@ -2411,7 +2981,6 @@ export class TwigCaptureTab extends Tab {
       el.textContent = text;
       this.listEl.appendChild(el);
     };
-    this.mergeAllButton.textContent = "Merge all";
     if (this.tableState !== "ready" || this.table === undefined) {
       this.countEl.textContent = "";
       this.summary.textContent = "all neurons";
@@ -2435,8 +3004,12 @@ export class TwigCaptureTab extends Tab {
       return;
     }
     const { files, rows: all } = this.table;
+    const neurons = this.neuronFiltersActive()
+      ? `${files.filter((f) => this.neuronPasses(f.root_id)).length} of ` +
+        `${files.length} neuron(s)`
+      : `${files.length} neuron(s)`;
     this.summary.textContent =
-      `all neurons  ·  ${files.length} neuron(s)  ·  latest run of each` +
+      `all neurons  ·  ${neurons}  ·  latest run of each` +
       (this.table.generated
         ? `  ·  table ${this.table.generated.slice(0, 16)}`
         : "");
@@ -2491,6 +3064,28 @@ export class TwigCaptureTab extends Tab {
     const main = document.createElement("div");
     main.classList.add("neuroglancer-twig-capture-main");
 
+    // Staged list: a tick per row, for what Merge staged will include.
+    const stage = this.activeStage();
+    if (stage !== undefined) {
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.classList.add("neuroglancer-twig-capture-stagebox");
+      box.checked = stage.selected.has(rowKey(candidate));
+      box.disabled = this.isJoined(candidate);
+      box.title = box.disabled
+        ? "Already part of the neuron."
+        : "Ticked rows are merged by Merge staged. Untick to leave this one " +
+          "out; it is hidden in the view too.";
+      box.addEventListener("click", (event: MouseEvent) => {
+        event.stopPropagation();
+        this.toggleStaged(candidate, box.checked);
+      });
+      main.appendChild(box);
+      if (!box.checked && !box.disabled) {
+        row.classList.add("neuroglancer-twig-capture-row-unstaged");
+      }
+    }
+
     const prob = document.createElement("span");
     prob.classList.add("neuroglancer-twig-capture-prob");
     prob.textContent = fmt(candidate.prob_merge);
@@ -2506,10 +3101,13 @@ export class TwigCaptureTab extends Tab {
       const neuron = document.createElement("span");
       neuron.classList.add("neuroglancer-twig-capture-tag");
       neuron.classList.add("neuroglancer-twig-capture-tag-neuron");
-      neuron.textContent = `→ ${candidate._root}`;
+      const annot = this.neuronMeta?.neurons.get(candidate._root);
+      const label = neuronLabel(annot);
+      neuron.textContent = `→ ${candidate._root}${label ? ` ${label}` : ""}`;
       neuron.title =
         `Candidate for neuron ${candidate._root} (its root when inference ` +
-        `ran; file ${candidate._file}). Merge joins it to that neuron.`;
+        `ran; file ${candidate._file}). Merge joins it to that neuron.` +
+        (this.neuronMeta ? `\n\n${neuronTooltip(annot)}` : "");
       main.appendChild(neuron);
     }
 
@@ -2568,6 +3166,17 @@ export class TwigCaptureTab extends Tab {
     const pending = this.deciding.has(key);
     const allowed = this.decisionsAllowed();
 
+    if (status === "skipped") {
+      const chip = document.createElement("span");
+      chip.classList.add("neuroglancer-twig-capture-tag");
+      chip.classList.add("neuroglancer-twig-capture-tag-warn");
+      chip.textContent = "skipped";
+      chip.title =
+        `Merge staged left this one alone: ${this.skipReason.get(key) ?? "?"}. ` +
+        "Look at it, then Merge it on its own if it is right.";
+      main.appendChild(chip);
+    }
+
     // The recorded verdict stays on the TOP row, beside the other chips: it
     // is a fact about the candidate, like the synapse count, and belongs with
     // the things a reviewer scans rather than with the controls.
@@ -2611,8 +3220,13 @@ export class TwigCaptureTab extends Tab {
             : status === "failed"
               ? "Retry"
               : "Merge";
+    // Also while a staged run is going: merges must be strictly one at a
+    // time, since each changes the neuron's root.
     merge.disabled =
-      status === "done" || status === "merging" || status === "already";
+      status === "done" ||
+      status === "merging" ||
+      status === "already" ||
+      this.batch !== undefined;
     merge.title =
       "Writes to the chunkedgraph: adds an edge joining this candidate to the " +
       "neuron, attributed to you and visible to everyone." +
@@ -2665,6 +3279,7 @@ export class TwigCaptureTab extends Tab {
     const entry = this.history.get(key);
     if (entry !== undefined && status !== "merging") {
       const undo = document.createElement("button");
+      undo.disabled = this.batch !== undefined;
       undo.classList.add("neuroglancer-twig-capture-merge");
       undo.textContent = entry.undone ? "Redo" : "Undo";
       undo.title = entry.undone
@@ -2695,7 +3310,7 @@ export class TwigCaptureTab extends Tab {
       actions.appendChild(open);
     }
 
-    if (status === "failed") {
+    if (status === "failed" || status === "skipped") {
       row.classList.add("neuroglancer-twig-capture-row-failed");
     } else if (status === "done" || status === "already") {
       row.classList.add("neuroglancer-twig-capture-row-done");
