@@ -271,17 +271,33 @@ export class DecisionStore {
    * When a candidate has been reviewed more than once the LATEST row wins.
    */
   async fetchForNeuron(rootId: string): Promise<Map<string, DecisionRow>> {
+    // Built by hand, not JSON.stringify: rootId is above 2^53 and would be
+    // rounded if it ever became a JS number.
+    return this.fetchRows(
+      `,"filter_equal_dict":{"${TABLE}":{"pt_root_id":${rootId}}}`,
+    );
+  }
+
+  /**
+   * Every decision in the table, keyed by candidate id, latest winning --
+   * for the all-neurons view, which lists candidates of every neuron at once.
+   * One query: the tables hold tens of thousands of rows at most (Aedes,
+   * 2026-11-20: ~27k).
+   */
+  async fetchAll(): Promise<Map<string, DecisionRow>> {
+    return this.fetchRows("");
+  }
+
+  private async fetchRows(filter: string): Promise<Map<string, DecisionRow>> {
     const url =
       `${this.server}/materialize/api/v3/datastack/${this.datastack}/query` +
       "?return_pyarrow=false&arrow_format=false&merge_reference=false" +
       "&allow_missing_lookups=true&direct_sql_pandas=true";
 
-    // Built by hand, not JSON.stringify: rootId is above 2^53 and would be
-    // rounded if it ever became a JS number.
     const body =
       `{"table":"${TABLE}",` +
-      `"timestamp":"${new Date().toISOString()}",` +
-      `"filter_equal_dict":{"${TABLE}":{"pt_root_id":${rootId}}}}`;
+      `"timestamp":"${new Date().toISOString()}"` +
+      `${filter}}`;
 
     const response = await fetch(url, {
       method: "POST",

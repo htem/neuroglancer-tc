@@ -63,6 +63,12 @@ import {
   DecisionStore,
   decisionsAllowed,
 } from "#src/layer/segmentation/twig_capture_decisions.js";
+import type { CandidateTable } from "#src/layer/segmentation/twig_capture_table.js";
+import {
+  CANDIDATE_TABLE_FILE,
+  fetchCandidateTable,
+  passesProb,
+} from "#src/layer/segmentation/twig_capture_table.js";
 import { StatusMessage } from "#src/status.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { NullarySignal } from "#src/util/signal.js";
@@ -88,6 +94,9 @@ export const TWIG_CAPTURE_JSON_KEY = "twigCapture";
  *                runs, and a followed-forward root means the file may be
  *                named after a successor. This is what makes the tab
  *                non-empty.
+ *   probOp       ">=" (default) or "<=": which side of minProb is shown.
+ *                "<=" is for low-probability fragments that carry many
+ *                synapses, which a reviewer may still want to look at.
  *   minProb, mito, review, sortKey
  *                four scalars that decide WHICH rows are shown and in what
  *                order. Share "the top one by orphan synapses" without the
@@ -113,6 +122,8 @@ export class TwigCaptureState {
   file = "";
   candidate = "";
   minProb = 0.75;
+  /** ">=" | "<=": keep candidates at or above minProb, or at or below it. */
+  probOp: ">=" | "<=" = ">=";
   /** "any" | "hide" | "only" -- replaced the hideMito/mitoOnly pair. */
   mito = "any";
   /** "any" | "none" | "done" | "merge" | "no_merge" | "unsure". */
@@ -128,6 +139,7 @@ export class TwigCaptureState {
     if (this.file) x.file = this.file;
     if (this.candidate) x.candidate = this.candidate;
     if (this.minProb !== 0.75) x.minProb = this.minProb;
+    if (this.probOp !== ">=") x.probOp = this.probOp;
     if (this.mito !== "any") x.mito = this.mito;
     if (this.review !== "any") x.review = this.review;
     if (this.sortKey !== "prob") x.sortKey = this.sortKey;
@@ -148,6 +160,7 @@ export class TwigCaptureState {
     if (typeof o.candidate === "string") this.candidate = o.candidate;
     if (typeof o.minProb === "number" && Number.isFinite(o.minProb))
       this.minProb = o.minProb;
+    this.probOp = o.probOp === "<=" ? "<=" : ">=";
     // Links made before 2026-10-06 carry the hideMito/mitoOnly booleans, and
     // those links are already pasted into chats and tickets. Read them, then
     // let the new key win if both somehow appear.
@@ -218,7 +231,34 @@ interface TwigCandidate {
    * without a supervoxel_synapses table.
    */
   cand_synapses_total?: number | null;
+  /**
+   * Which result file this candidate came from, set on load (parseResult) or
+   * by the all-neurons table. `id` (cand_N) is unique only within one file,
+   * so per-row state is keyed by file and id together -- see rowKey().
+   */
+  _file?: string;
+  /** The neuron's root as recorded in that file (inference time). */
+  _root?: string;
+  /**
+   * A row from the all-neurons table: display fields only. Acting on it
+   * fetches the neuron's file for the full record (ensureFull).
+   */
+  _lite?: boolean;
 }
+
+/** Per-row state key: cand_N is only unique within one result file. */
+function rowKey(c: TwigCandidate): string {
+  return `${c._file ?? ""}#${c.id}`;
+}
+
+/** A full candidate record together with the result file it belongs to. */
+interface RowRef {
+  result: TwigResult;
+  candidate: TwigCandidate;
+}
+
+/** Rows rendered at most in the all-neurons view; the rest are counted. */
+const ALL_NEURONS_ROW_CAP = 500;
 
 /**
  * Real synapses inside one scoring window, attributed by supervoxel.
@@ -304,16 +344,22 @@ function parseResult(name: string, text: string): TwigResult {
   if (!Array.isArray(obj.candidates)) {
     throw new Error(`${name}: no "candidates" array -- not an AMP result file`);
   }
+  const rootId = String(obj.root_id ?? "unknown");
+  const candidates = obj.candidates as TwigCandidate[];
+  for (const c of candidates) {
+    c._file = name;
+    c._root = rootId;
+  }
   return {
     name,
-    root_id: String(obj.root_id ?? "unknown"),
+    root_id: rootId,
     timestamp: obj.timestamp,
     dataset: obj.dataset,
     models_used: obj.models_used,
     merge_threshold: obj.merge_threshold,
     connectivity: obj.connectivity,
     candidate_count: obj.candidate_count,
-    candidates: obj.candidates as TwigCandidate[],
+    candidates,
     rejected: obj.rejected,
     synapse_box_wide_nm: obj.filters?.synapse_box_wide_nm ?? undefined,
   };
@@ -345,9 +391,13 @@ const CATALOG_URL_KEY = "neuroglancer-twig-capture-catalog-url";
  * v1.0 (2026-09-30): first version fit to hand to someone else. Catalog from
  * a served directory, per-candidate synapse counts, merge with undo/redo, the
  * already-merged and changed-hands checks on load.
+ *
+ * v1.1 (2026-11-21): an all-neurons view when no root id is chosen (every
+ * candidate in the catalog that passes the filters, from candidates.json.gz,
+ * with merge and verdicts inline), and a p >= / p <= toggle.
  */
-const TWIG_CAPTURE_VERSION = "v1.0";
-const TWIG_CAPTURE_DATE = "20260930";
+const TWIG_CAPTURE_VERSION = "v1.1";
+const TWIG_CAPTURE_DATE = "20261121";
 
 const DEFAULT_CATALOG_URL =
   "https://catmaid2.hms.harvard.edu/twigcapture_aedes/";
@@ -461,6 +511,7 @@ export class TwigCaptureTab extends Tab {
   private catalog: CatalogEntry[] = [];
   private catalogUrl = "";
   private mitoSelect: HTMLSelectElement | undefined;
+  private probOpSelect: HTMLSelectElement | undefined;
   private reviewSelect: HTMLSelectElement | undefined;
   private mergeAllButton = document.createElement("button");
   /** candidate id -> outcome, so a row is not offered twice. */
@@ -482,10 +533,33 @@ export class TwigCaptureTab extends Tab {
   private lastRenderedFile: string | undefined;
   private decisions = new Map<string, DecisionRow>();
   private decisionStore: DecisionStore | undefined;
-  /** Candidates whose decision POST is in flight, so the row can show it. */
+  /** Rows (rowKey) whose decision POST is in flight, so the row can show it. */
   private deciding = new Set<string>();
-  /** The target neuron's root TODAY; changes with every merge in this tab. */
-  private activeTargetRoot: bigint | undefined;
+  /**
+   * Each neuron's root TODAY, by result file name; changes with every merge
+   * in this tab. Per file rather than one value because the all-neurons view
+   * merges into many neurons.
+   */
+  private targetRoots = new Map<string, bigint>();
+
+  // ---- all-neurons view ----------------------------------------------------
+  /** The catalog's candidates.json.gz, once fetched. */
+  private table: CandidateTable | undefined;
+  /** Which catalog `table` (and tableState) belong to. */
+  private tableFor = "";
+  private tableState: "none" | "loading" | "ready" | "missing" | "error" =
+    "none";
+  private tableError = "";
+  /** Every decision in the table, by candidate id (all-neurons view). */
+  private allDecisions = new Map<string, DecisionRow>();
+  /** Bumped whenever allDecisions changes; part of the filter cache key. */
+  private allDecisionsVersion = 0;
+  private allFiltered:
+    | { table: CandidateTable; key: string; rows: TwigCandidate[] }
+    | undefined;
+  /** Full result files fetched to act on table rows, by file name. */
+  private fileCache = new Map<string, Promise<TwigResult>>();
+  private allButton = document.createElement("button");
   /**
    * Progress of the check that runs on load, or undefined when not running.
    *
@@ -513,6 +587,7 @@ export class TwigCaptureTab extends Tab {
 
   // filters
   private minProb = 0.75;
+  private probOp: ">=" | "<=" = ">=";
   private mito = "any";
   private review = "any";
   private sortKey: "prob" | "size" | "contact" | "synapses" = "prob";
@@ -529,6 +604,7 @@ export class TwigCaptureTab extends Tab {
     t.catalogUrl = this.catalogUrl;
     t.file = this.active?.name ?? "";
     t.minProb = this.minProb;
+    t.probOp = this.probOp;
     t.mito = this.mito;
     t.review = this.review;
     t.sortKey = this.sortKey;
@@ -541,6 +617,7 @@ export class TwigCaptureTab extends Tab {
     // the shared link's values rather than snapping to them afterwards.
     const saved = layer.twigCapture;
     this.minProb = saved.minProb;
+    this.probOp = saved.probOp;
     this.mito = saved.mito;
     this.review = saved.review;
     this.sortKey = saved.sortKey as typeof this.sortKey;
@@ -708,13 +785,24 @@ export class TwigCaptureTab extends Tab {
     this.rootInput.addEventListener("input", () => {
       const value = this.rootInput.value.trim();
       if (value && this.catalog.some((e) => e.root_id === value)) open();
+      // Emptying the box is "no root id selected": every neuron.
+      else if (value === "" && this.active !== undefined) this.showAll();
     });
     this.rootInput.addEventListener("change", open);
     this.rootInput.addEventListener("keydown", (event: KeyboardEvent) => {
       if (event.key === "Enter") open();
     });
+    this.allButton.textContent = "All neurons";
+    this.allButton.title =
+      "List candidates from every neuron in the catalog that pass the " +
+      "filters (from " +
+      CANDIDATE_TABLE_FILE +
+      "). Merge and verdicts work on these rows too.";
+    this.allButton.disabled = true;
+    this.allButton.addEventListener("click", () => this.showAll());
     search.appendChild(this.rootInput);
     search.appendChild(this.rootList);
+    search.appendChild(this.allButton);
     row.appendChild(search);
 
     if (this.catalogUrl) void this.loadCatalog(this.catalogUrl);
@@ -750,6 +838,13 @@ export class TwigCaptureTab extends Tab {
       const results = Array.isArray(index?.results) ? index.results : [];
       this.catalog = results as CatalogEntry[];
       this.rootInput.disabled = this.catalog.length === 0;
+      this.allButton.disabled = this.catalog.length === 0;
+      // A different catalog, or a forced reload: the table is stale.
+      if (this.tableFor !== base || force) {
+        this.table = undefined;
+        this.tableState = "none";
+        this.tableFor = base;
+      }
       this.catalogStatus.textContent = `${this.catalog.length} file(s)`;
       this.catalogStatus.title = index?.generated
         ? `index generated ${index.generated}`
@@ -761,6 +856,9 @@ export class TwigCaptureTab extends Tab {
       const want = this.layer.twigCapture.file;
       if (want && !this.results.some((r) => r.name === want)) {
         void this.loadUrl(base + want);
+      } else if (!want && this.active === undefined) {
+        // No neuron named: the all-neurons view.
+        void this.loadTable(force);
       }
       removeChildren(this.rootList);
       for (const entry of this.catalog) {
@@ -807,6 +905,206 @@ export class TwigCaptureTab extends Tab {
       ? this.catalogUrl
       : this.catalogUrl + "/";
     await this.loadUrl(base + entry.file);
+  }
+
+  // ---- all-neurons view ----------------------------------------------------
+
+  /** No neuron chosen and a catalog to list from. */
+  private isAllMode(): boolean {
+    return this.active === undefined && this.catalog.length > 0;
+  }
+
+  private catalogBase(): string {
+    return this.catalogUrl.endsWith("/")
+      ? this.catalogUrl
+      : this.catalogUrl + "/";
+  }
+
+  /** Leave the current neuron and list candidates from every neuron. */
+  private showAll() {
+    this.active = undefined;
+    this.rootInput.value = "";
+    this.layer.twigCapture.candidate = "";
+    this.publish();
+    this.render();
+    void this.loadTable();
+  }
+
+  /**
+   * Fetch the catalog's candidate table (once per catalog unless forced),
+   * then every decision, then check the listed rows against the graph.
+   */
+  private async loadTable(force = false) {
+    if (!this.catalogUrl || this.catalog.length === 0) return;
+    const base = this.catalogBase();
+    if (!force && this.tableFor === base && this.tableState !== "none") {
+      if (this.tableState === "ready") void this.loadAllDecisions();
+      return;
+    }
+    this.tableFor = base;
+    this.tableState = "loading";
+    this.render();
+    try {
+      const table = await fetchCandidateTable(base, force);
+      if (this.tableFor !== base) return; // catalog switched meanwhile
+      this.table = table;
+      this.tableState = table === undefined ? "missing" : "ready";
+    } catch (e) {
+      if (this.tableFor !== base) return;
+      this.table = undefined;
+      this.tableState = "error";
+      this.tableError = String(e);
+    }
+    this.render();
+    if (this.tableState === "ready") {
+      await this.loadAllDecisions();
+      if (this.isAllMode()) void this.refreshAllRows();
+    }
+  }
+
+  /** The dataset (datastack) of the rows being listed. */
+  private listDataset(): string | undefined {
+    return (
+      this.active?.dataset ??
+      this.table?.files.find((f) => f.dataset)?.dataset ??
+      undefined
+    );
+  }
+
+  private async loadAllDecisions() {
+    if (!this.decisionsAllowed()) return;
+    const store = this.store(this.listDataset());
+    if (store === undefined) return;
+    try {
+      this.allDecisions = await store.fetchAll();
+      this.allDecisionsVersion++;
+      this.render();
+    } catch (e) {
+      StatusMessage.showTemporaryMessage(
+        `Twig Capture: could not read decisions: ${e}`,
+        5000,
+      );
+    }
+  }
+
+  /** The recorded verdict for a row, from whichever view it is listed in. */
+  private decisionFor(c: TwigCandidate): DecisionRow | undefined {
+    return c._lite
+      ? this.allDecisions.get(c.target_segment_id)
+      : this.decisions.get(c.target_segment_id);
+  }
+
+  /** A result file, fetched once and cached; the active file if it is that. */
+  private fetchResultFile(file: string): Promise<TwigResult> {
+    const loaded = this.results.find((r) => r.name === file);
+    if (loaded !== undefined) return Promise.resolve(loaded);
+    let p = this.fileCache.get(file);
+    if (p === undefined) {
+      const url = this.catalogBase() + file;
+      p = (async () => {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+        return parseResult(file, await response.text());
+      })();
+      // A failure must not stick: drop it so the next click retries.
+      p.catch(() => this.fileCache.delete(file));
+      this.fileCache.set(file, p);
+    }
+    return p;
+  }
+
+  /**
+   * The full record behind a row, with its result file. A row from the
+   * all-neurons table carries display fields only; merging and recording a
+   * verdict need merge_sink / merge_source, which are in the neuron's file.
+   */
+  private async ensureFull(c: TwigCandidate): Promise<RowRef | undefined> {
+    const file = c._file ?? this.active?.name;
+    if (file === undefined) return undefined;
+    try {
+      const result = await this.fetchResultFile(file);
+      const candidate = c._lite
+        ? result.candidates.find((x) => x.id === c.id)
+        : c;
+      if (candidate === undefined) {
+        throw new Error(`${c.id} is not in ${file}; the catalog may be stale`);
+      }
+      return { result, candidate };
+    } catch (e) {
+      StatusMessage.showTemporaryMessage(
+        `Twig Capture: could not load the neuron's result file: ${e}`,
+        6000,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Mark rows that are already part of their neuron, for the rows the
+   * all-neurons view shows. One getRoot per row plus one per neuron, rather
+   * than the single-neuron check's file download: the table has no
+   * supervoxels, so this resolves the recorded root ids instead. It only
+   * labels rows; doMerge re-checks from supervoxels before any edit.
+   */
+  private async refreshAllRows() {
+    const graph = this.graphene();
+    if (graph?.getRoot === undefined || !this.isAllMode()) return;
+    const rows = this.filtered().slice(0, ALL_NEURONS_ROW_CAP);
+    const neuronRoot = new Map<string, Promise<bigint>>();
+    const rootOf = (c: TwigCandidate) => {
+      const file = c._file ?? "";
+      const known = this.targetRoots.get(file);
+      if (known !== undefined) return Promise.resolve(known);
+      let p = neuronRoot.get(file);
+      if (p === undefined) {
+        p = graph.getRoot!(BigInt(c._root ?? "0"));
+        neuronRoot.set(file, p);
+      }
+      return p;
+    };
+    this.refreshButton.disabled = true;
+    this.refreshButton.textContent = "Refreshing…";
+    let already = 0;
+    try {
+      const queue = [...rows];
+      const worker = async () => {
+        for (;;) {
+          const c = queue.shift();
+          if (c === undefined) return;
+          try {
+            const [target, cand] = await Promise.all([
+              rootOf(c),
+              graph.getRoot!(BigInt(c.target_segment_id)),
+            ]);
+            const key = rowKey(c);
+            if (cand === target) {
+              already++;
+              if (this.mergeStatus.get(key) !== "done") {
+                this.mergeStatus.set(key, "already");
+              }
+            } else if (this.mergeStatus.get(key) === "already") {
+              this.mergeStatus.delete(key);
+            }
+          } catch {
+            // one failed lookup says nothing about the row either way
+          }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(8, rows.length) }, worker),
+      );
+      if (rows.length > 0) {
+        StatusMessage.showTemporaryMessage(
+          `Twig Capture: checked the ${rows.length} listed candidate(s); ` +
+            `${already} already part of their neuron.`,
+          5000,
+        );
+      }
+    } finally {
+      this.refreshButton.disabled = false;
+      this.refreshButton.textContent = "Refresh";
+      this.render();
+    }
   }
 
   /**
@@ -860,8 +1158,37 @@ export class TwigCaptureTab extends Tab {
       row.appendChild(wrap);
     };
 
+    // p, then a >= / <= choice, then the threshold. "<=" finds what the
+    // model doubts but that may still be worth a look -- typically a
+    // low-probability fragment carrying many synapses (sort by synapses).
+    {
+      const wrap = document.createElement("label");
+      wrap.textContent = "p";
+      wrap.title =
+        "Merge probability filter: keep candidates at or above (≥) or " +
+        "at or below (≤) the threshold.";
+      const op = document.createElement("select");
+      for (const [value, text] of [
+        [">=", "≥"],
+        ["<=", "≤"],
+      ]) {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = text;
+        op.appendChild(opt);
+      }
+      op.value = this.probOp;
+      op.addEventListener("change", () => {
+        this.probOp = op.value === "<=" ? "<=" : ">=";
+        this.publish();
+        this.render();
+      });
+      this.probOpSelect = op;
+      wrap.appendChild(op);
+      row.appendChild(wrap);
+    }
     addNumber(
-      "p ≥",
+      "",
       this.minProb,
       0.05,
       0,
@@ -870,7 +1197,7 @@ export class TwigCaptureTab extends Tab {
         this.minProb = v;
         this.publish();
       },
-      "Minimum merge probability",
+      "Merge probability threshold",
     );
     // Two facets, each a SELECT rather than checkboxes.
     //
@@ -1002,18 +1329,19 @@ export class TwigCaptureTab extends Tab {
   }
 
   private addResult(result: TwigResult) {
-    // A different neuron means a fresh merge history and a fresh target root.
-    this.mergeStatus.clear();
-    this.history.clear();
-    this.activeTargetRoot = undefined;
-    // And fresh decisions. These are keyed by candidate id, which says
+    // Merge status and history are keyed by file AND cand_N (rowKey), so
+    // they survive switching neurons -- a merge made in the all-neurons view
+    // still reads "Merged" when that neuron is opened. The target root is
+    // re-resolved by the load-time check, so a reloaded file drops it.
+    this.targetRoots.delete(result.name);
+    this.fileCache.set(result.name, Promise.resolve(result));
+    // Fresh decisions. These are keyed by candidate id, which says
     // nothing about which neuron they belong to, so leaving them showed the
     // PREVIOUS neuron's verdicts against the new one's candidates until
     // loadDecisions returned. Where decisions are not enabled for the layer
     // loadDecisions returns early, so they would have persisted indefinitely
     // -- a chip claiming a candidate had been judged when it had not.
     this.decisions.clear();
-    this.deciding.clear();
     // Re-loading the same file replaces it rather than stacking duplicates.
     const existing = this.results.findIndex((r) => r.name === result.name);
     if (existing >= 0) {
@@ -1074,10 +1402,12 @@ export class TwigCaptureTab extends Tab {
     // candidate.
     let ids: bigint[];
     try {
-      // activeTargetRoot tracks merges made in this session; fall back to the
-      // root recorded in the file.
+      // targetRoots tracks merges made in this session; fall back to the
+      // root recorded in the file (showSegments resolves it to today's).
+      const file = candidate._file ?? this.active?.name ?? "";
       ids = [
-        this.activeTargetRoot ?? BigInt(this.active!.root_id),
+        this.targetRoots.get(file) ??
+          BigInt(candidate._root ?? this.active!.root_id),
         BigInt(candidate.target_segment_id),
       ];
     } catch {
@@ -1153,6 +1483,7 @@ export class TwigCaptureTab extends Tab {
    */
   private renderFilters() {
     if (this.mitoSelect !== undefined) this.mitoSelect.value = this.mito;
+    if (this.probOpSelect !== undefined) this.probOpSelect.value = this.probOp;
     if (this.reviewSelect !== undefined) {
       this.reviewSelect.value = this.review;
       this.reviewSelect.disabled = !this.decisionsAllowed();
@@ -1188,24 +1519,27 @@ export class TwigCaptureTab extends Tab {
    */
   private async undoOrRedo(candidate: TwigCandidate) {
     const server = this.graphene()?.graphServer;
-    const entry = this.history.get(candidate.id);
+    const key = rowKey(candidate);
+    const entry = this.history.get(key);
     if (server === undefined || entry === undefined) return;
     const redoing = entry.undone;
-    this.mergeStatus.set(candidate.id, "merging");
+    this.mergeStatus.set(key, "merging");
     this.render();
     try {
       const { operationId } = await server.undoOperation(entry.operationId);
       // Act on the operation that now stands: after an undo, that is the undo
       // itself; undoing it again is the redo.
-      this.history.set(candidate.id, {
+      this.history.set(key, {
         operationId: operationId ?? entry.operationId,
         undone: !entry.undone,
       });
+      // The neuron's root changed again; let the next check resolve it.
+      this.targetRoots.delete(candidate._file ?? "");
       if (redoing) {
-        this.mergeStatus.set(candidate.id, "done");
+        this.mergeStatus.set(key, "done");
       } else {
         // Undone: the candidate stands apart again, so offer Merge afresh.
-        this.mergeStatus.delete(candidate.id);
+        this.mergeStatus.delete(key);
       }
       StatusMessage.showTemporaryMessage(
         redoing
@@ -1219,12 +1553,12 @@ export class TwigCaptureTab extends Tab {
             "cannot be redone from here.",
           6000,
         );
-        this.history.delete(candidate.id);
+        this.history.delete(key);
       }
       // Every root involved has changed; re-resolve rather than guess.
       await this.refreshAgainstGraph();
     } catch (e) {
-      this.mergeStatus.set(candidate.id, "failed");
+      this.mergeStatus.set(key, "failed");
       console.error(
         `[twig-capture] ${redoing ? "redo" : "undo"} failed`,
         candidate.id,
@@ -1252,7 +1586,14 @@ export class TwigCaptureTab extends Tab {
   private async refreshAgainstGraph(loadedFor?: TwigResult) {
     const graph = this.graphene();
     const result = loadedFor ?? this.active;
-    if (result === undefined) return;
+    if (result === undefined) {
+      // The all-neurons view: re-read decisions, re-check the listed rows.
+      if (this.isAllMode()) {
+        void this.loadAllDecisions();
+        await this.refreshAllRows();
+      }
+      return;
+    }
     // Decisions are independent of the graph check: they come from CAVE, not
     // the chunkedgraph, and a layer with no graph can still show what other
     // reviewers have already judged. Kick it off before the early return.
@@ -1284,7 +1625,7 @@ export class TwigCaptureTab extends Tab {
         ? await graph.getRoot(BigInt(anySink.supervoxel_id))
         : await graph.getRoot(BigInt(result.root_id));
       if (loadedFor !== undefined && this.active !== result) return;
-      this.activeTargetRoot = targetRoot;
+      this.targetRoots.set(result.name, targetRoot);
       if (String(targetRoot) !== result.root_id) {
         // A root is a version, not an identity. Say so, because the
         // alternative is a reviewer wondering why the header disagrees with
@@ -1325,14 +1666,15 @@ export class TwigCaptureTab extends Tab {
                   `the chunkedgraph\u2026 ${checked}/${this.checking.total}`;
               }
             }
+            const key = rowKey(candidate);
             if (root === targetRoot) {
               already++;
               // Do not overwrite a merge this session already recorded.
-              if (this.mergeStatus.get(candidate.id) !== "done") {
-                this.mergeStatus.set(candidate.id, "already");
+              if (this.mergeStatus.get(key) !== "done") {
+                this.mergeStatus.set(key, "already");
               }
-            } else if (this.mergeStatus.get(candidate.id) === "already") {
-              this.mergeStatus.delete(candidate.id);
+            } else if (this.mergeStatus.get(key) === "already") {
+              this.mergeStatus.delete(key);
             }
           } catch {
             // leave this row's state alone; a single failed lookup is not
@@ -1392,9 +1734,12 @@ export class TwigCaptureTab extends Tab {
     return decisionsAllowed(this.sourceUrls());
   }
 
-  /** The decision store for the active result, or undefined with a reason. */
-  private store(): DecisionStore | undefined {
-    const datastack = this.active?.dataset;
+  /**
+   * The decision store for a dataset (default: the active result's, else the
+   * all-neurons table's), or undefined when there is no datastack or server.
+   */
+  private store(dataset?: string): DecisionStore | undefined {
+    const datastack = dataset ?? this.listDataset();
     const server = this.caveServer();
     if (datastack === undefined || server === undefined) return undefined;
     if (
@@ -1424,14 +1769,14 @@ export class TwigCaptureTab extends Tab {
    * the file's id made decisions fail to load immediately after any merge.
    *
    * Resolved the same way refreshAgainstGraph does it: from a sink
-   * SUPERVOXEL, which is immutable. activeTargetRoot is preferred when set
+   * SUPERVOXEL, which is immutable. targetRoots is preferred when set
    * because it reflects merges made in this session without another round
    * trip. Falls back to the file's root only when there is no graph to ask,
    * which is also the only case where it can still be stale.
    */
   private async currentNeuronRoot(result: TwigResult): Promise<string> {
-    if (this.activeTargetRoot !== undefined)
-      return String(this.activeTargetRoot);
+    const known = this.targetRoots.get(result.name);
+    if (known !== undefined) return String(known);
     const graph = this.graphene();
     const anySink = result.candidates.find((c) => c.merge_sink)?.merge_sink;
     if (graph?.getRoot !== undefined && anySink) {
@@ -1447,7 +1792,7 @@ export class TwigCaptureTab extends Tab {
 
   private async loadDecisions(result: TwigResult) {
     if (!this.decisionsAllowed()) return;
-    const store = this.store();
+    const store = this.store(result.dataset);
     if (store === undefined) return;
     try {
       const root = await this.currentNeuronRoot(result);
@@ -1488,23 +1833,36 @@ export class TwigCaptureTab extends Tab {
       );
       return false;
     }
-    const result = this.active;
-    const store = this.store();
-    if (result === undefined || store === undefined) {
+    const key = rowKey(candidate);
+    // The row's own result file, not the active one: in the all-neurons view
+    // every row belongs to a different neuron, and src= must name its file.
+    this.deciding.add(key);
+    this.render();
+    const ref = await this.ensureFull(candidate);
+    this.deciding.delete(key);
+    if (ref === undefined) {
+      this.render();
+      return false;
+    }
+    const { result } = ref;
+    const store = this.store(result.dataset);
+    if (store === undefined) {
       StatusMessage.showTemporaryMessage(
         "Twig Capture: no CAVE datastack for this layer; decision not saved.",
         5000,
       );
+      this.render();
       return false;
     }
-    const sink = candidate.merge_sink;
-    const source = candidate.merge_source;
+    const sink = ref.candidate.merge_sink;
+    const source = ref.candidate.merge_source;
     if (!sink || !source) {
       StatusMessage.showTemporaryMessage(
         "Twig Capture: this result file has no merge_sink / merge_source, so " +
           "the two sides cannot be bound. Re-run run_twigcapture.py.",
         6000,
       );
+      this.render();
       return false;
     }
     // The result file stem, which is what src= has to point at.
@@ -1512,21 +1870,28 @@ export class TwigCaptureTab extends Tab {
     const target: DecisionTarget = {
       sink,
       source,
-      coordinate_nm: candidate.coordinate_nm,
+      // the full record's: the table rounds coordinates to whole nm
+      coordinate_nm: ref.candidate.coordinate_nm,
       cand: candidate.target_segment_id,
       src,
     };
-    this.deciding.add(candidate.target_segment_id);
+    this.deciding.add(key);
     this.render();
     try {
       const id = await store.post(target, verdict, op);
-      this.decisions.set(candidate.target_segment_id, {
+      const row: DecisionRow = {
         id,
         tag: verdict,
         cand: candidate.target_segment_id,
         tag2: `src=${src};cand=${candidate.target_segment_id}`,
         created: Date.now(),
-      });
+      };
+      // Both views: the single-neuron map only if this is the neuron shown.
+      if (this.active === result) {
+        this.decisions.set(candidate.target_segment_id, row);
+      }
+      this.allDecisions.set(candidate.target_segment_id, row);
+      this.allDecisionsVersion++;
       return true;
     } catch (e) {
       StatusMessage.showTemporaryMessage(
@@ -1535,7 +1900,7 @@ export class TwigCaptureTab extends Tab {
       );
       return false;
     } finally {
-      this.deciding.delete(candidate.target_segment_id);
+      this.deciding.delete(key);
       this.render();
     }
   }
@@ -1557,7 +1922,7 @@ export class TwigCaptureTab extends Tab {
    * server rejects a stale root. Supervoxels never change, which is why
    * run_twigcapture.py records them.
    */
-  private async doMerge(candidate: TwigCandidate): Promise<boolean> {
+  private async doMerge(row: TwigCandidate): Promise<boolean> {
     const graph = this.graphene();
     const server = graph?.graphServer;
     if (server === undefined) {
@@ -1567,6 +1932,18 @@ export class TwigCaptureTab extends Tab {
       );
       return false;
     }
+    const key = rowKey(row);
+    this.mergeStatus.set(key, "merging");
+    this.render();
+    // The full record: a row from the all-neurons table has no merge
+    // endpoints of its own.
+    const ref = await this.ensureFull(row);
+    if (ref === undefined) {
+      this.mergeStatus.delete(key);
+      this.render();
+      return false;
+    }
+    const { candidate, result } = ref;
     const sink = candidate.merge_sink;
     const source = candidate.merge_source;
     if (!sink || !source) {
@@ -1575,11 +1952,11 @@ export class TwigCaptureTab extends Tab {
           "(merge_sink / merge_source). Re-run run_twigcapture.py to add them.",
         6000,
       );
+      this.mergeStatus.delete(key);
+      this.render();
       return false;
     }
 
-    this.mergeStatus.set(candidate.id, "merging");
-    this.render();
     try {
       const sinkSv = BigInt(sink.supervoxel_id);
       const sourceSv = BigInt(source.supervoxel_id);
@@ -1589,7 +1966,7 @@ export class TwigCaptureTab extends Tab {
         graph!.getRoot ? graph!.getRoot(sourceSv) : Promise.resolve(sourceSv),
       ]);
       if (sinkRoot === sourceRoot) {
-        this.mergeStatus.set(candidate.id, "done");
+        this.mergeStatus.set(key, "done");
         StatusMessage.showTemporaryMessage(
           "Already merged: both sides are the same segment today.",
           4000,
@@ -1615,13 +1992,13 @@ export class TwigCaptureTab extends Tab {
         const ok = window.confirm(
           `Candidate ${candidate.target_segment_id} has been edited since ` +
             `this file was written -- it is now part of ${sourceRoot}.\n\n` +
-            "Merging joins THAT segment to this neuron, which may be much " +
+            `Merging joins THAT segment to neuron ${result.root_id}, which may be much ` +
             "larger than the twig scored here " +
             `(${candidate.num_l2_nodes} L2 node(s)).\n\n` +
             "Check it in the viewer first. Merge anyway?",
         );
         if (!ok) {
-          this.mergeStatus.delete(candidate.id);
+          this.mergeStatus.delete(key);
           this.render();
           return false;
         }
@@ -1675,8 +2052,8 @@ export class TwigCaptureTab extends Tab {
         newRoot: String(newRoot),
         operationId,
       });
-      this.activeTargetRoot = newRoot;
-      this.mergeStatus.set(candidate.id, "done");
+      this.targetRoots.set(result.name, newRoot);
+      this.mergeStatus.set(key, "done");
       // The edit happened; record the judgement that caused it, carrying the
       // operation id so the row is evidence of a real graph change rather
       // than an opinion. Deliberately not awaited into the merge's own
@@ -1691,7 +2068,7 @@ export class TwigCaptureTab extends Tab {
         void this.recordDecision(candidate, "merge", operationId);
       }
       if (operationId !== undefined) {
-        this.history.set(candidate.id, { operationId, undone: false });
+        this.history.set(key, { operationId, undone: false });
       }
       StatusMessage.showTemporaryMessage(
         `Merged ${candidate.target_segment_id} \u2192 new root ${newRoot}`,
@@ -1700,7 +2077,7 @@ export class TwigCaptureTab extends Tab {
       this.render();
       return true;
     } catch (e) {
-      this.mergeStatus.set(candidate.id, "failed");
+      this.mergeStatus.set(key, "failed");
       // Full object, not just the message: graphene wraps HttpError and the
       // server's reason is often only in the stack or the response body.
       console.error("[twig-capture] merge failed", candidate.id, e);
@@ -1713,11 +2090,40 @@ export class TwigCaptureTab extends Tab {
     }
   }
 
+  /** The rows to filter: the active neuron's, else the all-neurons table. */
+  private sourceRows(): TwigCandidate[] {
+    if (this.active !== undefined) return this.active.candidates;
+    if (this.isAllMode() && this.table !== undefined) return this.table.rows;
+    return [];
+  }
+
   private filtered(): TwigCandidate[] {
-    const result = this.active;
-    if (result === undefined) return [];
-    const rows = result.candidates.filter((c) => {
-      if (c.prob_merge < this.minProb) return false;
+    // The all-neurons table can hold millions of rows (BANC: 1.56M), and
+    // every merge or verdict re-renders, so its filtered + sorted list is
+    // cached until a filter, the table or the decisions change.
+    if (this.active === undefined && this.table !== undefined) {
+      const key = [
+        this.probOp,
+        this.minProb,
+        this.mito,
+        this.review,
+        this.sortKey,
+        this.decisionsAllowed() ? this.allDecisionsVersion : -1,
+      ].join("|");
+      const cached = this.allFiltered;
+      if (cached?.table === this.table && cached.key === key) {
+        return cached.rows;
+      }
+      const rows = this.filterAndSort(this.sourceRows());
+      this.allFiltered = { table: this.table, key, rows };
+      return rows;
+    }
+    return this.filterAndSort(this.sourceRows());
+  }
+
+  private filterAndSort(source: TwigCandidate[]): TwigCandidate[] {
+    const rows = source.filter((c) => {
+      if (!passesProb(c.prob_merge, this.probOp, this.minProb)) return false;
       // No L2-node filter. The candidate search already caps it at
       // max_candidate_l2_nodes (20), so every row here is a twig by
       // construction and the control only ever hid real candidates.
@@ -1731,7 +2137,7 @@ export class TwigCaptureTab extends Tab {
       // filtering on it would hide every row while claiming they are all
       // unreviewed, which is a lie rather than an empty result.
       if (this.review !== "any" && this.decisionsAllowed()) {
-        const d = this.decisions.get(c.target_segment_id);
+        const d = this.decisionFor(c);
         if (this.review === "none" && d !== undefined) return false;
         if (this.review === "done" && d === undefined) return false;
         if (
@@ -1779,14 +2185,17 @@ export class TwigCaptureTab extends Tab {
     // would be meaningless. This also keeps out of the way of the
     // scrollIntoView that a shared link performs on first render, which runs
     // exactly when the file has just changed.
+    // The all-neurons list counts as one "file" for this purpose.
+    const listName =
+      this.active?.name ?? (this.isAllMode() ? "\u0000all" : undefined);
     const sameFile =
-      this.active !== undefined && this.lastRenderedFile === this.active.name;
+      listName !== undefined && this.lastRenderedFile === listName;
     const keptScrollTop = this.listEl.scrollTop;
     const restoreScroll = () => {
       // The browser clamps to the new scrollHeight, so a list that shrank
       // under a filter change lands at the bottom rather than out of bounds.
       if (sameFile) this.listEl.scrollTop = keptScrollTop;
-      this.lastRenderedFile = this.active?.name;
+      this.lastRenderedFile = listName;
     };
     // file chooser
     removeChildren(this.fileSelect);
@@ -1806,7 +2215,11 @@ export class TwigCaptureTab extends Tab {
 
     const result = this.active;
     if (result === undefined) {
-      this.countEl.textContent = "";
+      if (this.isAllMode()) {
+        this.renderAll();
+      } else {
+        this.countEl.textContent = "";
+      }
       restoreScroll();
       return;
     }
@@ -1859,6 +2272,62 @@ export class TwigCaptureTab extends Tab {
     restoreScroll();
   }
 
+  /** The all-neurons list: every neuron's candidates that pass the filters. */
+  private renderAll() {
+    const hint = (text: string) => {
+      const el = document.createElement("div");
+      el.classList.add("neuroglancer-twig-capture-hint");
+      el.textContent = text;
+      this.listEl.appendChild(el);
+    };
+    this.mergeAllButton.textContent = "Merge all";
+    if (this.tableState !== "ready" || this.table === undefined) {
+      this.countEl.textContent = "";
+      this.summary.textContent = "all neurons";
+      if (this.tableState === "loading" || this.tableState === "none") {
+        hint(
+          `Loading every neuron's candidates (${CANDIDATE_TABLE_FILE})… ` +
+            "or pick a root id above.",
+        );
+      } else if (this.tableState === "missing") {
+        hint(
+          `This catalog has no ${CANDIDATE_TABLE_FILE}, so candidates can ` +
+            "only be listed one neuron at a time: pick a root id above. " +
+            "Re-run scripts/make_results_index.py on the directory to add it.",
+        );
+      } else {
+        hint(
+          `Could not read ${CANDIDATE_TABLE_FILE}: ${this.tableError}. ` +
+            "Pick a root id above.",
+        );
+      }
+      return;
+    }
+    const { files, rows: all } = this.table;
+    this.summary.textContent =
+      `all neurons  ·  ${files.length} neuron(s)  ·  latest run of each` +
+      (this.table.generated
+        ? `  ·  table ${this.table.generated.slice(0, 16)}`
+        : "");
+    const rows = this.filtered();
+    const shown = rows.slice(0, ALL_NEURONS_ROW_CAP);
+    this.countEl.textContent =
+      rows.length > shown.length
+        ? `top ${shown.length} of ${rows.length} matching (${all.length} candidates)`
+        : `${rows.length} of ${all.length} candidates`;
+    for (const candidate of shown) {
+      this.listEl.appendChild(this.makeRow(candidate));
+    }
+    if (rows.length === 0) {
+      hint("No candidates pass the current filters.");
+    } else if (rows.length > shown.length) {
+      hint(
+        `${rows.length - shown.length} more match. Narrow the filters or ` +
+          "change the sort to see them.",
+      );
+    }
+  }
+
   private makeRow(candidate: TwigCandidate): HTMLElement {
     const row = document.createElement("div");
     row.classList.add("neuroglancer-twig-capture-row");
@@ -1894,6 +2363,18 @@ export class TwigCaptureTab extends Tab {
     id.classList.add("neuroglancer-twig-capture-id");
     id.textContent = candidate.target_segment_id;
     main.appendChild(id);
+
+    // All-neurons view: which neuron this candidate would join.
+    if (this.active === undefined && candidate._root) {
+      const neuron = document.createElement("span");
+      neuron.classList.add("neuroglancer-twig-capture-tag");
+      neuron.classList.add("neuroglancer-twig-capture-tag-neuron");
+      neuron.textContent = `→ ${candidate._root}`;
+      neuron.title =
+        `Candidate for neuron ${candidate._root} (its root when inference ` +
+        `ran; file ${candidate._file}). Merge joins it to that neuron.`;
+      main.appendChild(neuron);
+    }
 
     if (candidate.likely_mito) {
       const tag = document.createElement("span");
@@ -1944,9 +2425,10 @@ export class TwigCaptureTab extends Tab {
       main.appendChild(chip);
     }
 
-    const status = this.mergeStatus.get(candidate.id);
-    const decided = this.decisions.get(candidate.target_segment_id);
-    const pending = this.deciding.has(candidate.target_segment_id);
+    const key = rowKey(candidate);
+    const status = this.mergeStatus.get(key);
+    const decided = this.decisionFor(candidate);
+    const pending = this.deciding.has(key);
     const allowed = this.decisionsAllowed();
 
     // The recorded verdict stays on the TOP row, beside the other chips: it
@@ -2043,7 +2525,7 @@ export class TwigCaptureTab extends Tab {
     }
 
     // Undo / Redo, only where this session actually holds an operation id.
-    const entry = this.history.get(candidate.id);
+    const entry = this.history.get(key);
     if (entry !== undefined && status !== "merging") {
       const undo = document.createElement("button");
       undo.classList.add("neuroglancer-twig-capture-merge");
@@ -2056,6 +2538,24 @@ export class TwigCaptureTab extends Tab {
         void this.undoOrRedo(candidate);
       });
       actions.appendChild(undo);
+    }
+
+    // All-neurons view: open this candidate's neuron in the one-neuron view.
+    if (this.active === undefined && candidate._root) {
+      const open = document.createElement("button");
+      open.classList.add("neuroglancer-twig-capture-merge");
+      open.textContent = "Neuron";
+      open.title =
+        `Open neuron ${candidate._root} on its own, with this candidate ` +
+        'selected. "All neurons" brings this list back.';
+      open.addEventListener("click", (event: MouseEvent) => {
+        event.stopPropagation();
+        this.layer.twigCapture.candidate = candidate.target_segment_id;
+        this.scrolledToShared = false; // scroll to it once the neuron opens
+        this.rootInput.value = candidate._root ?? "";
+        void this.openFromCatalog(candidate._root ?? "");
+      });
+      actions.appendChild(open);
     }
 
     if (status === "failed") {
