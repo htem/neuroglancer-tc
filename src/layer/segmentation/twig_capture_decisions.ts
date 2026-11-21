@@ -68,6 +68,11 @@ export const DECISION_ALLOWLIST: readonly string[] = [
   "https://cave.fanc-fly.com/segmentation/table/wclee_fly_cns_001",
   // Aedes -- twig_capture_decisions created 2026-10-06
   "https://cave.fanc-fly.com/segmentation/table/wclee_aedes_brain",
+  // CRANTb (kronauer_ant) -- twig_capture_decisions created by
+  // twigcapture branch crantb, scripts/cave/create_twig_capture_tables.py
+  // --dataset crantb. Leave this entry out of a deployment until that table
+  // exists: without it the writer has nowhere to post.
+  "https://data.proofreading.zetta.ai/segmentation/table/kronauer_ant_x1",
 ];
 
 /**
@@ -114,8 +119,20 @@ export interface DecisionTarget {
 /** The voxel grid `ctr` is written in -- what you paste into Neuroglancer. */
 const CTR_VOXEL_NM = [8, 8, 45];
 
-function ctrVoxels(nm: readonly number[]): string {
-  return nm.map((v, i) => Math.floor(v / CTR_VOXEL_NM[i])).join(",");
+/**
+ * Per-datastack exceptions to CTR_VOXEL_NM. CRANTb's sections are 42 nm, so
+ * its 8 x 8 x 45 grid would put every ctr z ~7% off the section a reviewer
+ * would paste it into.
+ */
+const CTR_VOXEL_NM_BY_DATASTACK: Record<string, readonly number[]> = {
+  kronauer_ant: [8, 8, 42],
+};
+
+function ctrVoxels(nm: readonly number[], datastack?: string): string {
+  const grid =
+    (datastack !== undefined && CTR_VOXEL_NM_BY_DATASTACK[datastack]) ||
+    CTR_VOXEL_NM;
+  return nm.map((v, i) => Math.floor(v / grid[i])).join(",");
 }
 
 /** Pull `cand=...` out of a tag2 string. Empty when absent. */
@@ -210,7 +227,7 @@ export class DecisionStore {
     const parts = [
       `src=${target.src}`,
       `cand=${target.cand}`,
-      `ctr=${ctrVoxels(target.coordinate_nm)}`,
+      `ctr=${ctrVoxels(target.coordinate_nm, this.datastack)}`,
     ];
     if (op !== undefined && op !== "") parts.push(`op=${op}`);
 
