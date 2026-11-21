@@ -257,8 +257,12 @@ interface RowRef {
   candidate: TwigCandidate;
 }
 
-/** Rows rendered at most in the all-neurons view; the rest are counted. */
-const ALL_NEURONS_ROW_CAP = 500;
+/**
+ * The all-neurons view renders this many rows at a time; "Show next" adds
+ * another page. Rows are DOM nodes with listeners, and BANC alone has 1.56M
+ * candidates, so the list is paged rather than drawn whole.
+ */
+const ALL_NEURONS_PAGE = 100;
 
 /**
  * Real synapses inside one scoring window, attributed by supervoxel.
@@ -554,6 +558,8 @@ export class TwigCaptureTab extends Tab {
   private allDecisions = new Map<string, DecisionRow>();
   /** Bumped whenever allDecisions changes; part of the filter cache key. */
   private allDecisionsVersion = 0;
+  /** Rows of the filtered all-neurons list currently rendered. */
+  private allShown = ALL_NEURONS_PAGE;
   private allFiltered:
     | { table: CandidateTable; key: string; rows: TwigCandidate[] }
     | undefined;
@@ -1049,7 +1055,7 @@ export class TwigCaptureTab extends Tab {
   private async refreshAllRows() {
     const graph = this.graphene();
     if (graph?.getRoot === undefined || !this.isAllMode()) return;
-    const rows = this.filtered().slice(0, ALL_NEURONS_ROW_CAP);
+    const rows = this.filtered().slice(0, this.allShown);
     const neuronRoot = new Map<string, Promise<bigint>>();
     const rootOf = (c: TwigCandidate) => {
       const file = c._file ?? "";
@@ -1944,6 +1950,21 @@ export class TwigCaptureTab extends Tab {
       return false;
     }
     const { candidate, result } = ref;
+    // SAFEGUARD: the record fetched for a table row must be the same
+    // candidate. cand_N is matched within the file; the segment id has to
+    // agree too, or the table and the file are out of step and the merge
+    // endpoints may belong to a different candidate.
+    if (candidate.target_segment_id !== row.target_segment_id) {
+      StatusMessage.showTemporaryMessage(
+        `Twig Capture: NOT merged. ${row.id} in ${result.name} is ` +
+          `${candidate.target_segment_id}, but the list says ` +
+          `${row.target_segment_id}. The catalog is stale: refresh it (\u21bb).`,
+        8000,
+      );
+      this.mergeStatus.delete(key);
+      this.render();
+      return false;
+    }
     const sink = candidate.merge_sink;
     const source = candidate.merge_source;
     if (!sink || !source) {
@@ -1996,6 +2017,57 @@ export class TwigCaptureTab extends Tab {
             "larger than the twig scored here " +
             `(${candidate.num_l2_nodes} L2 node(s)).\n\n` +
             "Check it in the viewer first. Merge anyway?",
+        );
+        if (!ok) {
+          this.mergeStatus.delete(key);
+          this.render();
+          return false;
+        }
+      }
+      // SAFEGUARD: IS THE CONTACT STILL ON THE NEURON?
+      //
+      // sinkRoot is whatever segment the neuron-side supervoxel belongs to
+      // today. If the neuron has been split since inference, that may be a
+      // detached piece rather than the neuron -- and the candidate would be
+      // joined to the wrong object. The neuron's own root is taken from
+      // several of its OTHER contact points (supervoxels, so valid however
+      // stale the file); a sink that disagrees with them is refused from the
+      // all-neurons list and needs explicit confirmation on the one-neuron
+      // view, where the reviewer is looking at the neuron.
+      const neuron = await this.neuronRootConsensus(result, candidate);
+      const fromAll = this.active !== result;
+      if (neuron !== undefined && neuron.root !== sinkRoot) {
+        const why =
+          `This candidate's contact is on segment ${sinkRoot}, but ` +
+          `${neuron.agree} of ${neuron.total} other contact points of neuron ` +
+          `${result.root_id} are on ${neuron.root}. The neuron may have been ` +
+          "split or edited since inference.";
+        if (fromAll) {
+          StatusMessage.showTemporaryMessage(
+            `Twig Capture: NOT merged. ${why} Open it with "Neuron" to check.`,
+            10000,
+          );
+          this.mergeStatus.delete(key);
+          this.render();
+          return false;
+        }
+        if (!window.confirm(`${why}\n\nMerge onto ${sinkRoot} anyway?`)) {
+          this.mergeStatus.delete(key);
+          this.render();
+          return false;
+        }
+      }
+      // SAFEGUARD: from the all-neurons list every row is a different
+      // neuron, so say which one before editing.
+      if (fromAll) {
+        const syn = candidate.cand_synapses_total;
+        const ok = window.confirm(
+          `Merge candidate ${candidate.target_segment_id}\n` +
+            `  (${candidate.num_l2_nodes} L2 node(s), p ${fmt(candidate.prob_merge)}` +
+            `${syn != null ? `, ${syn} synapses` : ""})\n` +
+            `into neuron ${result.root_id}` +
+            `${String(sinkRoot) !== result.root_id ? ` (today ${sinkRoot})` : ""}?\n\n` +
+            "This edits the shared segmentation and is attributed to you.",
         );
         if (!ok) {
           this.mergeStatus.delete(key);
@@ -2090,6 +2162,56 @@ export class TwigCaptureTab extends Tab {
     }
   }
 
+  /**
+   * The neuron's root TODAY, by majority over up to five of its contact
+   * points other than `except`'s (sink supervoxels spread through the file).
+   * undefined when there are fewer than two to ask or no graph.
+   */
+  private async neuronRootConsensus(
+    result: TwigResult,
+    except: TwigCandidate,
+  ): Promise<{ root: bigint; agree: number; total: number } | undefined> {
+    const graph = this.graphene();
+    if (graph?.getRoot === undefined) return undefined;
+    const own = except.merge_sink?.supervoxel_id;
+    const svs = [
+      ...new Set(
+        result.candidates
+          .map((c) => c.merge_sink?.supervoxel_id)
+          .filter((sv): sv is string => !!sv && sv !== own),
+      ),
+    ];
+    if (svs.length < 2) return undefined;
+    const n = Math.min(5, svs.length);
+    const picked = Array.from(
+      { length: n },
+      (_, i) => svs[Math.floor((i * svs.length) / n)],
+    );
+    const roots = await Promise.all(
+      picked.map((sv) =>
+        graph.getRoot!(BigInt(sv)).then(
+          (r) => r,
+          () => undefined,
+        ),
+      ),
+    );
+    const counts = new Map<bigint, number>();
+    for (const r of roots) {
+      if (r !== undefined) counts.set(r, (counts.get(r) ?? 0) + 1);
+    }
+    let best: bigint | undefined;
+    let agree = 0;
+    for (const [r, c] of counts) {
+      if (c > agree) {
+        best = r;
+        agree = c;
+      }
+    }
+    const total = [...counts.values()].reduce((a, b) => a + b, 0);
+    if (best === undefined || total < 2) return undefined;
+    return { root: best, agree, total };
+  }
+
   /** The rows to filter: the active neuron's, else the all-neurons table. */
   private sourceRows(): TwigCandidate[] {
     if (this.active !== undefined) return this.active.candidates;
@@ -2116,6 +2238,15 @@ export class TwigCaptureTab extends Tab {
       }
       const rows = this.filterAndSort(this.sourceRows());
       this.allFiltered = { table: this.table, key, rows };
+      // New filters or new decisions: start again at the first page, unless
+      // only decisions changed (a verdict just recorded) -- then keep the
+      // reviewer's place.
+      if (
+        cached?.key.split("|").slice(0, 5).join("|") !==
+        key.split("|").slice(0, 5).join("|")
+      ) {
+        this.allShown = ALL_NEURONS_PAGE;
+      }
       return rows;
     }
     return this.filterAndSort(this.sourceRows());
@@ -2310,10 +2441,10 @@ export class TwigCaptureTab extends Tab {
         ? `  ·  table ${this.table.generated.slice(0, 16)}`
         : "");
     const rows = this.filtered();
-    const shown = rows.slice(0, ALL_NEURONS_ROW_CAP);
+    const shown = rows.slice(0, this.allShown);
     this.countEl.textContent =
       rows.length > shown.length
-        ? `top ${shown.length} of ${rows.length} matching (${all.length} candidates)`
+        ? `${shown.length} of ${rows.length} matching shown (${all.length} candidates)`
         : `${rows.length} of ${all.length} candidates`;
     for (const candidate of shown) {
       this.listEl.appendChild(this.makeRow(candidate));
@@ -2321,10 +2452,16 @@ export class TwigCaptureTab extends Tab {
     if (rows.length === 0) {
       hint("No candidates pass the current filters.");
     } else if (rows.length > shown.length) {
-      hint(
-        `${rows.length - shown.length} more match. Narrow the filters or ` +
-          "change the sort to see them.",
-      );
+      const more = document.createElement("button");
+      more.classList.add("neuroglancer-twig-capture-merge");
+      more.classList.add("neuroglancer-twig-capture-more");
+      const next = Math.min(ALL_NEURONS_PAGE, rows.length - shown.length);
+      more.textContent = `Show next ${next} (${rows.length - shown.length} more)`;
+      more.addEventListener("click", () => {
+        this.allShown += ALL_NEURONS_PAGE;
+        this.render();
+      });
+      this.listEl.appendChild(more);
     }
   }
 
