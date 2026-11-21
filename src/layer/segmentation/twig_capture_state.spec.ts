@@ -76,4 +76,20 @@ describe("TwigCaptureState legacy links", () => {
   it("emits nothing for an untouched tab", () => {
     expect(new TwigCaptureState().toJSON()).toBeUndefined();
   });
+
+  it("round-trips probOp, and leaves it out at the default", () => {
+    const s = new TwigCaptureState();
+    expect(s.probOp).toBe(">=");
+    s.probOp = "<=";
+    const json = s.toJSON()!;
+    expect(json.probOp).toBe("<=");
+    expect(restored(json).probOp).toBe("<=");
+    s.probOp = ">=";
+    expect(s.toJSON()).toBeUndefined();
+  });
+
+  it("reads links without probOp, or with junk, as >=", () => {
+    expect(restored({ minProb: 0.5 }).probOp).toBe(">=");
+    expect(restored({ probOp: "<" }).probOp).toBe(">=");
+  });
 });
