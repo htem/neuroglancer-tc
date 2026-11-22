@@ -341,3 +341,10 @@
   border-left: 3px solid #c90;
   padding-left: 6px;
 }
+
+/* v1.3: the staged row whose fragment the mouse points at in the 3D view. */
+.neuroglancer-twig-capture-row-hover {
+  outline: 2px solid #fc6;
+  outline-offset: -2px;
+  background: rgba(255, 204, 102, 0.16);
+}
