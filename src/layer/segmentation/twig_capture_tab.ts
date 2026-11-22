@@ -447,7 +447,7 @@ const CATALOG_URL_KEY = "neuroglancer-twig-capture-catalog-url";
  * (super class, class, type, status, flow) from the catalog's neurons.json,
  * a cache of the project's SeaTable.
  */
-const TWIG_CAPTURE_VERSION = "v1.2";
+const TWIG_CAPTURE_VERSION = "v1.3";
 const TWIG_CAPTURE_DATE = "20261121";
 
 const DEFAULT_CATALOG_URL =
@@ -645,6 +645,20 @@ export class TwigCaptureTab extends Tab {
   private batch: { stop: boolean; done: number; total: number } | undefined;
   private clearStageButton = document.createElement("button");
   /**
+   * The staged list and the 3D view are kept in step, both ways. Pointing at
+   * a staged fragment in the view marks its row (and scrolls it into sight);
+   * hiding a fragment in the view (double-click, or unticking it in the
+   * segment list) unticks its row, and showing it again ticks it.
+   * `stageRowEls` is the rows as last drawn, by rowKey; `hoverKey` the row
+   * last pointed at -- sticky, so it survives the mouse crossing from the
+   * view to the panel. `ownSegmentEdits` is > 0 while the tab itself is
+   * changing the segment sets, which must not read as the reviewer's choice.
+   */
+  private stageRowEls = new Map<string, HTMLElement>();
+  private hoverKey: string | undefined;
+  private ownSegmentEdits = 0;
+  private stageRenderPending = false;
+  /**
    * Progress of the check that runs on load, or undefined when not running.
    *
    * While it is set the candidate list is WITHHELD rather than shown and
@@ -776,6 +790,16 @@ export class TwigCaptureTab extends Tab {
       "chunkedgraph and are attributed to you; Undo is a further edit, not " +
       "a retraction.";
     element.appendChild(footer);
+
+    const display = layer.displayState;
+    this.registerDisposer(
+      display.segmentSelectionState.changed.add(() => this.onViewHover()),
+    );
+    this.registerDisposer(
+      display.segmentationGroupState.value.visibleSegments.changed.add(
+        (x, add) => this.onVisibleChanged(x, add),
+      ),
+    );
 
     this.render();
   }
@@ -1657,6 +1681,11 @@ export class TwigCaptureTab extends Tab {
     globalPosition.value.set(position);
     globalPosition.changed.dispatch();
 
+    // In a staged list the view already shows the whole proposal -- the
+    // neuron and every ticked candidate -- and swapping it for this one pair
+    // would also untick the rest. Just fly there.
+    if (this.activeStage() !== undefined) return;
+
     // Show both sides of the proposed merge: the neuron under review and the
     // candidate.
     let ids: bigint[];
@@ -2395,12 +2424,14 @@ export class TwigCaptureTab extends Tab {
       oldValues.add(sourceRoot);
       const newValues = new Uint64Set();
       newValues.add(newRoot);
-      graph!.state?.replaceSegments(oldValues, newValues);
-      const group = this.layer.displayState.segmentationGroupState.value;
-      group.selectedSegments.delete(sinkRoot);
-      group.selectedSegments.delete(sourceRoot);
-      group.selectedSegments.add(newRoot);
-      group.visibleSegments.set(newRoot, true);
+      this.ownEdit(() => {
+        graph!.state?.replaceSegments(oldValues, newValues);
+        const group = this.layer.displayState.segmentationGroupState.value;
+        group.selectedSegments.delete(sinkRoot);
+        group.selectedSegments.delete(sourceRoot);
+        group.selectedSegments.add(newRoot);
+        group.visibleSegments.set(newRoot, true);
+      });
 
       // The neuron under review now has a new root; later merges in this
       // session must target it.
@@ -2586,14 +2617,99 @@ export class TwigCaptureTab extends Tab {
   /** Select-and-show one segment: the segment list keeps only selected ones visible. */
   private showSegment(root: bigint) {
     const group = this.layer.displayState.segmentationGroupState.value;
-    group.selectedSegments.add(root);
-    group.visibleSegments.set(root, true);
+    this.ownEdit(() => {
+      group.selectedSegments.add(root);
+      group.visibleSegments.set(root, true);
+    });
   }
 
   private hideSegment(root: bigint) {
     const group = this.layer.displayState.segmentationGroupState.value;
-    group.visibleSegments.delete(root);
-    group.selectedSegments.delete(root);
+    this.ownEdit(() => {
+      group.visibleSegments.delete(root);
+      group.selectedSegments.delete(root);
+    });
+  }
+
+  /** Change the segment sets without it reading as the reviewer's doing. */
+  private ownEdit(fn: () => void) {
+    this.ownSegmentEdits++;
+    try {
+      fn();
+    } finally {
+      this.ownSegmentEdits--;
+    }
+  }
+
+  /** The staged row whose candidate is shown in the view as `root`. */
+  private stagedKeyForRoot(root: bigint): string | undefined {
+    const stage = this.activeStage();
+    if (stage === undefined || root === stage.neuron) return undefined;
+    for (const [key, r] of stage.roots) if (r === root) return key;
+    return undefined;
+  }
+
+  /**
+   * The mouse is over a segment in the view: if it is a staged candidate,
+   * mark its row and bring it into sight. Pointing at nothing, or at the
+   * neuron, keeps the last mark, so it is still there once the mouse has
+   * crossed to the panel to untick it.
+   */
+  private onViewHover() {
+    const root = this.layer.displayState.segmentSelectionState.value;
+    if (root === undefined) return;
+    const key = this.stagedKeyForRoot(root);
+    if (key === undefined || key === this.hoverKey) return;
+    if (this.hoverKey !== undefined) {
+      this.stageRowEls
+        .get(this.hoverKey)
+        ?.classList.remove("neuroglancer-twig-capture-row-hover");
+    }
+    this.hoverKey = key;
+    const el = this.stageRowEls.get(key);
+    if (el !== undefined) {
+      el.classList.add("neuroglancer-twig-capture-row-hover");
+      el.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  /**
+   * The visible set changed. A staged candidate hidden by the reviewer -- in
+   * the 3D view, the segment list, or by clearing the layer -- is unticked;
+   * one shown again is ticked. Changes the tab makes itself, and anything
+   * during a Merge staged run, are ignored.
+   */
+  private onVisibleChanged(
+    x: bigint | bigint[] | BigUint64Array | null,
+    add: boolean,
+  ) {
+    if (this.ownSegmentEdits > 0 || this.batch !== undefined) return;
+    const stage = this.activeStage();
+    if (stage === undefined || stage.roots.size === 0) return;
+    const ids =
+      x === null ? null : new Set(typeof x === "bigint" ? [x] : Array.from(x));
+    let changed = false;
+    for (const c of stage.rows) {
+      const key = rowKey(c);
+      const root = stage.roots.get(key);
+      if (root === undefined || root === stage.neuron || this.isJoined(c)) {
+        continue;
+      }
+      if (ids !== null && !ids.has(root)) continue;
+      const want = ids === null ? false : add;
+      if (stage.selected.has(key) === want) continue;
+      if (want) stage.selected.add(key);
+      else stage.selected.delete(key);
+      changed = true;
+    }
+    if (changed && !this.stageRenderPending) {
+      // One redraw for a burst of changes (a clear, a multi-select).
+      this.stageRenderPending = true;
+      setTimeout(() => {
+        this.stageRenderPending = false;
+        this.render();
+      }, 0);
+    }
   }
 
   /**
@@ -2620,8 +2736,11 @@ export class TwigCaptureTab extends Tab {
     const graph = this.graphene();
     if (graph?.getRoot === undefined) return;
     const group = this.layer.displayState.segmentationGroupState.value;
-    group.visibleSegments.clear();
-    group.selectedSegments.clear();
+    this.hoverKey = undefined;
+    this.ownEdit(() => {
+      group.visibleSegments.clear();
+      group.selectedSegments.clear();
+    });
     const consensus = await this.neuronRootConsensus(result);
     if (this.stage !== stage) return;
     stage.neuron = consensus?.root ?? this.targetRoots.get(result.name);
@@ -2950,6 +3069,7 @@ export class TwigCaptureTab extends Tab {
 
     const stage = this.activeStage();
     const rows = stage !== undefined ? stage.rows : this.filtered();
+    this.stageRowEls.clear();
     if (stage !== undefined) {
       const picks = this.stagedPicks();
       const syn = picks.reduce((a, c) => a + (c.cand_synapses_total ?? 0), 0);
@@ -3117,6 +3237,22 @@ export class TwigCaptureTab extends Tab {
       if (!box.checked && !box.disabled) {
         row.classList.add("neuroglancer-twig-capture-row-unstaged");
       }
+      // Linked to the view: this row is marked when its fragment is pointed
+      // at there, and pointing at the row highlights the fragment.
+      const key = rowKey(candidate);
+      this.stageRowEls.set(key, row);
+      if (key === this.hoverKey) {
+        row.classList.add("neuroglancer-twig-capture-row-hover");
+      }
+      row.addEventListener("mouseenter", () => {
+        const root = stage.roots.get(key);
+        if (root !== undefined) {
+          this.layer.displayState.segmentSelectionState.set(root);
+        }
+      });
+      row.addEventListener("mouseleave", () => {
+        this.layer.displayState.segmentSelectionState.set(null);
+      });
     }
 
     const prob = document.createElement("span");
