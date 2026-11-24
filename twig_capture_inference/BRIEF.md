@@ -246,8 +246,8 @@ session that fails to start falls back to the CPU and logs why.
 
 **Deploying (radagast).** One build serves three folders, each with its own
 `default_state.json` (in `deploy/<dataset>/`). A link with no state opens
-that folder's dataset, with the Twig Capture catalog for it
-(`catmaid2/twigcapture_<dataset>/`). See `deploy/deploy.sh`. The default
+that folder's dataset, with the Twig Capture catalog of its newest model's
+results (`twigcapture_<dataset>/results/`, see README "Results folders"). See `deploy/deploy.sh`. The default
 and remembered catalog are now per dataset, so a BANC layer no longer opens
 the Aedes catalog. CRANTb's cluster results (`twig_capture/crantb_v2.2`)
 are not served on catmaid2 yet; `catmaid2/twigcapture_crantb/` currently

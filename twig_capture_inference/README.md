@@ -17,9 +17,19 @@ while the model runs. The 63 candidates at p ≥ 0.9 are then staged with
 | Aedes | https://radagast.hms.harvard.edu/twigcapture_aedes/ |
 | CRANTb | https://radagast.hms.harvard.edu/twigcapture_crantb/ |
 
-Each link opens its dataset, with the Twig Capture tab connected to that
-dataset's cluster results (`catmaid2.hms.harvard.edu/twigcapture_<dataset>/`).
-Sign in to CAVE when asked.
+Each link opens its dataset, with the Twig Capture tab connected to the
+cluster results of that dataset's newest model, served beside the viewer
+(`twigcapture_<dataset>/results/`). Sign in to CAVE when asked (CRANTb has
+its own login).
+
+**Results folders.** On O2, `twig_capture/viewers/results_<dataset>/` holds
+links to the newest model's result files plus `index.json` and
+`candidates.json.gz` (`make_results_index.py`, for the root picker and "All
+neurons") and `neurons.json` (`make_seatable_meta.py`, for the SeaTable
+filters). Today: BANC `banc_v2.0` (banc_finetune 2026-11-13), Aedes
+`aedes_v2.0_test` (aedes_finetune 2026-11-13), CRANTb
+`crantb_test_aedes_v2.1`. When a newer model's results land, relink the
+folder and re-run both scripts.
 
 ## Predicting merges for your own neurons
 

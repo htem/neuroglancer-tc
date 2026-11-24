@@ -37,7 +37,11 @@ export interface TwigDataset {
   /** EM read at 8 nm in xy. */
   emUrl: string;
   emResolution: [number, number, number];
-  /** Results catalog (cluster runs, index.json) the Twig Capture tab opens by default. */
+  /**
+   * Results catalog (cluster runs, index.json) the Twig Capture tab opens by
+   * default: the newest model's results, served beside each viewer as
+   * twigcapture_<dataset>/results/ (see deploy/deploy.sh).
+   */
   catalogUrl: string;
   /** Caveats shown in the selector. */
   note?: string;
@@ -57,7 +61,7 @@ export const TWIG_DATASETS: TwigDataset[] = [
     label: "BANC",
     datastack: "brain_and_nerve_cord",
     table: "wclee_fly_cns_001",
-    catalogUrl: "https://catmaid2.hms.harvard.edu/twigcapture_banc/",
+    catalogUrl: "https://radagast.hms.harvard.edu/twigcapture_banc/results/",
     supervoxelUrl:
       "precomputed://gs://zetta_lee_fly_cns_001_segmentation/v1_sharded",
     supervoxelResolution: [32, 32, 45],
@@ -73,7 +77,7 @@ export const TWIG_DATASETS: TwigDataset[] = [
     label: "Aedes",
     datastack: "wclee_aedes_brain",
     table: "wclee_aedes_brain",
-    catalogUrl: "https://catmaid2.hms.harvard.edu/twigcapture_aedes/",
+    catalogUrl: "https://radagast.hms.harvard.edu/twigcapture_aedes/results/",
     supervoxelUrl: "precomputed://gs://fanc-fly_segmentation/wclee_aedes_brain",
     supervoxelResolution: [32, 32, 45],
     emUrl:
@@ -85,7 +89,7 @@ export const TWIG_DATASETS: TwigDataset[] = [
     label: "CRANTb",
     datastack: "kronauer_ant",
     table: "kronauer_ant_x1",
-    catalogUrl: "https://catmaid2.hms.harvard.edu/twigcapture_crantb/",
+    catalogUrl: "https://radagast.hms.harvard.edu/twigcapture_crantb/results/",
     supervoxelUrl:
       "precomputed://gs://zetta_ws/dkronauer-ant-001-240904-finetune-v3.2-0.27",
     supervoxelResolution: [32, 32, 42],

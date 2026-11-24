@@ -38,7 +38,7 @@
    },
    "tab": "twigCapture",
    "twigCapture": {
-    "catalogUrl": "https://catmaid2.hms.harvard.edu/twigcapture_crantb/"
+    "catalogUrl": "https://radagast.hms.harvard.edu/twigcapture_crantb/results/"
    },
    "name": "seg"
   }

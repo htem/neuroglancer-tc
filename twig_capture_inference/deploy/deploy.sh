@@ -51,6 +51,10 @@ for k in banc aedes crantb; do
   [ -d "$d" ] && mv "$d" "$d.prev"
   mv "$BASE/.incoming/twigcapture_$k" "$d"
   chmod -R a+rX "$d"
+  # The newest model's results for this dataset, served at
+  # twigcapture_<k>/results/ (index.json, candidates.json.gz, neurons.json
+  # and links to the result files; see README "Results folders").
+  [ -e "$BASE/results_$k" ] && ln -sfn "$BASE/results_$k" "$d/results"
 done
 rm -rf "$BASE/.incoming" "$TGZ"
 ls -ld "$BASE"/twigcapture_*
