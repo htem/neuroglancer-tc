@@ -2213,7 +2213,10 @@ class GrapheneGraphSource extends SegmentationGraphSource {
    */
   fetchGraph(path: string, init: RequestInit = {}) {
     const { fetchOkImpl, baseUrl } = this.httpSource;
-    return fetchOkImpl(/^https?:/.test(path) ? path : `${baseUrl}${path}`, init);
+    return fetchOkImpl(
+      /^https?:/.test(path) ? path : `${baseUrl}${path}`,
+      init,
+    );
   }
 
   async isL2CacheUrlAvailable() {
