@@ -369,6 +369,28 @@
   margin-right: 2px;
 }
 
+/* Orphan-first chains (run_twigcapture_v2_orph.py).
+   A hop whose ancestry a reviewer has already rejected is dimmed rather than
+   hidden: the row still has to explain why it stopped mattering, and hiding
+   it would make the chain look shorter than it was. */
+.neuroglancer-twig-capture-row-blocked {
+  opacity: 0.45;
+}
+.neuroglancer-twig-capture-row-blocked .neuroglancer-twig-capture-id {
+  text-decoration: line-through;
+}
+
+/* A chain hop. The tee makes the parent relationship explicit: indentation
+   alone cannot distinguish two hops at the same depth on different branches. */
+.neuroglancer-twig-capture-row-chain {
+  border-left: 1px solid #3a3a3a;
+}
+.neuroglancer-twig-capture-chain-tee {
+  color: #8a8a8a;
+  font-family: monospace;
+  margin-right: 2px;
+}
+
 /* In-browser results, level 2+: a suggestion that attaches to an earlier one. */
 .neuroglancer-twig-capture-tag-hop {
   background: #2a3a4a;

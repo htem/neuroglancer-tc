@@ -315,6 +315,13 @@ interface TwigCandidate {
    * fetches the neuron's file for the full record (ensureFull).
    */
   _lite?: boolean;
+  // --- orphan-first (run_twigcapture_v2_orph.py) -------------------------
+  // Absent in forward v2 files, so every use is guarded. (hop and
+  // parent_root are declared above.)
+  /** Hops from the seed along this candidate's own ancestry. */
+  depth?: number;
+  /** True when this candidate is a catalogued cell, i.e. the chain ended. */
+  is_cell?: boolean;
 }
 
 /** Per-row state key: cand_N is only unique within one result file. */
@@ -435,6 +442,17 @@ interface TwigResult {
    * decisions and staging work per member neuron.
    */
   members?: string[];
+  // --- orphan-first ------------------------------------------------------
+  /** "orphan_first" selects the chain view; undefined is a forward v2 file. */
+  mode?: string;
+  seed_id?: string;
+  outcome?: string;
+  reached_cell?: string | null;
+  n_hops?: number;
+  n_merges?: number;
+  /** Product along the ancestry of the cell reached -- NOT over all merges. */
+  path_probability?: number | null;
+  path_to_cell?: string[];
 }
 
 /** One list of the candidates of several neurons' results. */
@@ -487,6 +505,16 @@ function parseResultObject(name: string, obj: any): TwigResult {
     candidates,
     rejected: obj.rejected,
     synapse_box_wide_nm: obj.filters?.synapse_box_wide_nm ?? undefined,
+    mode: obj.mode,
+    seed_id: obj.seed_id === undefined ? undefined : String(obj.seed_id),
+    outcome: obj.outcome,
+    reached_cell: obj.reached_cell == null ? null : String(obj.reached_cell),
+    n_hops: obj.n_hops,
+    n_merges: obj.n_merges,
+    path_probability: obj.path_probability ?? null,
+    path_to_cell: Array.isArray(obj.path_to_cell)
+      ? (obj.path_to_cell as string[])
+      : undefined,
   };
 }
 
@@ -778,6 +806,7 @@ export class TwigCaptureTab extends Tab {
    * not a buffer of reversible state.
    */
   private history = new Map<string, { operationId: string; undone: boolean }>();
+  private showChainButton = document.createElement("button");
   private summary = document.createElement("div");
   private listEl = document.createElement("div");
   private countEl = document.createElement("div");
@@ -861,8 +890,37 @@ export class TwigCaptureTab extends Tab {
     // Only then does the same button read "Merge staged", which merges the
     // ticked ones sequentially -- each one re-resolved and re-checked first,
     // because every merge changes the neuron's root. While that runs the
-    // button is "Stop". Never across neurons: a bulk edit to many neurons at
-    // once is too much to have checked by eye.
+    // button is "Stop". Across neurons only from a combined list (several
+    // neurons opened together from the Twig Selector), and then neuron by
+    // neuron, each against its own root.
+    // Orphan-first only: shown by render() when the active file is a chain.
+    this.showChainButton.classList.add("neuroglancer-twig-capture-merge");
+    this.showChainButton.textContent = "Show chain";
+    this.showChainButton.style.display = "none";
+    this.showChainButton.title =
+      "Display the seed and every accepted hop at once. A chain is a path " +
+      "through several fragments, so judging it means seeing all of them " +
+      "together -- one hop on its own abuts its parent, not the seed.";
+    this.showChainButton.addEventListener("click", () => {
+      const result = this.active;
+      if (result === undefined) return;
+      const ids: bigint[] = [];
+      const seen = new Set<string>();
+      for (const x of [
+        result.seed_id,
+        ...result.candidates.map((c) => c.target_segment_id),
+      ]) {
+        if (!x || seen.has(x)) continue;
+        seen.add(x);
+        try {
+          ids.push(BigInt(x));
+        } catch {
+          // A malformed id in one row must not take the whole chain down.
+        }
+      }
+      if (ids.length) void this.showSegments(ids);
+    });
+    countRow.appendChild(this.showChainButton);
     this.mergeAllButton.classList.add("neuroglancer-twig-capture-merge");
     this.mergeAllButton.textContent = "Stage all";
     this.mergeAllButton.addEventListener("click", () => {
@@ -1853,14 +1911,21 @@ export class TwigCaptureTab extends Tab {
     // candidate.
     let ids: bigint[];
     try {
-      // targetRoots tracks merges made in this session; fall back to the
-      // root recorded in the file (showSegments resolves it to today's).
-      const file = candidate._file ?? this.active?.name ?? "";
-      ids = [
-        this.targetRoots.get(file) ??
-          BigInt(candidate._root ?? this.active!.root_id),
-        BigInt(candidate.target_segment_id),
-      ];
+      if (candidate.parent_root !== undefined) {
+        // Orphan-first: the pair under review is (this hop, its PARENT), and
+        // neither is the seed once past hop 1. Show the entire branch so the
+        // contact being judged is actually visible in context.
+        ids = this.chainIds(candidate).map((x) => BigInt(x));
+      } else {
+        // targetRoots tracks merges made in this session; fall back to the
+        // root recorded in the file (showSegments resolves it to today's).
+        const file = candidate._file ?? this.active?.name ?? "";
+        ids = [
+          this.targetRoots.get(file) ??
+            BigInt(candidate._root ?? this.active!.root_id),
+          BigInt(candidate.target_segment_id),
+        ];
+      }
     } catch {
       StatusMessage.showTemporaryMessage(
         `Twig Capture: "${candidate.target_segment_id}" is not a valid segment id.`,
@@ -3405,7 +3470,28 @@ export class TwigCaptureTab extends Tab {
       return;
     }
 
-    const bits = [`neuron ${result.root_id}`];
+    const bits = [
+      result.mode === "orphan_first"
+        ? `seed ${result.seed_id ?? result.root_id}`
+        : `neuron ${result.root_id}`,
+    ];
+    if (result.mode === "orphan_first") {
+      // The outcome IS the result for an orphan walk: "exhausted" means the
+      // fragment was never connected to anything catalogued, which is a
+      // different fact from "no candidates" and must not look the same.
+      const reached = result.reached_cell;
+      bits.push(
+        reached
+          ? `reached ${reached}`
+          : `${result.outcome ?? "unresolved"} -- no cell reached`,
+      );
+      if (result.path_probability != null) {
+        bits.push(`path p ${fmt(result.path_probability)}`);
+      }
+      bits.push(
+        `${result.n_merges ?? 0} merge(s) over ${result.n_hops ?? 0} hop(s)`,
+      );
+    }
     const annot = this.neuronMeta?.neurons.get(result.root_id);
     if (neuronLabel(annot)) bits.push(neuronLabel(annot));
     if (result.models_used) bits.push(`model ${result.models_used}`);
@@ -3415,6 +3501,9 @@ export class TwigCaptureTab extends Tab {
       bits.push(`thr ${result.merge_threshold}`);
     if (result.timestamp) bits.push(result.timestamp.slice(0, 16));
     this.summary.textContent = bits.join("  ·  ");
+
+    this.showChainButton.style.display =
+      result.mode === "orphan_first" ? "" : "none";
 
     const stage = this.activeStage();
     const rows = stage !== undefined ? stage.rows : this.filtered();
@@ -3540,6 +3629,68 @@ export class TwigCaptureTab extends Tab {
     }
   }
 
+  /**
+   * The chain's ancestry links, target -> parent, for the active file.
+   *
+   * Rebuilt per render rather than cached: a merge changes nothing here (the
+   * file is fixed) but switching files changes everything, and a stale map
+   * would silently mis-parent rows.
+   */
+  private parentOf(): Map<string, string> {
+    const m = new Map<string, string>();
+    for (const c of this.active?.candidates ?? []) {
+      if (c.parent_root) m.set(c.target_segment_id, c.parent_root);
+    }
+    return m;
+  }
+
+  /**
+   * The nearest ancestor a reviewer has already rejected, if any.
+   *
+   * A chain is only meaningful up to its first bad hop: if hop 2 is wrong,
+   * hop 3 attached to something that does not belong to this cell and its
+   * probability means nothing. Such rows are shown struck through rather than
+   * hidden, so the reviewer can see WHY they stopped mattering.
+   */
+  private blockedBy(
+    candidate: TwigCandidate,
+    parents: Map<string, string>,
+  ): string | undefined {
+    let cur = candidate.parent_root;
+    const seen = new Set<string>();
+    while (cur !== undefined && !seen.has(cur)) {
+      seen.add(cur);
+      const d = this.decisions.get(cur);
+      if (d && d.tag === "no_merge") return cur;
+      cur = parents.get(cur);
+    }
+    return undefined;
+  }
+
+  /**
+   * Every segment on this candidate's branch: the seed, each ancestor in
+   * order, then the candidate itself.
+   *
+   * Showing a hop on its own is misleading. Hop 3 abuts hop 2, not the seed,
+   * so a viewer displaying only {seed, hop3} shows two objects that do not
+   * touch and leaves the reviewer hunting for a contact that is not there.
+   * The whole branch has to be on screen for the question to make sense.
+   */
+  private chainIds(candidate: TwigCandidate): string[] {
+    const parents = this.parentOf();
+    const out: string[] = [candidate.target_segment_id];
+    const seen = new Set<string>(out);
+    let cur = candidate.parent_root;
+    while (cur !== undefined && !seen.has(cur)) {
+      seen.add(cur);
+      out.push(cur);
+      cur = parents.get(cur);
+    }
+    const seed = this.active?.seed_id;
+    if (seed && !seen.has(seed)) out.push(seed);
+    return out.reverse(); // seed first, candidate last
+  }
+
   private makeRow(candidate: TwigCandidate): HTMLElement {
     const row = document.createElement("div");
     row.classList.add("neuroglancer-twig-capture-row");
@@ -3602,6 +3753,70 @@ export class TwigCaptureTab extends Tab {
       row.addEventListener("mouseleave", () => {
         this.layer.displayState.segmentSelectionState.set(null);
       });
+    }
+
+    // --- chain position, for orphan-first files only ---------------------
+    // Keyed on parent_root too: in-browser results carry hop on every row.
+    if (candidate.hop !== undefined && candidate.parent_root !== undefined) {
+      const depth = candidate.depth ?? 1;
+      // Indent by ancestry depth so a branch reads as a branch. Capped: a
+      // 10-hop chain indented 10 times would push the probability off-row.
+      row.style.marginLeft = `${Math.min(depth - 1, 4) * 14}px`;
+      row.classList.add("neuroglancer-twig-capture-row-chain");
+
+      // A tree glyph, because indentation alone does not say WHAT a row hangs
+      // off: two hops at the same depth on different branches indent
+      // identically. The parent id is on the chip and in the tooltip.
+      if (depth > 1) {
+        const tee = document.createElement("span");
+        tee.classList.add("neuroglancer-twig-capture-chain-tee");
+        tee.textContent = "\u2514\u2500";
+        tee.title = `attaches to ${candidate.parent_root}`;
+        main.appendChild(tee);
+      }
+
+      const hop = document.createElement("span");
+      hop.classList.add("neuroglancer-twig-capture-tag");
+      hop.classList.add("neuroglancer-twig-capture-tag-hop");
+      // "hop 2 of 1" would be nonsense, so the chip states the LINEAGE --
+      // which hop produced it and how far down the branch it sits -- rather
+      // than the iteration number alone.
+      hop.textContent =
+        depth > 1
+          ? `hop ${candidate.hop} \u00b7 d${depth}`
+          : `hop ${candidate.hop}`;
+      hop.title =
+        `Iteration ${candidate.hop} of the walk; ${depth} merge(s) from the ` +
+        `seed along this branch` +
+        (candidate.parent_root
+          ? `, attached to ${candidate.parent_root}`
+          : "") +
+        `. A hop is only meaningful if every hop before it on the same ` +
+        `branch is correct. Clicking this row shows the whole branch.`;
+      main.appendChild(hop);
+
+      if (candidate.is_cell) {
+        const tag = document.createElement("span");
+        tag.classList.add("neuroglancer-twig-capture-tag");
+        tag.textContent = "reaches cell";
+        tag.title =
+          "This candidate is a catalogued cell, so the walk stopped here.";
+        main.appendChild(tag);
+      }
+
+      const blocker = this.blockedBy(candidate, this.parentOf());
+      if (blocker !== undefined) {
+        row.classList.add("neuroglancer-twig-capture-row-blocked");
+        const tag = document.createElement("span");
+        tag.classList.add("neuroglancer-twig-capture-tag");
+        tag.classList.add("neuroglancer-twig-capture-tag-warn");
+        tag.textContent = "upstream rejected";
+        tag.title =
+          `An earlier hop on this branch (${blocker}) was marked no_merge, ` +
+          `so this candidate attached to something that does not belong to ` +
+          `the seed. Its probability no longer means anything.`;
+        main.appendChild(tag);
+      }
     }
 
     const prob = document.createElement("span");
