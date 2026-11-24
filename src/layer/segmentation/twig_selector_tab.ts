@@ -52,6 +52,7 @@ import type {
 } from "#src/layer/segmentation/twig_inference/pipeline.js";
 import {
   DatasetContext,
+  getLeavesL2,
   neuronSize,
   runTwigCapture,
 } from "#src/layer/segmentation/twig_inference/pipeline.js";
@@ -111,6 +112,10 @@ interface QueueItem {
   errorDetail?: string;
   /** The neuron's size, measured when queued (see neuronSize). */
   size?: { l2: number; regions: number };
+  /** Set when the root was replaced by its latest version before running. */
+  updatedFrom?: string;
+  /** Share of the old root's L2 nodes now in the new root (below 1: split). */
+  updatedShare?: number;
 }
 
 /** The options one neuron runs with, and what that costs. */
@@ -195,6 +200,83 @@ export class TwigSelectorState {
     };
   }
 
+  /**
+   * The root's latest version. A root is a version, not an identity: any
+   * edit retires it. Unchanged roots cost one is_latest_roots call. For a
+   * retired one, an even sample of its L2 nodes (which still resolve) is
+   * mapped to today's roots and the most common wins -- the version that
+   * carries most of the neuron, also after a split.
+   */
+  async latestRoot(
+    root: string,
+  ): Promise<{ root: string; share: number } | undefined> {
+    const graph = this.graph();
+    if (!graph) return undefined;
+    const r = await graph.fetchGraph("/is_latest_roots?int64_as_str=1", {
+      method: "POST",
+      body: JSON.stringify({ node_ids: [root] }),
+    });
+    const latest = (await r.json())?.is_latest?.[0];
+    if (latest) return { root, share: 1 };
+    const leaves = await getLeavesL2(graph, root);
+    if (!leaves.length) return undefined;
+    const n = Math.min(40, leaves.length);
+    const sample = Array.from(
+      { length: n },
+      (_, i) => leaves[Math.floor((i * leaves.length) / n)],
+    );
+    const counts = new Map<string, number>();
+    await Promise.all(
+      sample.map(async (id) => {
+        try {
+          const rr = await graph.fetchGraph(`/node/${id}/root?int64_as_str=1`);
+          const now = String((await rr.json()).root_id);
+          counts.set(now, (counts.get(now) ?? 0) + 1);
+        } catch {
+          // one failed lookup only thins the sample
+        }
+      }),
+    );
+    let best: string | undefined;
+    let bestN = 0;
+    for (const [k, v] of counts) {
+      if (v > bestN) {
+        best = k;
+        bestN = v;
+      }
+    }
+    return best ? { root: best, share: bestN / n } : undefined;
+  }
+
+  /** Replace a queued root by its latest version (see latestRoot). */
+  private async updateRoot(item: QueueItem) {
+    const now = await this.latestRoot(item.root);
+    if (!now || now.root === item.root) return;
+    logEvent(
+      "info",
+      `root ${item.root} is outdated; using ${now.root} (${Math.round(now.share * 100)}% of its L2 nodes)`,
+    );
+    if (this.items.some((i) => i !== item && i.root === now.root)) {
+      // Another queued root is already this neuron as it is now.
+      if (item.status !== "running") {
+        this.items = this.items.filter((i) => i !== item);
+        this.changed.dispatch();
+      }
+      return;
+    }
+    item.updatedFrom = item.updatedFrom ?? item.root;
+    item.updatedShare = now.share;
+    item.root = now.root;
+    item.size = undefined;
+    // A result cached for the new root may already exist.
+    const hit = this.cached(item.root);
+    if (hit && item.status === "queued") {
+      item.status = "done";
+      item.resultName = hit.name;
+    }
+    this.changed.dispatch();
+  }
+
   /** Measure a queued neuron (L2 nodes, regions) in the background. */
   measure(item: QueueItem) {
     const graph = this.graph();
@@ -204,15 +286,18 @@ export class TwigSelectorState {
       this.gpuKnown = g;
       this.changed.dispatch();
     });
-    neuronSize(graph, item.root, ds.supervoxelResolution[2]).then(
-      (size) => {
-        item.size = size;
-        this.changed.dispatch();
-      },
-      () => {
-        // Sizing is advisory: the run measures again and reports failures.
-      },
-    );
+    this.updateRoot(item)
+      .catch(() => undefined)
+      .then(() => neuronSize(graph, item.root, ds.supervoxelResolution[2]))
+      .then(
+        (size) => {
+          item.size = size;
+          this.changed.dispatch();
+        },
+        () => {
+          // Sizing is advisory: the run measures again and reports failures.
+        },
+      );
   }
 
   /** The backend the loaded model actually runs on (after any fallback). */
@@ -362,6 +447,10 @@ export class TwigSelectorState {
         // This neuron's options: from its size (auto), else the fields.
         let plan: RunPlan;
         try {
+          // Always run on the neuron as it is NOW.
+          await this.updateRoot(item);
+          // Dropped as a duplicate of another queued neuron.
+          if (!this.items.includes(item)) continue;
           if (this.settings.auto) {
             const ds = this.dataset()!;
             item.size ??= await neuronSize(
@@ -978,6 +1067,16 @@ export class TwigSelectorTab extends Tab {
       }
       main.appendChild(status);
       row.appendChild(main);
+      if (item.updatedFrom) {
+        const upd = document.createElement("div");
+        upd.classList.add("neuroglancer-twig-capture-hint");
+        upd.textContent =
+          `updated from outdated root ${item.updatedFrom}` +
+          (item.updatedShare !== undefined && item.updatedShare < 0.95
+            ? ` (split since: this version holds ${Math.round(item.updatedShare * 100)}% of it)`
+            : "");
+        row.appendChild(upd);
+      }
       // What this neuron will be run with, once it has been measured.
       const plan = state.planFor(item);
       if (item.size && plan && item.status !== "done") {
