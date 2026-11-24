@@ -75,7 +75,7 @@ export interface SelectorSettings {
 const DEFAULT_SETTINGS: SelectorSettings = {
   level: 1,
   chainThreshold: 0.75,
-  maxRegions: 400,
+  maxRegions: 200,
   maxSites: 8,
   maxCandidateL2: 20,
   backend: "auto",
@@ -617,8 +617,10 @@ export class TwigSelectorTab extends Tab {
       "max regions",
       num(st.maxRegions, 1, 100000, 50, (v) => (st.maxRegions = Math.round(v))),
       "Per level. One region is a 6.4 x 6.4 um search window around one " +
-        "1.1 um bin of the object's L2 graph; a fragment needs a few, a " +
-        "whole neuron hundreds to thousands.",
+        "1.1 um bin of the object's L2 graph: a fragment needs a few, most " +
+        "neurons 30-200, big ones several hundred. On a laptop GPU a region " +
+        "takes ~15-50 s. 200 covers most neurons completely; above the cap, " +
+        "regions are spread evenly over the whole neuron. On CPU use 1-3.",
     );
     field(
       "candidate L2 ≤",
