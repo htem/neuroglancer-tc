@@ -1,3 +1,37 @@
+## Twig Capture (this fork)
+
+![Twig Capture: an undertraced BANC neuron is queued in the Twig Selector, merge candidates are predicted in the browser, and the confident ones are staged for review](twig_capture_inference/docs/twig_selector_demo.gif)
+
+*Merge suggestions for undertraced neurons, predicted in your browser and
+reviewed in neuroglancer. Above, BANC SNpp47 has 100 L2 nodes against a
+median of 150 for its type. It is queued in the **Twig Selector**, and merges
+are predicted on this laptop's GPU in 13 min (real time on the clock; the GIF
+is a time-lapse). The 63 candidates at p ≥ 0.9 are staged in **Twig
+Capture**, ready for **Merge staged**.*
+
+| dataset | viewer |
+|---|---|
+| BANC | https://radagast.hms.harvard.edu/twigcapture_banc/ |
+| Aedes | https://radagast.hms.harvard.edu/twigcapture_aedes/ |
+| CRANTb | https://radagast.hms.harvard.edu/twigcapture_crantb/ |
+
+How it works:
+1. Select a neuron (or several) and open the **Twig Selector** tab.
+2. **Add visible segments**, or point at a neuron and press **Alt+T**, then
+   **Run**. The model runs on your GPU, or your CPU if there is none. Results
+   are cached in your browser.
+3. **Open in Twig Capture** to review the suggestions:
+   - one at a time, with **Merge**, **Not a merge**, **Unsure**, **New neuron**
+     or **Split needed**;
+   - or in bulk, with **Stage all → Merge staged**.
+
+   Verdicts are recorded in the dataset's CAVE `twig_capture_decisions` table.
+
+Guide: [`twig_capture_inference/README.md`](twig_capture_inference/README.md).
+How it works and what was measured: [`twig_capture_inference/BRIEF.md`](twig_capture_inference/BRIEF.md).
+
+---
+
 ## Neuroglancer: Web-based volumetric data visualization
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
