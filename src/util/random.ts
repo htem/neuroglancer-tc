@@ -39,7 +39,10 @@ export function getRandomValues<T extends TypedArray>(array: T): T {
   const blockSize = 65536;
   for (let i = 0, length = byteArray.length; i < length; i += blockSize) {
     crypto.getRandomValues(
-      byteArray.subarray(i, Math.min(length, i + blockSize)),
+      byteArray.subarray(
+        i,
+        Math.min(length, i + blockSize),
+      ) as Uint8Array<ArrayBuffer>,
     );
   }
   return array;
