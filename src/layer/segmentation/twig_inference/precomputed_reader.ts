@@ -84,6 +84,55 @@ async function gunzip(data: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
+/** Resolves when the browser is back online (or at once if it is online). */
+function whenOnline(signal?: AbortSignal): Promise<void> {
+  if (typeof navigator === "undefined" || navigator.onLine !== false) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const done = () => {
+      window.removeEventListener("online", done);
+      signal?.removeEventListener("abort", stop);
+      resolve();
+    };
+    const stop = () => {
+      window.removeEventListener("online", done);
+      reject(signal!.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    window.addEventListener("online", done);
+    signal?.addEventListener("abort", stop, { once: true });
+  });
+}
+
+/**
+ * fetch, retried through network blips. A dropped connection makes fetch
+ * throw "Failed to fetch" at once, so without this one blip failed every
+ * region queued behind it (a beta tester lost 60 regions in 0.3 s). Network
+ * errors, 429 and 5xx are retried with backoff (1, 2, 4, 8, 16 s); while the
+ * browser reports itself offline it waits for the connection instead.
+ * Other HTTP statuses are returned to the caller as they are.
+ */
+export async function fetchRetrying(
+  url: string,
+  init: RequestInit = {},
+  signal?: AbortSignal,
+  attempts = 6,
+): Promise<Response> {
+  for (let attempt = 0; ; ++attempt) {
+    await whenOnline(signal);
+    try {
+      const r = await fetch(url, { ...init, signal });
+      if ((r.status === 429 || r.status >= 500) && attempt < attempts - 1) {
+        throw new Error(`HTTP ${r.status} for ${url}`);
+      }
+      return r;
+    } catch (e) {
+      if (signal?.aborted || attempt >= attempts - 1) throw e;
+      await new Promise((res) => setTimeout(res, 1000 * 2 ** attempt));
+    }
+  }
+}
+
 async function fetchRange(
   url: string,
   start: number,
@@ -91,24 +140,18 @@ async function fetchRange(
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
   if (end <= start) return new Uint8Array(0);
-  for (let attempt = 0; ; ++attempt) {
-    try {
-      const r = await fetch(url, {
-        headers: { Range: `bytes=${start}-${end - 1}` },
-        signal,
-      });
-      if (r.status === 404) return new Uint8Array(0);
-      if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-      const buf = new Uint8Array(await r.arrayBuffer());
-      // A server that ignores Range returns the whole object.
-      return r.status === 200 && buf.length > end - start
-        ? buf.subarray(start, end)
-        : buf;
-    } catch (e) {
-      if (signal?.aborted || attempt >= 2) throw e;
-      await new Promise((res) => setTimeout(res, 500 * (attempt + 1)));
-    }
-  }
+  const r = await fetchRetrying(
+    url,
+    { headers: { Range: `bytes=${start}-${end - 1}` } },
+    signal,
+  );
+  if (r.status === 404) return new Uint8Array(0);
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  const buf = new Uint8Array(await r.arrayBuffer());
+  // A server that ignores Range returns the whole object.
+  return r.status === 200 && buf.length > end - start
+    ? buf.subarray(start, end)
+    : buf;
 }
 
 class LRU<V> {
@@ -173,7 +216,7 @@ export class PrecomputedVolume {
   init(): Promise<void> {
     if (!this.ready) {
       this.ready = (async () => {
-        const r = await fetch(this.objectUrl("info"));
+        const r = await fetchRetrying(this.objectUrl("info"));
         if (!r.ok) throw new Error(`${this.url}/info: HTTP ${r.status}`);
         this.info = await r.json();
         const s = this.info.scales.find((sc) =>
@@ -288,7 +331,11 @@ export class PrecomputedVolume {
       bytes = got;
     } else {
       const name = `${lo[0]}-${hi[0]}_${lo[1]}-${hi[1]}_${lo[2]}-${hi[2]}`;
-      const r = await fetch(this.objectUrl(`${key}/${name}`), { signal });
+      const r = await fetchRetrying(
+        this.objectUrl(`${key}/${name}`),
+        {},
+        signal,
+      );
       if (r.status === 404) return null;
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       bytes = new Uint8Array(await r.arrayBuffer());

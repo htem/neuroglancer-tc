@@ -24,9 +24,9 @@ describe("autoPlan", () => {
     expect(p.maxRegions).toBe(16);
     expect(p.maxSites).toBe(8);
   });
-  it("keeps a neuron to small twigs and caps a big one", () => {
+  it("never limits partner size, and caps a big neuron's regions", () => {
     const p = autoPlan({ l2: 1764, regions: 900 }, true);
-    expect(p.maxCandidateL2).toBe(20);
+    expect(p.maxCandidateL2).toBeGreaterThanOrEqual(1_000_000);
     expect(p.maxRegions).toBe(300);
   });
   it("cuts work hard on CPU", () => {

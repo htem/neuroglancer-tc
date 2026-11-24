@@ -87,7 +87,10 @@ import {
   passesProb,
 } from "#src/layer/segmentation/twig_capture_table.js";
 import type { TwigDataset } from "#src/layer/segmentation/twig_inference/datasets.js";
-import { datasetForUrls } from "#src/layer/segmentation/twig_inference/datasets.js";
+import {
+  LARGE_MERGE_L2,
+  datasetForUrls,
+} from "#src/layer/segmentation/twig_inference/datasets.js";
 import {
   LOCAL_RESULT_PREFIX,
   type LocalResultJson,
@@ -3261,6 +3264,7 @@ export class TwigCaptureTab extends Tab {
       expectedRoot.set(file, root);
     }
     const syn = picks.reduce((a, c) => a + (c.cand_synapses_total ?? 0), 0);
+    const large = picks.filter((c) => (c.num_l2_nodes ?? 0) > LARGE_MERGE_L2);
     const into =
       groups.size === 1
         ? `neuron ${(await this.resultForFile([...groups.keys()][0]))?.root_id ?? result.root_id}`
@@ -3276,6 +3280,12 @@ export class TwigCaptureTab extends Tab {
         "neuron, is SKIPPED and left for you. A failed merge stops the run, " +
         "and Stop ends it after the current merge.\n\n" +
         "Each merge edits the shared segmentation and is attributed to you." +
+        (large.length
+          ? `\n\nWARNING, ${large.length} LARGE MERGE(S): partner(s) above ` +
+            `${LARGE_MERGE_L2} L2 nodes (largest ` +
+            `${Math.max(...large.map((c) => c.num_l2_nodes ?? 0))}), bigger ` +
+            "than the model was trained on. Untick any you have not looked at."
+          : "") +
         (warnings.length
           ? "\n\nNOTE, edited since inference:\n" + warnings.join("\n")
           : ""),
@@ -3505,11 +3515,11 @@ export class TwigCaptureTab extends Tab {
       // Neuron filters pick neurons, so they apply to the all-neurons list
       // only; an opened neuron was chosen explicitly.
       if (c._lite && !this.neuronPasses(c._root ?? "")) return false;
-      // No L2-node filter. The candidate search already caps it at
-      // max_candidate_l2_nodes (20), so every row here is a twig by
-      // construction and the control only ever hid real candidates.
-      // num_l2_nodes is still shown on every row, and the changed-hands
-      // dialog still quotes it.
+      // No L2-node filter. Cluster results are capped at
+      // max_candidate_l2_nodes (20); browser results are not, and their
+      // larger partners carry a "large merge" tag rather than being hidden.
+      // num_l2_nodes is shown on every row, and the changed-hands dialog
+      // still quotes it.
       const mito = c.likely_mito === true;
       if (this.mito === "hide" && mito) return false;
       if (this.mito === "only" && !mito) return false;
@@ -4009,6 +4019,22 @@ export class TwigCaptureTab extends Tab {
           : "the neuron ") +
         "and was found by treating the earlier confident suggestions as " +
         "already merged. Merge that one first.";
+      main.appendChild(tag);
+    }
+
+    // Bigger than any partner the model was trained on. Never hidden: the
+    // reviewer decides, but should look at the whole fragment first.
+    if ((candidate.num_l2_nodes ?? 0) > LARGE_MERGE_L2) {
+      const tag = document.createElement("span");
+      tag.classList.add("neuroglancer-twig-capture-tag");
+      tag.classList.add("neuroglancer-twig-capture-tag-warn");
+      tag.textContent = "large merge";
+      tag.title =
+        `This partner has ${candidate.num_l2_nodes} L2 nodes. The model was ` +
+        `trained on partners of up to ${LARGE_MERGE_L2} and sees only ~1 um ` +
+        "around the contact, not the fragment's size, so a wrong large " +
+        "merge does the most damage. Look at the whole fragment before " +
+        "merging.";
       main.appendChild(tag);
     }
 

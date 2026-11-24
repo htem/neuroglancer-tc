@@ -29,9 +29,12 @@
  */
 
 import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
+import { DecisionStore } from "#src/layer/segmentation/twig_capture_decisions.js";
 import type { TwigDataset } from "#src/layer/segmentation/twig_inference/datasets.js";
 import {
   DEFAULT_MODEL_URL,
+  LARGE_MERGE_L2,
+  NO_L2_LIMIT,
   datasetForUrls,
 } from "#src/layer/segmentation/twig_inference/datasets.js";
 import {
@@ -56,6 +59,7 @@ import {
   neuronSize,
   runTwigCapture,
 } from "#src/layer/segmentation/twig_inference/pipeline.js";
+import { addSynapseCounts } from "#src/layer/segmentation/twig_inference/synapses.js";
 import { StatusMessage } from "#src/status.js";
 import { removeChildren } from "#src/util/dom.js";
 import { NullarySignal } from "#src/util/signal.js";
@@ -73,8 +77,10 @@ export interface SelectorSettings {
   chainThreshold: number;
   maxRegions: number;
   maxSites: number;
-  /** Largest candidate proposed, in L2 nodes (cluster runner: 20). */
+  /** Largest candidate proposed, in L2 nodes (default no limit; cluster runner: 20). */
   maxCandidateL2: number;
+  /** 2: saved after partners were uncapped (see loadSettings). */
+  l2LimitVersion?: number;
   backend: Backend;
   modelUrl: string;
 }
@@ -85,7 +91,8 @@ const DEFAULT_SETTINGS: SelectorSettings = {
   chainThreshold: 0.75,
   maxRegions: 200,
   maxSites: 8,
-  maxCandidateL2: 20,
+  maxCandidateL2: NO_L2_LIMIT,
+  l2LimitVersion: 2,
   backend: "auto",
   modelUrl: DEFAULT_MODEL_URL,
 };
@@ -93,7 +100,16 @@ const DEFAULT_SETTINGS: SelectorSettings = {
 function loadSettings(): SelectorSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    if (raw) {
+      const saved = JSON.parse(raw);
+      // Settings saved before partners were uncapped carry the old default
+      // (20); lift it once, or those users would never see large partners.
+      if (saved.l2LimitVersion !== 2) {
+        saved.maxCandidateL2 = NO_L2_LIMIT;
+        saved.l2LimitVersion = 2;
+      }
+      return { ...DEFAULT_SETTINGS, ...saved };
+    }
   } catch {
     // private window / blocked storage
   }
@@ -127,8 +143,6 @@ export interface RunPlan {
   minutes: number;
 }
 
-/** A neuron at or below this many L2 nodes is a fragment looking for a home. */
-const FRAGMENT_L2 = 50;
 /** Region budget per level when chosen automatically. */
 const AUTO_REGIONS_GPU = 300;
 const AUTO_REGIONS_CPU = 3;
@@ -137,9 +151,9 @@ const SEC_PER_REGION_GPU = 25;
 const SEC_PER_REGION_CPU = 600;
 
 /**
- * Options from the neuron's size. A fragment (few L2 nodes) usually belongs
- * ON a bigger neuron, so its partners are not size-limited; a neuron
- * collects small twigs (<= 20 L2, as the cluster runner). Every region is
+ * Options from the neuron's size. Partners are never size-limited: those
+ * above LARGE_MERGE_L2 are tagged "large merge" in Twig Capture instead,
+ * because the model was trained on smaller ones. Every region is
  * searched up to a budget, above which regions are spread over the neuron.
  * On CPU the budget and sites/pair are cut hard: ~10 min per region.
  */
@@ -153,7 +167,7 @@ export function autoPlan(
   );
   return {
     maxRegions,
-    maxCandidateL2: size.l2 <= FRAGMENT_L2 ? 1_000_000 : 20,
+    maxCandidateL2: NO_L2_LIMIT,
     maxSites: gpu ? 8 : 1,
     minutes:
       (maxRegions * (gpu ? SEC_PER_REGION_GPU : SEC_PER_REGION_CPU)) / 60,
@@ -194,7 +208,7 @@ export class TwigSelectorState {
     );
     return {
       maxRegions: st.maxRegions,
-      maxCandidateL2: st.maxCandidateL2 ?? 20,
+      maxCandidateL2: st.maxCandidateL2 ?? NO_L2_LIMIT,
       maxSites: st.maxSites,
       minutes: (regions * (gpu ? SEC_PER_REGION_GPU : SEC_PER_REGION_CPU)) / 60,
     };
@@ -313,6 +327,15 @@ export class TwigSelectorState {
     return datasetForUrls(this.layer.dataSources.map((d) => d.spec.url));
   }
 
+  /** CAVE server origin of this layer's graphene source. */
+  private caveServer(): string | undefined {
+    for (const ds of this.layer.dataSources) {
+      const m = /https?:\/\/[^/\s]+/.exec(ds.spec?.url ?? "");
+      if (m !== null) return m[0];
+    }
+    return undefined;
+  }
+
   graph(): GraphAccess | undefined {
     const g = this.layer.displayState.segmentationGroupState.value.graph
       .value as any;
@@ -388,15 +411,19 @@ export class TwigSelectorState {
     const want =
       plan ??
       (st.auto
-        ? { maxRegions: AUTO_REGIONS_GPU, maxCandidateL2: 20 }
+        ? { maxRegions: AUTO_REGIONS_GPU, maxCandidateL2: NO_L2_LIMIT }
         : {
             maxRegions: st.maxRegions,
-            maxCandidateL2: st.maxCandidateL2 ?? 20,
+            maxCandidateL2: st.maxCandidateL2 ?? NO_L2_LIMIT,
           });
     // The result must have looked at least as far as the settings now ask:
     // as deep a level, as large a partner, and every region unless it was
     // capped at or above today's cap.
     if ((x.level ?? 1) < st.level) return undefined;
+    // Made by another model: a new model means new predictions.
+    if (x.local_model !== undefined && x.local_model !== st.modelUrl) {
+      return undefined;
+    }
     if ((x.filters?.max_candidate_l2_nodes ?? 20) < want.maxCandidateL2) {
       return undefined;
     }
@@ -528,6 +555,24 @@ export class TwigSelectorState {
             },
             signal,
           );
+          // Synapses on each partner, for the "N syn" tag and the synapse
+          // sort. Best effort: a result without them is still a result.
+          const server = this.caveServer();
+          if (server !== undefined && result.candidates.length > 0) {
+            item.progress = { ...item.progress!, phase: "counting synapses" };
+            this.changed.dispatch();
+            try {
+              await addSynapseCounts(
+                result,
+                new DecisionStore(server, dataset.datastack),
+                dataset.synapseTable,
+                signal,
+              );
+            } catch (e) {
+              if ((e as any)?.name === "AbortError") throw e;
+              logEvent("warn", `root ${item.root}: synapse counts failed`, e);
+            }
+          }
           item.status = "done";
           item.resultName = result.name;
           this.layer.localTwigResults.add(result, false);
@@ -881,7 +926,7 @@ export class TwigSelectorTab extends Tab {
       "candidate L2 ≤",
       (() => {
         const el = num(
-          st.maxCandidateL2 ?? 20,
+          st.maxCandidateL2 ?? NO_L2_LIMIT,
           1,
           1000000,
           10,
@@ -890,10 +935,11 @@ export class TwigSelectorTab extends Tab {
         manual.push(el);
         return el;
       })(),
-      "Largest partner proposed, in L2 nodes. 20 (as the cluster runner) " +
-        "suits a neuron collecting small twigs. To find where a small " +
-        "FRAGMENT belongs -- usually onto a big neuron -- raise it (e.g. " +
-        "100000) so large partners are scored too.",
+      "Largest partner proposed, in L2 nodes. No limit by default " +
+        `(${NO_L2_LIMIT}). Partners above ${LARGE_MERGE_L2} L2 -- the size ` +
+        "the model was trained on -- are tagged 'large merge' in Twig " +
+        `Capture: check them before merging. Set ${LARGE_MERGE_L2} to ` +
+        "match the cluster runner.",
     );
     const sites = document.createElement("select");
     for (const [v, label] of [
@@ -1067,6 +1113,36 @@ export class TwigSelectorTab extends Tab {
       }
       main.appendChild(status);
       row.appendChild(main);
+      // Regions that failed even after retries (usually the connection):
+      // the result is incomplete, and nothing else on the row says so.
+      const failedRegions = (cached as any)?.benchmark?.region_errors ?? 0;
+      if (failedRegions > 0) {
+        const warn = document.createElement("div");
+        warn.classList.add("neuroglancer-twig-capture-hint");
+        warn.style.color = "#f88";
+        const searched = (cached as any)?.binned_regions_searched;
+        warn.textContent =
+          `${failedRegions}` +
+          (typeof searched === "number" ? ` of ${searched}` : "") +
+          " region(s) failed, so this result is incomplete. ";
+        warn.title =
+          "Usually a dropped connection while reading image chunks. " +
+          "Copy report gives the details.";
+        if (item.status === "done") {
+          const again = document.createElement("button");
+          again.textContent = "Re-run";
+          again.title =
+            "Run this neuron again (queued; it replaces this result).";
+          again.addEventListener("click", (e) => {
+            e.stopPropagation();
+            item.status = "queued";
+            state.changed.dispatch();
+            if (!state.isRunning) void state.run(false);
+          });
+          warn.appendChild(again);
+        }
+        row.appendChild(warn);
+      }
       if (item.updatedFrom) {
         const upd = document.createElement("div");
         upd.classList.add("neuroglancer-twig-capture-hint");
@@ -1088,14 +1164,14 @@ export class TwigSelectorTab extends Tab {
         line.textContent =
           `${item.size.l2} L2 · ${item.size.regions} region(s)` +
           (capped ? `, ${plan.maxRegions} searched (spread)` : "") +
-          ` · partners ${plan.maxCandidateL2 >= 1_000_000 ? "any size" : `≤ ${plan.maxCandidateL2} L2`}` +
+          ` · partners ${plan.maxCandidateL2 >= NO_L2_LIMIT ? "any size" : `≤ ${plan.maxCandidateL2} L2`}` +
           ` · ${plan.maxSites} site(s)/pair` +
           (item.status === "queued"
             ? ` · ~${mins} min (${gpu ? "GPU" : "CPU"})`
             : "");
         line.title =
-          (item.size.l2 <= FRAGMENT_L2 && state.settings.auto
-            ? "A fragment: partners of any size are scored, to find the neuron it belongs to. "
+          (plan.maxCandidateL2 >= NO_L2_LIMIT
+            ? `Partners of any size are scored; those above ${LARGE_MERGE_L2} L2 are tagged 'large merge'. `
             : "") + "The time is a rough estimate (dense tissue is slower).";
         row.appendChild(line);
       }

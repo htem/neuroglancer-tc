@@ -330,6 +330,38 @@ export class DecisionStore {
     return this.fetchRows("");
   }
 
+  /**
+   * Rows of any table in this datastack, from the live query endpoint, as of
+   * `timestamp`. `extra` is a JSON fragment (`,"filter_in_dict":...`) built
+   * by hand, so 64-bit ids are never rounded. 16+ digit numbers in the reply
+   * come back as strings for the same reason.
+   */
+  async liveQuery(
+    table: string,
+    timestamp: string,
+    extra: string,
+    signal?: AbortSignal,
+  ): Promise<any[]> {
+    const url =
+      `${this.server}/materialize/api/v3/datastack/${this.datastack}/query` +
+      "?return_pyarrow=false&arrow_format=false&merge_reference=false" +
+      "&allow_missing_lookups=true";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: await this.headers(),
+      body: `{"table":"${table}","timestamp":"${timestamp}"${extra}}`,
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(
+        `CAVE query on ${table} failed (${response.status}): ` +
+          (await caveError(response)),
+      );
+    }
+    const text = await response.text();
+    return JSON.parse(text.replace(/(:\s*)(\d{16,})/g, '$1"$2"'));
+  }
+
   private async fetchRows(filter: string): Promise<Map<string, DecisionRow>> {
     const url =
       `${this.server}/materialize/api/v3/datastack/${this.datastack}/query` +

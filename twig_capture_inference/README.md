@@ -66,6 +66,43 @@ paste the text into a message to us. It holds your browser and OS, GPU
 details, the settings, the error and a short run log. It contains no login
 tokens.
 
+## Updating the in-browser model
+
+When twigcapture has a newer checkpoint (Kevin's runs are in
+`kd193/automergeproof/models/models_local/<run>/local_classifier_ckpt_<N>.pth`;
+the newest one used for cluster results is named in `configs/<dataset>.yaml`,
+`models.local_model_path`):
+
+1. **Build and publish it** (on O2, from this folder of a neuroglancer-tc
+   checkout):
+
+   ```bash
+   sbatch scripts/build_browser_model.sh <ckpt.pth> [name]
+   ```
+
+   The job exports the checkpoint to ONNX, rewrites every Conv3d as Conv2d
+   (WebGPU is about 40× faster on it), and checks the result against
+   PyTorch. It fails if they differ by more than 1e-4. It then publishes
+   `https://radagast.hms.harvard.edu/twigcapture_dev/models/<name>/local_fp32c2d.onnx`
+   with a `MODEL.txt` recording the checkpoint, the sha256 and the check.
+   The name defaults to `<run>_ep<N>`, and a published name is never
+   overwritten.
+2. **Try it:** paste that URL into the Twig Selector's **model** field.
+   Results record the model URL (`local_model`), and a result made with a
+   different model is not reused.
+3. **Make it the default:** set `DEFAULT_MODEL_URL` in
+   `src/layer/segmentation/twig_inference/datasets.ts` to the new URL,
+   commit, and redeploy (`deploy/deploy.sh`).
+
+Each model needs its own URL because browsers cache the model by URL:
+replacing a file in place would leave browsers scoring with the old copy.
+
+**Which models so far**
+
+| name | checkpoint | notes |
+|---|---|---|
+| `joint_finetune_20261123_105038_ep8` | Kevin's joint Aedes+BANC fine-tune on reviewer decisions, epoch 8 | the current default (also served as `twigcapture_dev/local_fp32c2d.onnx`) |
+
 ## For developers
 
 See [BRIEF.md](BRIEF.md) for how it works, what has been measured against

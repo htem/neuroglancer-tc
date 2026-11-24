@@ -43,6 +43,13 @@ export interface TwigDataset {
    * twigcapture_<dataset>/results/ (see deploy/deploy.sh).
    */
   catalogUrl: string;
+  /**
+   * CAVE synapse table that in-browser results take cand_synapses_total
+   * from (pre + post rows on the partner). The same tables as the cluster's
+   * counts: BANC and Aedes synapses_v2 (Aedes v3 is not served by CAVE),
+   * CRANTb synapses_v3.
+   */
+  synapseTable: string;
   /** Caveats shown in the selector. */
   note?: string;
 }
@@ -62,6 +69,7 @@ export const TWIG_DATASETS: TwigDataset[] = [
     datastack: "brain_and_nerve_cord",
     table: "wclee_fly_cns_001",
     catalogUrl: "https://radagast.hms.harvard.edu/twigcapture_banc/results/",
+    synapseTable: "synapses_v2",
     supervoxelUrl:
       "precomputed://gs://zetta_lee_fly_cns_001_segmentation/v1_sharded",
     supervoxelResolution: [32, 32, 45],
@@ -78,6 +86,7 @@ export const TWIG_DATASETS: TwigDataset[] = [
     datastack: "wclee_aedes_brain",
     table: "wclee_aedes_brain",
     catalogUrl: "https://radagast.hms.harvard.edu/twigcapture_aedes/results/",
+    synapseTable: "synapses_v2",
     supervoxelUrl: "precomputed://gs://fanc-fly_segmentation/wclee_aedes_brain",
     supervoxelResolution: [32, 32, 45],
     emUrl:
@@ -90,6 +99,7 @@ export const TWIG_DATASETS: TwigDataset[] = [
     datastack: "kronauer_ant",
     table: "kronauer_ant_x1",
     catalogUrl: "https://radagast.hms.harvard.edu/twigcapture_crantb/results/",
+    synapseTable: "synapses_v3",
     supervoxelUrl:
       "precomputed://gs://zetta_ws/dkronauer-ant-001-240904-finetune-v3.2-0.27",
     supervoxelResolution: [32, 32, 42],
@@ -113,6 +123,18 @@ export function datasetForUrls(urls: string[]): TwigDataset | undefined {
  * it needs a precomputed per-dataset grid that only exists on the cluster, and
  * the orphan-first runner already runs without it.
  */
+/**
+ * Partner size, in L2 nodes, above which a suggestion is a LARGE MERGE. The
+ * model was trained only on partners up to this size (the GT pipeline's and
+ * the cluster runner's candidate cap), and it sees ~1 um around the contact,
+ * not the partner's size: a large orphan wrongly merged does the most damage.
+ * The browser no longer caps partners at this size; it tags them instead.
+ */
+export const LARGE_MERGE_L2 = 20;
+
+/** "No limit" for the Twig Selector's partner-size field. */
+export const NO_L2_LIMIT = 1_000_000;
+
 export const TWIG_PARAMS = {
   cutout: [200, 200, 120] as [number, number, number],
   border: 20,
