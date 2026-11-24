@@ -2,20 +2,21 @@
 
 ![Twig Capture: an undertraced BANC neuron is queued in the Twig Selector, merge candidates are predicted in the browser, and the confident ones are staged for review](twig_capture_inference/docs/twig_selector_demo.gif)
 
-*Merge suggestions for undertraced neurons, predicted in your browser and
+_Merge suggestions for undertraced neurons, predicted in your browser and
 reviewed in neuroglancer. Above, BANC SNpp47 has 100 L2 nodes against a
 median of 150 for its type. It is queued in the **Twig Selector**, and merges
 are predicted on this laptop's GPU in 13 min (real time on the clock; the GIF
 is a time-lapse). The 63 candidates at p ≥ 0.9 are staged in **Twig
-Capture**, ready for **Merge staged**.*
+Capture**, ready for **Merge staged**._
 
-| dataset | viewer |
-|---|---|
-| BANC | https://radagast.hms.harvard.edu/twigcapture_banc/ |
-| Aedes | https://radagast.hms.harvard.edu/twigcapture_aedes/ |
-| CRANTb | https://radagast.hms.harvard.edu/twigcapture_crantb/ |
+| dataset | viewer                                               |
+| ------- | ---------------------------------------------------- |
+| BANC    | https://radagast.hms.harvard.edu/twigcapture_banc/   |
+| Aedes   | https://radagast.hms.harvard.edu/twigcapture_aedes/  |
+| CRANTb  | https://radagast.hms.harvard.edu/twigcapture_crantb/ |
 
 How it works:
+
 1. Select a neuron (or several) and open the **Twig Selector** tab.
 2. **Add visible segments**, or point at a neuron and press **Alt+T**, then
    **Run**. The model runs on your GPU, or your CPU if there is none. Results
