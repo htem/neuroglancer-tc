@@ -348,3 +348,23 @@
   outline-offset: -2px;
   background: rgba(255, 204, 102, 0.16);
 }
+
+/* One-cell verdicts (new neuron, split needed): a line under the row with a
+   group per cell -- the cell's role and id, then the buttons about it -- so
+   it is never a question which end of the suggested merge a button marks. */
+.neuroglancer-twig-capture-sides {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 0 2px 2px 0;
+}
+.neuroglancer-twig-capture-side {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.neuroglancer-twig-capture-side-label {
+  font-family: monospace;
+  opacity: 0.8;
+  margin-right: 2px;
+}

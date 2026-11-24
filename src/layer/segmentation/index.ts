@@ -918,6 +918,7 @@ export class SegmentationUserLayer extends Base {
                 this.localPosition,
               );
               this.graphConnection.value = graphConnection;
+              this.bindDefaultGraphTools();
               for (const renderLayer of graphRenderLayers) {
                 loadedSubsource.addRenderLayer(renderLayer);
               }
@@ -1029,6 +1030,30 @@ export class SegmentationUserLayer extends Base {
       });
     }
     return specs;
+  }
+
+  /**
+   * Spelunker's proofreading shortcuts, so that this build behaves like the
+   * CAVE viewers people already use: M merge, C multicut (split), F find
+   * path. Spelunker carries them as per-layer toolBindings in its links; a
+   * graphene layer added here by hand, or opened from a link without them,
+   * gets the same keys. A key already bound -- by the link, by the user, or
+   * by another layer -- is left alone.
+   */
+  private bindDefaultGraphTools() {
+    const isGraphene = this.dataSources.some((ds) =>
+      ds.spec.url.startsWith("graphene://"),
+    );
+    if (!isGraphene) return;
+    const binder = this.toolBinder;
+    for (const [key, tool] of [
+      ["M", "grapheneMergeSegments"],
+      ["C", "grapheneMulticutSegments"],
+      ["F", "grapheneFindPath"],
+    ]) {
+      if (binder.globalBinder.get(key) !== undefined) continue;
+      binder.setJson(key, tool);
+    }
   }
 
   restoreState(specification: any) {

@@ -16,8 +16,25 @@
  *
  *   pt    bound point on the NEURON    position in NANOMETRES
  *   pt2   bound point on the ORPHAN
- *   tag   merge | no_merge | unsure
+ *   tag   merge | no_merge | unsure | new_neuron | split_needed
+ *
+ *         The last two are about ONE side of the pair, named in tag2 by
+ *         cell=<root id at review>;side=sink|source; the cell is at pt (sink)
+ *         or pt2 (source). In a neuron-first result the sink is the neuron
+ *         under review and the source the candidate. In an orphan-first
+ *         result (run_twigcapture_v2_orph.py) the sink is the growing SEED and
+ *         the source the candidate.
+ *
+ *         new_neuron    that cell is a whole neuron of its own, so the two
+ *                       must not be merged. Training: a no_merge. Annotation:
+ *                       a new cell for the dataset's table (and backbone
+ *                       proofread) at that side's point. Neuron-first: only
+ *                       the candidate can be it.
+ *         split_needed  that cell contains a false merge to resolve before
+ *                       this pair can be judged. Either side. Training: left
+ *                       out, like unsure. Not staged by Stage all.
  *   tag2  src=<result file stem>;cand=<target_segment_id>;ctr=<x,y,z>[;op=<id>]
+ *         [;cell=<root id>;side=sink|source]   (new_neuron, split_needed)
  *
  * `ctr` is in 8 x 8 x 45 nm VOXELS while pt/pt2 are nm. Different units, on
  * purpose, and the table description says so.
@@ -92,7 +109,24 @@ export function decisionsAllowed(urls: readonly string[]): boolean {
   return false;
 }
 
-export type Verdict = "merge" | "no_merge" | "unsure";
+export type Verdict =
+  | "merge"
+  | "no_merge"
+  | "unsure"
+  | "new_neuron"
+  | "split_needed";
+
+/** Verdicts about one side of the pair; they carry cell= and side=. */
+export const SIDED_VERDICTS: readonly Verdict[] = [
+  "new_neuron",
+  "split_needed",
+];
+
+/** Verdicts that say "do not join these two": no_merge, and new_neuron (the
+ * orphan is a neuron of its own, so it is also not part of this one). */
+export function isNotAMerge(tag: string | undefined): boolean {
+  return tag === "no_merge" || tag === "new_neuron";
+}
 
 export interface DecisionRow {
   id: number;
@@ -114,6 +148,8 @@ export interface DecisionTarget {
   cand: string;
   /** The result file stem, <root_id>_<timestamp>. */
   src: string;
+  /** Sided verdicts only: which side is meant, and its root id at review. */
+  cell?: { side: "sink" | "source"; root: string };
 }
 
 /** The voxel grid `ctr` is written in -- what you paste into Neuroglancer. */
@@ -230,6 +266,12 @@ export class DecisionStore {
       `ctr=${ctrVoxels(target.coordinate_nm, this.datastack)}`,
     ];
     if (op !== undefined && op !== "") parts.push(`op=${op}`);
+    if (SIDED_VERDICTS.includes(verdict)) {
+      if (target.cell === undefined) {
+        throw new Error(`a ${verdict} decision must say which side it means`);
+      }
+      parts.push(`cell=${target.cell.root}`, `side=${target.cell.side}`);
+    }
 
     const body = {
       annotations: [

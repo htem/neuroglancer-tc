@@ -62,6 +62,7 @@ import type {
 import {
   DecisionStore,
   decisionsAllowed,
+  isNotAMerge,
 } from "#src/layer/segmentation/twig_capture_decisions.js";
 import type {
   NeuronField,
@@ -146,7 +147,7 @@ export class TwigCaptureState {
   probOp: ">=" | "<=" = ">=";
   /** "any" | "hide" | "only" -- replaced the hideMito/mitoOnly pair. */
   mito = "any";
-  /** "any" | "none" | "done" | "merge" | "no_merge" | "unsure". */
+  /** "any" | "none" | "done" | or one of the verdicts. */
   review = "any";
   sortKey = "prob";
   /** SeaTable neuron filters: field -> value; absent means any. */
@@ -201,6 +202,8 @@ export class TwigCaptureState {
       "merge",
       "no_merge",
       "unsure",
+      "new_neuron",
+      "split_needed",
     ].includes(o.review)
       ? o.review
       : "any";
@@ -219,10 +222,30 @@ export class TwigCaptureState {
   }
 }
 
+/**
+ * The seed of an orphan-first result: the result's root id (seed_id), which
+ * is what the sink side of every hop grew from. Falls back to the
+ * candidate's parent_root.
+ */
+function ref0Seed(
+  active: { root_id: string } | undefined,
+  candidate: TwigCandidate,
+): string {
+  return active?.root_id ?? candidate._root ?? candidate.parent_root ?? "";
+}
+
 /** One candidate as run_twigcapture.py emits it. */
 interface TwigCandidate {
   id: string;
   target_segment_id: string;
+  /**
+   * Orphan-first results only (run_twigcapture_v2_orph.py): the root the
+   * candidate joins, i.e. the growing seed object (the merge_sink side), and
+   * the hop it was found on. Their presence is what marks a candidate as
+   * orphan-first.
+   */
+  parent_root?: string;
+  hop?: number;
   confidence?: number;
   prob_merge: number;
   pred_local?: number;
@@ -390,7 +413,8 @@ function parseResult(name: string, text: string): TwigResult {
   if (!Array.isArray(obj.candidates)) {
     throw new Error(`${name}: no "candidates" array -- not an AMP result file`);
   }
-  const rootId = String(obj.root_id ?? "unknown");
+  // Orphan-first files (run_twigcapture_v2_orph.py) name their root seed_id.
+  const rootId = String(obj.root_id ?? obj.seed_id ?? "unknown");
   const candidates = obj.candidates as TwigCandidate[];
   for (const c of candidates) {
     c._file = name;
@@ -1143,7 +1167,8 @@ export class TwigCaptureTab extends Tab {
   /** Set one neuron filter ("" = any), or clear them all with no field. */
   private setNeuronFilter(field?: NeuronField, value = "") {
     if (field === undefined) this.neuronFilters = {};
-    else if (value) this.neuronFilters = { ...this.neuronFilters, [field]: value };
+    else if (value)
+      this.neuronFilters = { ...this.neuronFilters, [field]: value };
     else {
       const next = { ...this.neuronFilters };
       delete next[field];
@@ -1548,6 +1573,8 @@ export class TwigCaptureTab extends Tab {
         ["merge", "merge"],
         ["no_merge", "not a merge"],
         ["unsure", "unsure"],
+        ["new_neuron", "new neuron"],
+        ["split_needed", "split needed"],
       ],
       () => this.review,
       (v) => (this.review = v),
@@ -2109,6 +2136,7 @@ export class TwigCaptureTab extends Tab {
     candidate: TwigCandidate,
     verdict: Verdict,
     op?: string,
+    cell?: { side: "sink" | "source"; root: string },
   ): Promise<boolean> {
     if (!this.decisionsAllowed()) {
       // The control is hidden for these layers, so reaching here means a
@@ -2153,6 +2181,32 @@ export class TwigCaptureTab extends Tab {
       this.render();
       return false;
     }
+    // A sided verdict names its cell by the root it has NOW, looked up from
+    // that side's supervoxel: the file's ids are a snapshot from inference,
+    // and the cell has often been proofread since. cell= is what downstream
+    // reads; pt/pt2 are contact-face points and can bind to the neighbour.
+    if (cell !== undefined) {
+      const graph = this.graphene();
+      const sv = (cell.side === "sink" ? sink : source).supervoxel_id;
+      try {
+        if (graph?.getRoot !== undefined) {
+          cell = {
+            side: cell.side,
+            root: String(await graph.getRoot(BigInt(sv))),
+          };
+        }
+      } catch {
+        // keep the file's id; it is still the right cell, only maybe stale
+      }
+      if (!/^\d+$/.test(cell.root)) {
+        StatusMessage.showTemporaryMessage(
+          "Twig Capture: could not tell which cell this is; nothing was written.",
+          6000,
+        );
+        this.render();
+        return false;
+      }
+    }
     // The result file stem, which is what src= has to point at.
     const src = result.name.replace(/\.json$/, "");
     const target: DecisionTarget = {
@@ -2162,6 +2216,7 @@ export class TwigCaptureTab extends Tab {
       coordinate_nm: ref.candidate.coordinate_nm,
       cand: candidate.target_segment_id,
       src,
+      cell,
     };
     this.deciding.add(key);
     this.render();
@@ -2171,7 +2226,9 @@ export class TwigCaptureTab extends Tab {
         id,
         tag: verdict,
         cand: candidate.target_segment_id,
-        tag2: `src=${src};cand=${candidate.target_segment_id}`,
+        tag2:
+          `src=${src};cand=${candidate.target_segment_id}` +
+          (cell ? `;cell=${cell.root};side=${cell.side}` : ""),
         created: Date.now(),
       };
       // Both views: the single-neuron map only if this is the neuron shown.
@@ -2546,14 +2603,16 @@ export class TwigCaptureTab extends Tab {
   /**
    * What Stage all would take: the listed candidates of the open neuron that
    * can still be merged. Leaves out rows already joined, rows someone has
-   * judged "no_merge", and rows without merge endpoints.
+   * judged "no_merge", "new_neuron" or "split_needed", and rows without
+   * merge endpoints.
    */
   private stageable(): TwigCandidate[] {
     if (this.active === undefined) return [];
     return this.filtered().filter(
       (c) =>
         !this.isJoined(c) &&
-        this.decisionFor(c)?.tag !== "no_merge" &&
+        !isNotAMerge(this.decisionFor(c)?.tag) &&
+        this.decisionFor(c)?.tag !== "split_needed" &&
         !!c.merge_sink &&
         !!c.merge_source,
     );
@@ -2609,7 +2668,9 @@ export class TwigCaptureTab extends Tab {
       this.graphene()?.graphServer === undefined;
     b.title =
       "Stage every listed candidate of this neuron that can still be merged " +
-      "(not already joined, not judged no_merge) and show them all in the " +
+      "(not already joined, not judged no_merge, new_neuron or " +
+      "split_needed) and show them " +
+      "all in the " +
       "view. Nothing is edited: untick the ones you do not want, then Merge " +
       "staged.";
   }
@@ -2963,7 +3024,13 @@ export class TwigCaptureTab extends Tab {
         if (this.review === "none" && d !== undefined) return false;
         if (this.review === "done" && d === undefined) return false;
         if (
-          ["merge", "no_merge", "unsure"].includes(this.review) &&
+          [
+            "merge",
+            "no_merge",
+            "unsure",
+            "new_neuron",
+            "split_needed",
+          ].includes(this.review) &&
           d?.tag !== this.review
         ) {
           return false;
@@ -3352,7 +3419,7 @@ export class TwigCaptureTab extends Tab {
     if (decided !== undefined) {
       const chip = document.createElement("span");
       chip.classList.add("neuroglancer-twig-capture-tag");
-      if (decided.tag === "no_merge") {
+      if (isNotAMerge(decided.tag) || decided.tag === "split_needed") {
         chip.classList.add("neuroglancer-twig-capture-tag-warn");
       }
       chip.textContent = decided.tag;
@@ -3376,6 +3443,10 @@ export class TwigCaptureTab extends Tab {
     // as chips appeared and disappeared.
     const actions = document.createElement("div");
     actions.classList.add("neuroglancer-twig-capture-actions");
+    // Verdicts about ONE cell of the pair get their own line under the row,
+    // one group per cell: who it is first, then what is wrong with it.
+    const sidesBox = document.createElement("div");
+    sidesBox.classList.add("neuroglancer-twig-capture-sides");
 
     const merge = document.createElement("button");
     merge.classList.add("neuroglancer-twig-capture-merge");
@@ -3441,6 +3512,78 @@ export class TwigCaptureTab extends Tab {
           void this.recordDecision(candidate, verdict);
         });
         actions.appendChild(b);
+      }
+
+      // Verdicts about ONE side of the pair. Each button names the cell it
+      // marks, by role and id, because "which end of the suggested merge?"
+      // is otherwise ambiguous. Neuron-first: the sink is the neuron under
+      // review, the source the candidate. Orphan-first (parent_root set):
+      // the sink is the seed being grown, the source the candidate.
+      // Orphan-first: a full row carries parent_root; an All-neurons row is
+      // a compact table row without it, so fall back to the file name
+      // (run_twigcapture_v2_orph.py writes orph_<seed>_<stamp>.json).
+      const orph =
+        candidate.parent_root !== undefined ||
+        (candidate._file ?? "").startsWith("orph_");
+      const sinkRoot = ref0Seed(this.active, candidate);
+      const sides: Record<"sink" | "source", [string, string]> = {
+        sink: [orph ? "seed" : "neuron", sinkRoot],
+        source: ["candidate", candidate.target_segment_id],
+      };
+      const sided: [Verdict, string, ("sink" | "source")[], string][] = [
+        [
+          "new_neuron",
+          "New neuron",
+          // A neuron under review is already a neuron; only an orphan side
+          // can be newly found to be one.
+          orph ? ["sink", "source"] : ["source"],
+          "is a whole neuron of its own: these two are not a merge, and that " +
+            "cell is a new neuron to add to the table (and to backbone " +
+            "proofread). Counts as a no_merge for training.",
+        ],
+        [
+          "split_needed",
+          "Split needed",
+          ["sink", "source"],
+          "contains a false merge that should be resolved before this pair " +
+            "is judged. Left out of training, and not staged by Stage all.",
+        ],
+      ];
+      for (const side of ["sink", "source"] as const) {
+        const [role, root] = sides[side];
+        if (!root) continue;
+        const mine = sided.filter(([, , which]) => which.includes(side));
+        if (mine.length === 0) continue;
+        const group = document.createElement("div");
+        group.classList.add("neuroglancer-twig-capture-side");
+        const who = document.createElement("span");
+        who.classList.add("neuroglancer-twig-capture-side-label");
+        who.textContent = `${role} \u2026${root.slice(-6)}`;
+        who.title =
+          `${role === "candidate" ? "The candidate" : role === "seed" ? "The seed being grown" : "The neuron under review"}: ` +
+          `${root}. The buttons beside it are about this cell only.`;
+        group.appendChild(who);
+        for (const [verdict, label, , help] of mine) {
+          const b = document.createElement("button");
+          b.classList.add("neuroglancer-twig-capture-merge");
+          b.textContent = pending ? "\u2026" : label;
+          b.disabled = pending || joined;
+          b.title = joined
+            ? "This candidate is already part of the neuron, so there is no " +
+              "pair left to judge. Undo the merge first if it was wrong."
+            : `Record that the ${role} (${root}) ${help} Writes a ${verdict} ` +
+              `row to twig_capture_decisions with cell=${root};side=${side}. ` +
+              "It does not change the segmentation.";
+          b.addEventListener("click", (event: MouseEvent) => {
+            event.stopPropagation();
+            void this.recordDecision(candidate, verdict, undefined, {
+              side,
+              root,
+            });
+          });
+          group.appendChild(b);
+        }
+        sidesBox.appendChild(group);
       }
     }
 
@@ -3508,6 +3651,7 @@ export class TwigCaptureTab extends Tab {
     metaLine.appendChild(meta);
     metaLine.appendChild(actions);
     row.appendChild(metaLine);
+    if (sidesBox.childElementCount > 0) row.appendChild(sidesBox);
 
     const syn = this.makeSynapseLine(candidate);
     if (syn !== undefined) row.appendChild(syn);
