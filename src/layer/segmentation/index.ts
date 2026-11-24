@@ -37,6 +37,10 @@ import { layerDataSourceSpecificationFromJson } from "#src/layer/layer_data_sour
 import * as json_keys from "#src/layer/segmentation/json_keys.js";
 import { registerLayerControls } from "#src/layer/segmentation/layer_controls.js";
 import {
+  MVB_REVIEW_JSON_KEY,
+  MvbReviewState,
+} from "#src/layer/segmentation/mvb_review_tab.js";
+import {
   TWIG_CAPTURE_JSON_KEY,
   TwigCaptureState,
   TwigCaptureTab,
@@ -634,6 +638,8 @@ const Base = UserLayerWithAnnotationsMixin(UserLayer);
 export class SegmentationUserLayer extends Base {
   /** Shareable Twig Capture state; see TwigCaptureState. */
   twigCapture = new TwigCaptureState();
+  /** Shareable MVB review state (queue URL, current object); see MvbReviewState. */
+  mvbReview = new MvbReviewState();
   /** Twig Capture results computed in this browser (IndexedDB-backed). */
   localTwigResults = new LocalTwigResults();
   /** Twig Selector queue and settings; per browser, never serialised. */
@@ -775,6 +781,7 @@ export class SegmentationUserLayer extends Base {
     // tab is built lazily below and so may never exist, while the layer must
     // serialise regardless. See TwigCaptureState for what it holds and why.
     this.twigCapture.changed.add(this.specificationChanged.dispatch);
+    this.mvbReview.changed.add(this.specificationChanged.dispatch);
     this.tabs.add("twigCapture", {
       label: "Twig Capture",
       order: -20,
@@ -1076,6 +1083,7 @@ export class SegmentationUserLayer extends Base {
   restoreState(specification: any) {
     super.restoreState(specification);
     this.twigCapture.restoreState(specification[TWIG_CAPTURE_JSON_KEY]);
+    this.mvbReview.restoreState(specification[MVB_REVIEW_JSON_KEY]);
     this.displayState.selectedAlpha.restoreState(
       specification[json_keys.SELECTED_ALPHA_JSON_KEY],
     );
@@ -1186,6 +1194,8 @@ export class SegmentationUserLayer extends Base {
     }
     const twig = this.twigCapture.toJSON();
     if (twig !== undefined) x[TWIG_CAPTURE_JSON_KEY] = twig;
+    const mvb = this.mvbReview.toJSON();
+    if (mvb !== undefined) x[MVB_REVIEW_JSON_KEY] = mvb;
     x[json_keys.EQUIVALENCES_JSON_KEY] =
       this.displayState.originalSegmentationGroupState.localGraph.toJSON();
     if (linkedSegmentationGroup.root.value === this) {
