@@ -52,6 +52,7 @@ import type {
 } from "#src/layer/segmentation/twig_inference/pipeline.js";
 import {
   DatasetContext,
+  neuronSize,
   runTwigCapture,
 } from "#src/layer/segmentation/twig_inference/pipeline.js";
 import { StatusMessage } from "#src/status.js";
@@ -62,6 +63,11 @@ import { Tab } from "#src/widget/tab_view.js";
 const SETTINGS_KEY = "neuroglancer-twig-selector-settings";
 
 export interface SelectorSettings {
+  /**
+   * Choose max regions, candidate size and sites/pair per neuron from its
+   * size and the device (autoPlan); the fields below are then ignored.
+   */
+  auto: boolean;
   level: number;
   chainThreshold: number;
   maxRegions: number;
@@ -73,6 +79,7 @@ export interface SelectorSettings {
 }
 
 const DEFAULT_SETTINGS: SelectorSettings = {
+  auto: true,
   level: 1,
   chainThreshold: 0.75,
   maxRegions: 200,
@@ -102,6 +109,50 @@ interface QueueItem {
   resultName?: string;
   /** Message and stack of a failure, for the copied report. */
   errorDetail?: string;
+  /** The neuron's size, measured when queued (see neuronSize). */
+  size?: { l2: number; regions: number };
+}
+
+/** The options one neuron runs with, and what that costs. */
+export interface RunPlan {
+  maxRegions: number;
+  maxCandidateL2: number;
+  maxSites: number;
+  /** Rough wall time in minutes on this device. */
+  minutes: number;
+}
+
+/** A neuron at or below this many L2 nodes is a fragment looking for a home. */
+const FRAGMENT_L2 = 50;
+/** Region budget per level when chosen automatically. */
+const AUTO_REGIONS_GPU = 300;
+const AUTO_REGIONS_CPU = 3;
+/** Measured on an Apple M-series laptop (BRIEF.md): seconds per region. */
+const SEC_PER_REGION_GPU = 25;
+const SEC_PER_REGION_CPU = 600;
+
+/**
+ * Options from the neuron's size. A fragment (few L2 nodes) usually belongs
+ * ON a bigger neuron, so its partners are not size-limited; a neuron
+ * collects small twigs (<= 20 L2, as the cluster runner). Every region is
+ * searched up to a budget, above which regions are spread over the neuron.
+ * On CPU the budget and sites/pair are cut hard: ~10 min per region.
+ */
+export function autoPlan(
+  size: { l2: number; regions: number },
+  gpu: boolean,
+): RunPlan {
+  const maxRegions = Math.max(
+    1,
+    Math.min(size.regions, gpu ? AUTO_REGIONS_GPU : AUTO_REGIONS_CPU),
+  );
+  return {
+    maxRegions,
+    maxCandidateL2: size.l2 <= FRAGMENT_L2 ? 1_000_000 : 20,
+    maxSites: gpu ? 8 : 1,
+    minutes:
+      (maxRegions * (gpu ? SEC_PER_REGION_GPU : SEC_PER_REGION_CPU)) / 60,
+  };
 }
 
 const contexts = new Map<string, DatasetContext>();
@@ -115,6 +166,54 @@ export class TwigSelectorState {
   private model: { key: string; model: MergeModel } | undefined;
 
   constructor(private layer: SegmentationUserLayer) {}
+
+  private gpuProbe: Promise<boolean> | undefined;
+  /** Will the model run on the GPU with the current device setting? */
+  willUseGpu(): Promise<boolean> {
+    const b = this.settings.backend;
+    if (b === "wasm") return Promise.resolve(false);
+    if (b === "webgpu") return Promise.resolve(true);
+    return (this.gpuProbe ??= webgpuAvailable());
+  }
+  /** Last known answer of willUseGpu, for drawing the plan synchronously. */
+  gpuKnown: boolean | undefined;
+
+  /** The options this neuron will run with (auto from its size, or the fields). */
+  planFor(item: QueueItem): RunPlan | undefined {
+    const st = this.settings;
+    const gpu = this.gpuKnown ?? true;
+    if (st.auto) return item.size ? autoPlan(item.size, gpu) : undefined;
+    const regions = Math.min(
+      item.size?.regions ?? st.maxRegions,
+      st.maxRegions,
+    );
+    return {
+      maxRegions: st.maxRegions,
+      maxCandidateL2: st.maxCandidateL2 ?? 20,
+      maxSites: st.maxSites,
+      minutes: (regions * (gpu ? SEC_PER_REGION_GPU : SEC_PER_REGION_CPU)) / 60,
+    };
+  }
+
+  /** Measure a queued neuron (L2 nodes, regions) in the background. */
+  measure(item: QueueItem) {
+    const graph = this.graph();
+    const ds = this.dataset();
+    if (!graph || !ds || item.size) return;
+    void this.willUseGpu().then((g) => {
+      this.gpuKnown = g;
+      this.changed.dispatch();
+    });
+    neuronSize(graph, item.root, ds.supervoxelResolution[2]).then(
+      (size) => {
+        item.size = size;
+        this.changed.dispatch();
+      },
+      () => {
+        // Sizing is advisory: the run measures again and reports failures.
+      },
+    );
+  }
 
   /** The backend the loaded model actually runs on (after any fallback). */
   get backendUsed() {
@@ -162,11 +261,11 @@ export class TwigSelectorState {
       // Already computed in this browser at this level or deeper: show it as
       // done rather than queueing work Run would skip anyway.
       const hit = this.cached(root);
-      this.items.push(
-        hit
-          ? { root, status: "done", resultName: hit.name }
-          : { root, status: "queued" },
-      );
+      const item: QueueItem = hit
+        ? { root, status: "done", resultName: hit.name }
+        : { root, status: "queued" };
+      this.items.push(item);
+      this.measure(item);
       added++;
     }
     this.changed.dispatch();
@@ -191,7 +290,7 @@ export class TwigSelectorState {
    * went at least as deep as the level now set (a level-1 result does not
    * answer a level-2 request; a level-2 result contains level 1).
    */
-  cached(root: string) {
+  cached(root: string, plan?: RunPlan) {
     const r = this.layer.localTwigResults.forRoot(
       root,
       this.dataset()?.datastack,
@@ -199,11 +298,21 @@ export class TwigSelectorState {
     if (r === undefined) return undefined;
     const x = r as any;
     const st = this.settings;
+    // In auto mode before the neuron is measured there is no plan: hold the
+    // result to the auto budget instead of the (ignored) manual fields.
+    const want =
+      plan ??
+      (st.auto
+        ? { maxRegions: AUTO_REGIONS_GPU, maxCandidateL2: 20 }
+        : {
+            maxRegions: st.maxRegions,
+            maxCandidateL2: st.maxCandidateL2 ?? 20,
+          });
     // The result must have looked at least as far as the settings now ask:
     // as deep a level, as large a partner, and every region unless it was
     // capped at or above today's cap.
     if ((x.level ?? 1) < st.level) return undefined;
-    if ((x.filters?.max_candidate_l2_nodes ?? 20) < (st.maxCandidateL2 ?? 20)) {
+    if ((x.filters?.max_candidate_l2_nodes ?? 20) < want.maxCandidateL2) {
       return undefined;
     }
     const searched = x.binned_regions_searched;
@@ -212,7 +321,7 @@ export class TwigSelectorState {
       typeof searched === "number" &&
       typeof total === "number" &&
       searched < total &&
-      searched < st.maxRegions
+      searched < want.maxRegions
     ) {
       return undefined;
     }
@@ -250,7 +359,31 @@ export class TwigSelectorState {
           if (!force || item.status === "running") continue;
         }
         if (item.status !== "queued" && !force) continue;
-        const cached = this.cached(item.root);
+        // This neuron's options: from its size (auto), else the fields.
+        let plan: RunPlan;
+        try {
+          if (this.settings.auto) {
+            const ds = this.dataset()!;
+            item.size ??= await neuronSize(
+              graph,
+              item.root,
+              ds.supervoxelResolution[2],
+            );
+            const gpu = await this.willUseGpu();
+            this.gpuKnown = gpu;
+            plan = autoPlan(item.size, gpu);
+          } else {
+            plan = this.planFor(item)!;
+          }
+        } catch (e) {
+          item.status = "failed";
+          item.error = `could not measure the neuron: ${String((e as any)?.message ?? e)}`;
+          item.errorDetail = errorText(e);
+          logEvent("error", `root ${item.root}: sizing failed`, e);
+          this.changed.dispatch();
+          continue;
+        }
+        const cached = this.cached(item.root, plan);
         if (cached && !force) {
           item.status = "done";
           item.resultName = cached.name;
@@ -295,9 +428,9 @@ export class TwigSelectorState {
             {
               level: st.level,
               chainThreshold: st.chainThreshold,
-              maxRegions: st.maxRegions,
-              maxSites: st.maxSites,
-              maxCandidateL2: st.maxCandidateL2 ?? 20,
+              maxRegions: plan.maxRegions,
+              maxSites: plan.maxSites,
+              maxCandidateL2: plan.maxCandidateL2,
               modelUrl: st.modelUrl,
             },
             (p) => {
@@ -613,9 +746,42 @@ export class TwigSelectorTab extends Tab {
       "Level 2+: suggestions at least this confident are treated as merged " +
         "before searching around them.",
     );
+    const auto = document.createElement("input");
+    auto.type = "checkbox";
+    auto.checked = st.auto;
+    field(
+      "auto",
+      auto,
+      "Choose max regions, partner size and sites/pair for each neuron from " +
+        "its size and your device: every region up to 300 on GPU (3 on CPU), " +
+        "spread over the neuron above that; partners of any size for a " +
+        "fragment (<= 50 L2 nodes), so it can find the neuron it belongs to, " +
+        "and small twigs (<= 20 L2) for a neuron; 8 sites/pair on GPU, 1 on " +
+        "CPU. Each queued neuron shows its plan. Untick to set them by hand.",
+    );
+    const manual: (HTMLInputElement | HTMLSelectElement)[] = [];
+    const applyAuto = () => {
+      for (const el of manual) {
+        el.disabled = st.auto;
+        el.title = st.auto ? "Chosen per neuron (auto is on)." : "";
+      }
+    };
+    auto.addEventListener("change", () => {
+      st.auto = auto.checked;
+      applyAuto();
+      state.saveSettings();
+    });
+    const regionsEl = num(
+      st.maxRegions,
+      1,
+      100000,
+      50,
+      (v) => (st.maxRegions = Math.round(v)),
+    );
+    manual.push(regionsEl);
     field(
       "max regions",
-      num(st.maxRegions, 1, 100000, 50, (v) => (st.maxRegions = Math.round(v))),
+      regionsEl,
       "Per level. One region is a 6.4 x 6.4 um search window around one " +
         "1.1 um bin of the object's L2 graph: a fragment needs a few, most " +
         "neurons 30-200, big ones several hundred. On a laptop GPU a region " +
@@ -624,13 +790,17 @@ export class TwigSelectorTab extends Tab {
     );
     field(
       "candidate L2 ≤",
-      num(
-        st.maxCandidateL2 ?? 20,
-        1,
-        1000000,
-        10,
-        (v) => (st.maxCandidateL2 = Math.round(v)),
-      ),
+      (() => {
+        const el = num(
+          st.maxCandidateL2 ?? 20,
+          1,
+          1000000,
+          10,
+          (v) => (st.maxCandidateL2 = Math.round(v)),
+        );
+        manual.push(el);
+        return el;
+      })(),
       "Largest partner proposed, in L2 nodes. 20 (as the cluster runner) " +
         "suits a neuron collecting small twigs. To find where a small " +
         "FRAGMENT belongs -- usually onto a big neuron -- raise it (e.g. " +
@@ -647,6 +817,7 @@ export class TwigSelectorTab extends Tab {
       sites.appendChild(o);
     }
     sites.value = String(st.maxSites);
+    manual.push(sites);
     sites.addEventListener("change", () => {
       st.maxSites = Number(sites.value);
       state.saveSettings();
@@ -672,6 +843,10 @@ export class TwigSelectorTab extends Tab {
     backend.value = st.backend;
     backend.addEventListener("change", () => {
       st.backend = backend.value as Backend;
+      void state.willUseGpu().then((g) => {
+        state.gpuKnown = g;
+        state.changed.dispatch();
+      });
       state.saveSettings();
     });
     field(
@@ -714,6 +889,7 @@ export class TwigSelectorTab extends Tab {
     pick.addEventListener("click", () => file.click());
     row.appendChild(pick);
     row.appendChild(file);
+    applyAuto();
     return row;
   }
 
@@ -802,6 +978,28 @@ export class TwigSelectorTab extends Tab {
       }
       main.appendChild(status);
       row.appendChild(main);
+      // What this neuron will be run with, once it has been measured.
+      const plan = state.planFor(item);
+      if (item.size && plan && item.status !== "done") {
+        const line = document.createElement("div");
+        line.classList.add("neuroglancer-twig-capture-hint");
+        const capped = item.size.regions > plan.maxRegions;
+        const gpu = state.gpuKnown ?? true;
+        const mins = Math.max(1, Math.round(plan.minutes));
+        line.textContent =
+          `${item.size.l2} L2 · ${item.size.regions} region(s)` +
+          (capped ? `, ${plan.maxRegions} searched (spread)` : "") +
+          ` · partners ${plan.maxCandidateL2 >= 1_000_000 ? "any size" : `≤ ${plan.maxCandidateL2} L2`}` +
+          ` · ${plan.maxSites} site(s)/pair` +
+          (item.status === "queued"
+            ? ` · ~${mins} min (${gpu ? "GPU" : "CPU"})`
+            : "");
+        line.title =
+          (item.size.l2 <= FRAGMENT_L2 && state.settings.auto
+            ? "A fragment: partners of any size are scored, to find the neuron it belongs to. "
+            : "") + "The time is a rough estimate (dense tissue is slower).";
+        row.appendChild(line);
+      }
       const actions = document.createElement("div");
       actions.classList.add("neuroglancer-twig-capture-actions");
       if (cached) {

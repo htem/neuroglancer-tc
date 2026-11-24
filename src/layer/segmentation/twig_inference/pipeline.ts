@@ -236,30 +236,27 @@ export async function runTwigCapture(
 
   /** L2 nodes of `roots` -> binned region centres (first node per bin). */
   const regionsFor = async (roots: string[], skipBackbone: boolean) => {
-    const bins = new Map<string, [number, number, number]>();
+    const all: [number, number, number][] = [];
+    const seen = new Set<string>();
     for (const r of roots) {
       const leaves = await getLeavesL2(graph, r);
       totalL2 += leaves.length;
       check();
       const attrs = await getL2Attributes(graph, leaves);
       check();
-      for (const id of leaves) {
-        const a = attrs[id];
-        if (!a?.rep_coord_nm) continue;
-        if (
-          skipBackbone &&
-          ((a.max_dt_nm ?? 0) > P.l2MaxDtNm ||
-            (a.size_nm3 ?? 0) > P.l2MaxSizeNm3)
-        )
-          continue;
-        const c: [number, number, number] = [
-          Math.floor(a.rep_coord_nm[0] / 16),
-          Math.floor(a.rep_coord_nm[1] / 16),
-          Math.floor(a.rep_coord_nm[2] / zRes),
-        ];
-        const key = `${Math.floor(c[0] / P.binXY)},${Math.floor(c[1] / P.binXY)},${Math.floor(c[2] / P.binZ)}`;
-        if (!bins.has(key)) bins.set(key, c);
+      for (const c of binL2(leaves, attrs, zRes, skipBackbone)) {
+        const key = c.join(",");
+        if (!seen.has(key)) {
+          seen.add(key);
+          all.push(c);
+        }
       }
+    }
+    // One region per bin across all roots (first seen wins), as before.
+    const bins = new Map<string, [number, number, number]>();
+    for (const c of all) {
+      const key = `${Math.floor(c[0] / P.binXY)},${Math.floor(c[1] / P.binXY)},${Math.floor(c[2] / P.binZ)}`;
+      if (!bins.has(key)) bins.set(key, c);
     }
     return [...bins.values()];
   };
@@ -697,4 +694,52 @@ export function spreadRegions(
     update(best);
   }
   return picked.map((i) => all[i]);
+}
+
+/**
+ * Region centres for a set of L2 nodes, one per bin, exactly as a run picks
+ * them: backbone/soma nodes (max_dt or size above the runner's limits) are
+ * skipped when `skipBackbone`, coordinates are in 16 nm x/y and z-slice
+ * units, and the first node in each bin is its centre.
+ */
+export function binL2(
+  leaves: string[],
+  attrs: Record<string, any>,
+  zRes: number,
+  skipBackbone: boolean,
+): [number, number, number][] {
+  const P = TWIG_PARAMS;
+  const bins = new Map<string, [number, number, number]>();
+  for (const id of leaves) {
+    const a = attrs[id];
+    if (!a?.rep_coord_nm) continue;
+    if (
+      skipBackbone &&
+      ((a.max_dt_nm ?? 0) > P.l2MaxDtNm ||
+        Number(a.size_nm3 ?? 0) > P.l2MaxSizeNm3)
+    )
+      continue;
+    const c: [number, number, number] = [
+      Math.floor(a.rep_coord_nm[0] / 16),
+      Math.floor(a.rep_coord_nm[1] / 16),
+      Math.floor(a.rep_coord_nm[2] / zRes),
+    ];
+    const key = `${Math.floor(c[0] / P.binXY)},${Math.floor(c[1] / P.binXY)},${Math.floor(c[2] / P.binZ)}`;
+    if (!bins.has(key)) bins.set(key, c);
+  }
+  return [...bins.values()];
+}
+
+/** A neuron's size before running: L2 nodes, and level-1 regions a run would search. */
+export async function neuronSize(
+  graph: GraphAccess,
+  root: string,
+  zRes: number,
+): Promise<{ l2: number; regions: number }> {
+  const leaves = await getLeavesL2(graph, root);
+  const attrs = await getL2Attributes(graph, leaves);
+  return {
+    l2: leaves.length,
+    regions: binL2(leaves, attrs, zRes, true).length,
+  };
 }
