@@ -1184,7 +1184,7 @@ export class Viewer extends RefCounted implements ViewerState {
       });
     }
 
-    for (const action of ["select", "star"]) {
+    for (const action of ["select", "star", "twig-predict"]) {
       this.bindAction(action, () => {
         this.mouseState.updateUnconditionally();
         this.layerManager.invokeAction(action);

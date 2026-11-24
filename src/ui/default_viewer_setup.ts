@@ -271,7 +271,7 @@ export function setupDefaultViewer() {
         defaultFragment:
           typeof NEUROGLANCER_DEFAULT_STATE_FRAGMENT !== "undefined"
             ? NEUROGLANCER_DEFAULT_STATE_FRAGMENT
-            : undefined,
+            : twigCaptureDefaultState(),
         upgradeState: viewer.stateUpgrader,
       },
     ),
@@ -296,4 +296,17 @@ export function setupDefaultViewer() {
   bindCommandPalette(viewer);
 
   return viewer;
+}
+
+/**
+ * Twig Capture deployments: one build is served from several folders
+ * (twigcapture_banc/, twigcapture_aedes/, twigcapture_crantb/), each with its
+ * own default_state.json beside index.html. A link with no state opens that
+ * folder's dataset; a link with a state is unaffected.
+ */
+function twigCaptureDefaultState(): string | undefined {
+  if (!/\/twigcapture_[a-z0-9_]+\/(index\.html)?$/.test(location.pathname)) {
+    return undefined;
+  }
+  return new URL("default_state.json", location.href).href;
 }

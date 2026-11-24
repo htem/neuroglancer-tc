@@ -368,3 +368,8 @@
   opacity: 0.8;
   margin-right: 2px;
 }
+
+/* In-browser results, level 2+: a suggestion that attaches to an earlier one. */
+.neuroglancer-twig-capture-tag-hop {
+  background: #2a3a4a;
+}

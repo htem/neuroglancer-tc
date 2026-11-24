@@ -41,6 +41,11 @@ import {
   TwigCaptureState,
   TwigCaptureTab,
 } from "#src/layer/segmentation/twig_capture_tab.js";
+import { LocalTwigResults } from "#src/layer/segmentation/twig_local_results.js";
+import {
+  TwigSelectorState,
+  TwigSelectorTab,
+} from "#src/layer/segmentation/twig_selector_tab.js";
 import {
   MeshLayer,
   MeshSource,
@@ -629,6 +634,10 @@ const Base = UserLayerWithAnnotationsMixin(UserLayer);
 export class SegmentationUserLayer extends Base {
   /** Shareable Twig Capture state; see TwigCaptureState. */
   twigCapture = new TwigCaptureState();
+  /** Twig Capture results computed in this browser (IndexedDB-backed). */
+  localTwigResults = new LocalTwigResults();
+  /** Twig Selector queue and settings; per browser, never serialised. */
+  twigSelector = new TwigSelectorState(this);
   sliceViewRenderScaleHistogram = new RenderScaleHistogram();
   sliceViewRenderScaleTarget = trackableRenderScaleTarget(1);
   codeVisible = new TrackableBoolean(true);
@@ -770,6 +779,14 @@ export class SegmentationUserLayer extends Base {
       label: "Twig Capture",
       order: -20,
       getter: () => new TwigCaptureTab(this),
+      hidden: hideGraphTab,
+    });
+    // In-browser Twig Capture: choose objects, run the merge model locally,
+    // results appear in the Twig Capture tab.
+    this.tabs.add("twigSelector", {
+      label: "Twig Selector",
+      order: -19,
+      getter: () => new TwigSelectorTab(this),
       hidden: hideGraphTab,
     });
     this.tabs.default = "rendering";
@@ -1199,6 +1216,20 @@ export class SegmentationUserLayer extends Base {
       case "clear-segments": {
         if (!this.pick.value) break;
         this.displayState.segmentationGroupState.value.visibleSegments.clear();
+        break;
+      }
+      case "twig-predict": {
+        // Alt+T: the neuron under the mouse (else every visible one) into
+        // the Twig Selector, and run. Only the selected layer answers, so
+        // one keypress never queues the same neuron on several layers.
+        if (this.manager.root.selectedLayer.layer?.layer !== this) break;
+        const { segmentSelectionState } = this.displayState;
+        const roots = segmentSelectionState.hasSelectedSegment
+          ? [String(segmentSelectionState.selectedSegment)]
+          : [
+              ...this.displayState.segmentationGroupState.value.visibleSegments,
+            ].map(String);
+        void this.twigSelector.predictFromHotkey(roots);
         break;
       }
       case "select":

@@ -22,7 +22,9 @@ O2 and in the browser:
 Steps:
 
 1. Export the model to ONNX and check it against PyTorch. **Done.**
-2. Score real-sized patches in the browser: correctness and speed. **In progress.**
+2. Score real-sized patches in the browser: correctness and speed. **Done
+   (2026-11-23): exact on WebGPU at 83 ms/patch on an Apple M-series GPU,
+   about 2 min per 1,500-candidate fragment** (the Conv2d rewrite, below).
 3. Separate candidate finding and patch building (the `run_twigcapture_v2.py`
    region loop) from all I/O. Run it under Pyodide on neuroglancer's cutouts.
 4. Move the batch runner onto the same module and ONNX model, so batch and
@@ -80,6 +82,176 @@ At 1.26 s/patch, CPU alone takes about 30 minutes for one fragment
    Relu, Add, ReduceMean, Flatten and Gemm, all in ORT Web's WebGPU op set.
    Still to run: fp16pad on a real GPU (Mac click, or the gpu_requeue job
    below), and `local_fp32pad.onnx` (new, 133 MB) on SwiftShader.
+
+### The fix: every Conv3d as Conv2d (2026-11-23, Apple M-series, Chrome, Metal-3)
+
+`local_fp32pad.onnx` was exact on WebGPU but took 3.7 s/patch at every batch
+size, slower than O2's CPU. ORT Web 1.22 runs 3D Conv on WebGPU with
+`Conv3DNaive`. Its 2D Conv uses tuned matmul kernels.
+
+`scripts/conv3d_as_conv2d.py` rewrites the graph so activations stay in
+(N, D, C, H, W) layout. Each Conv3d becomes: zero-pad depth only, slice the
+kd depth taps, then either
+
+- **concat** (`c2d`): stack the taps along channels and run one Conv2d with
+  the weight reordered to (Co, kd·Ci, kh, kw), 20 Conv2d nodes in all; or
+- **sum** (`s2d`): one Conv2d per tap, then add, 54 Conv2d nodes.
+
+H and W padding stays inside the Conv2d, and GlobalAveragePool becomes
+ReduceMean over axes (1, 3, 4). No Pad feeds a Conv directly, so these models
+load with full graph optimisation. `scripts/check_onnx.py` checks any model
+against PyTorch on CPU.
+
+| model | WebGPU ms/patch (batch 1 / 4 / 8) | max \|dp\| on WebGPU | 1,500 candidates |
+|---|---|---|---|
+| `local_fp32pad.onnx` (3D Conv) | 3704 / 3689 / – | 1e-7 | 93 min |
+| `local_fp32s2d.onnx` | 335 / 251 / 232 | 1e-7 | 6 min |
+| **`local_fp32c2d.onnx`** | **83** / 126 / 131 | **9e-8** | **2.1 min** |
+| `local_fp16c2d.onnx` | 67 / 67 / 70 | 3.8e-3 | 1.7 min |
+| `local_fp16pad.onnx` | 3 / 11 / 2 | 0.28: p is 0.5520 for every input | – |
+
+- **Use `local_fp32c2d.onnx` at batch 1.** It is exact, and fp16 saves only
+  about 20%.
+- The rewrite also halves CPU time with onnxruntime: 370 ms/patch against
+  716 ms on the Mac.
+- fp16pad's constant output is a bug in the fp16 3D/Pad path on WebGPU: the
+  fp16 Conv2d model is fine. It has not been chased further, because Conv2d
+  replaces that path.
+- The batch 4/8 slowdown for c2d comes from only 2 timing reps, so it may be
+  noise. Re-check when real patches are scored.
+
+Build the models (any machine with onnx and onnxruntime; fp16 also needs
+onnxconverter-common):
+
+```
+python scripts/conv3d_as_conv2d.py <dev>/local_fp32.onnx <dev>/local_fp32c2d.onnx concat
+python scripts/conv3d_as_conv2d.py <dev>/local_fp32.onnx <dev>/local_fp32s2d.onnx sum
+python -c "import onnx; from onnxconverter_common import float16 as f; onnx.save(f.convert_float_to_float16(onnx.load('<dev>/local_fp32c2d.onnx'), keep_io_types=True), '<dev>/local_fp16c2d.onnx')"
+python scripts/check_onnx.py <dev> <dev>/local_fp32c2d.onnx
+```
+
+## In the viewer: Twig Selector (2026-11-23)
+
+A **Twig Selector** tab on graphene segmentation layers (BANC, Aedes,
+CRANTb) queues objects ("Add visible segments", or paste root ids) and runs
+the whole pipeline in the browser. Results open in the **Twig Capture** tab,
+listed as `[this browser]`. Nothing runs on a server:
+
+- **Data:** read straight from the public volumes (supervoxels at 32 nm, EM
+  at 8 nm), plus the chunkedgraph and L2 cache using the layer's own CAVE
+  login.
+- **Model:** runs on the GPU (WebGPU) or, without one, on the CPU (WASM).
+- **Cache:** the model bytes and every result are kept in IndexedDB.
+- **Verdicts:** go to the same CAVE decisions tables. Results carry
+  `dataset` = the datastack, and `src=browser_<root>_<stamp>`.
+
+Code: `src/layer/segmentation/twig_inference/`, with `twig_selector_tab.ts`
+and `twig_local_results.ts` beside it.
+
+| file | what it does |
+|---|---|
+| `datasets.ts` | the per-dataset sources (from twigcapture `configs/*.yaml`) and filter values |
+| `precomputed_reader.ts` | exact cutouts from sharded or unsharded precomputed volumes (compressed_segmentation, jpeg, raw). gs:// is read through the GCS JSON API, for CORS |
+| `volume_ops.ts` | 1:1 port of `touching_labels_center`, `find_contact_sites`, `supervoxel_near`, the zoom(order=0) mask upsampling and `organelle_features` |
+| `pipeline.ts` | `run_twigcapture_v2.py`'s region loop; writes the runner's result schema |
+| `model.ts` | ONNX Runtime Web (from jsDelivr, pinned), WebGPU→WASM fallback, model cache |
+
+**Level.** Level 1 suggests merges onto the object. Level N+1 treats the
+level-N suggestions with p ≥ the chain threshold (default 0.75) as already
+merged, by relabelling them as the object, as the orphan-first runner does.
+It then searches around them. Those rows carry `hop` and `via_root` (the
+suggestion they attach to; merge that one first). The tab shows a "level N"
+chip, and the sink side is labelled "via".
+
+**Checks:**
+
+- `volume_ops.spec.ts` compares against the runner's own Python
+  (`scripts/gen_volume_ops_fixture.py` execs its functions under scipy). On
+  1,363 contact blobs everything matches exactly: the neighbours, the
+  rejections, the blob sizes and centroids, the supervoxel_near voxels and
+  the zoom indices.
+  - numpy's argsort is not stable above 16 elements, so blobs of equal size
+    can be listed in another order. That only matters at the 8-site cutoff.
+- The BANC cutouts are identical to CloudVolume's: all 79,660 distinct
+  supervoxels in a 200×200×120 region, the sampled voxels, and the EM mean
+  and zero fraction (so JPEG decoding is exact).
+- In the viewer, the model gives exactly PyTorch's p on the reference patches:
+  - WebGPU (Apple M-series): 82 ms/patch;
+  - CPU (WASM): 3.1 s/patch.
+
+**Differences from the cluster runner:**
+
+- No synapse-density gate (it needs a grid that exists only on the
+  cluster), so every non-backbone L2 bin is searched. Use "max regions" to
+  cap it.
+- BANC EM is the public 8 nm mip, which is downsampled. The runner instead
+  takes every second voxel of the 4 nm zarr.
+- No synapse counts.
+
+**CPU.** Runs single-threaded, because the page is not cross-origin isolated:
+COOP/COEP would break CAVE's login popup. The UI stalls during each patch,
+because ORT's worker proxy cannot start from the CDN script. Bundling
+onnxruntime-web would allow both. On CPU, set sites/pair to 1 and keep
+max regions small.
+
+**End-to-end runs (2026-11-24, Apple M-series, Chrome, WebGPU):**
+
+| dataset | root | regions | patches | time | result |
+|---|---|---|---|---|---|
+| BANC | 720575941598365041 | 15 (capped) | ~1,080 | 3.5 min | 108 suggestions; opens in Twig Capture; verdict buttons live |
+| BANC, level 2 | 720575941598365041 | 6 + 4 (capped) | 859 | 146 s | level 2 searched around the level-1 suggestions (see note) |
+| Aedes | 648518347555976042 | 36 (all) | 1,915 | 354 s | 427 suggestions, `dataset` wclee_aedes_brain |
+| CRANTb | (needs the zetta login) | | | | EM and supervoxel reads identical to CloudVolume |
+
+- Results are cached in IndexedDB and survive a reload. Re-adding a root
+  that has a result at this level or deeper shows it as done.
+- **Decisions:** the BANC `twig_capture_decisions` read works with the
+  layer's token (HTTP 200). A verdict on a browser row goes through the same
+  `DecisionStore.post`, with `src=browser_<root>_<stamp>.json`. No test row
+  was written.
+- **Against the cluster (Aedes 648518347555976042):** the cluster searched
+  2 regions (5 L2 nodes, after its synapse gate), the browser 36 (46 L2
+  nodes, no gate). Of the cluster's 25 candidates, 18 are in the browser
+  result. Their p agree only loosely, because the checkpoints differ: the
+  cluster run used `20260920_143447_aedes/ckpt_0016`, the browser model is
+  the joint Aedes+BANC fine-tune. The other 7 were not rejected. The browser
+  now logs pairs scored at or below the report threshold as
+  `below_threshold`, so whether they were scored low can be checked.
+- **Level 2, honestly labelled:** a row's `hop` now says what its sink
+  touches. 1 means the neuron, even when the row was found while searching a
+  later level (that level's windows overlap the neuron wherever the level-1
+  region cap stopped short). Higher means a suggestion, and then `via_root`
+  names it. On the test neuron all accepted level-1 suggestions were tiny
+  pieces lying against the neuron, so no true second-order rows came up.
+- **Site claims are released** when a site's EM is unusable (em_overflow,
+  em_zero_frac), as the runner does, so another region can still score it.
+
+**Several neurons at once.** The Selector queues and predicts any number of
+roots in turn. Tick finished ones and press **Open ticked together**: Twig
+Capture lists all their candidates as one list (`members` on the combined
+result). The graph check, decisions and **Stage all → Merge staged** then
+work per neuron. Each neuron's root is established from its own level-1
+contacts, and merges run neuron by neuron, each against its own advancing
+root.
+
+**Bug reports.** **Copy diagnostics** (always shown), and **Copy report** on
+a failed item, put a plain-text block on the clipboard. It holds the
+browser, OS, CPU threads and memory, the WebGPU adapter (vendor,
+architecture, f16, buffer limits, fallback adapter), cross-origin isolation,
+the ORT version, the backend actually used, the settings, the error with its
+stack, and the last 60 run events (model start, fallbacks, per-region
+failures with stacks). No tokens and no URL hash. If the clipboard is
+refused, the report opens in a text box instead. In "auto" mode a WebGPU
+session that fails to start falls back to the CPU and logs why.
+
+**Deploying (radagast).** One build serves three folders, each with its own
+`default_state.json` (in `deploy/<dataset>/`). A link with no state opens
+that folder's dataset, with the Twig Capture catalog for it
+(`catmaid2/twigcapture_<dataset>/`). See `deploy/deploy.sh`. The default
+and remembered catalog are now per dataset, so a BANC layer no longer opens
+the Aedes catalog. CRANTb's cluster results (`twig_capture/crantb_v2.2`)
+are not served on catmaid2 yet; `catmaid2/twigcapture_crantb/` currently
+falls through to WEBKNOSSOS.
 
 ## How to test (browser)
 
@@ -151,15 +323,17 @@ build is `~/.cache/ms-playwright/chromium-1243`.
 
 ## Next steps
 
-1. Run WebGPU on `local_fp16pad.onnx`. If it passes, record ms/patch, then
-   try fp32-pad if fp16 numerics drift.
-2. If WebGPU fails on another operator, rewrite it in `explicit_pad.py` the
-   same way. If 3D Conv is too slow or unsupported, express each Conv3d as a
-   sum of Conv2d over kernel depth.
-3. Load the model in the viewer from a URL and score one real candidate.
-   Build its patch from neuroglancer's own EM and segmentation chunks, check
-   p against that candidate's `prob_merge` in a result JSON, then move on to
-   step 3 of the plan.
+1. Copy `local_fp32c2d.onnx` to the radagast dev folder (`DEFAULT_MODEL_URL`),
+   then deploy with `deploy/deploy.sh` and check the three links.
+2. Serve CRANTb's results (`twig_capture/crantb_v2.2`) as
+   `catmaid2/twigcapture_crantb/` with an `index.json`, and run CRANTb end to
+   end after a zetta login.
+3. Optional synapse gate in the browser: serve each dataset's 500 nm density
+   grid (`data_files/<ds>/synapse_counts_500nm.npy`) and apply
+   `min_synapses_within` as the runner does. That makes runs faster and
+   region-for-region comparable with the cluster.
+4. Bundle onnxruntime-web, so the CPU path can use ORT's worker proxy (the UI
+   stays responsive) and, with COOP/COEP, threads.
 
 ## Also on this branch (viewer changes since `crantb` fed5bf0)
 

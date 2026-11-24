@@ -86,6 +86,12 @@ import {
   fetchCandidateTable,
   passesProb,
 } from "#src/layer/segmentation/twig_capture_table.js";
+import type { TwigDataset } from "#src/layer/segmentation/twig_inference/datasets.js";
+import { datasetForUrls } from "#src/layer/segmentation/twig_inference/datasets.js";
+import {
+  LOCAL_RESULT_PREFIX,
+  type LocalResultJson,
+} from "#src/layer/segmentation/twig_local_results.js";
 import { StatusMessage } from "#src/status.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { removeChildren } from "#src/util/dom.js";
@@ -245,6 +251,12 @@ interface TwigCandidate {
    * orphan-first.
    */
   parent_root?: string;
+  /**
+   * In-browser results with level > 1 (twig_inference/pipeline.ts): the
+   * earlier suggestion this candidate attaches to, when that is not the
+   * neuron itself. Its merge_sink lies on via_root.
+   */
+  via_root?: string;
   hop?: number;
   confidence?: number;
   prob_merge: number;
@@ -308,6 +320,20 @@ interface TwigCandidate {
 /** Per-row state key: cand_N is only unique within one result file. */
 function rowKey(c: TwigCandidate): string {
   return `${c._file ?? ""}#${c.id}`;
+}
+
+/** Is `root` one of the staged neurons (not a candidate)? */
+function isStagedNeuron(
+  stage: { neurons: Map<string, bigint> },
+  root: bigint,
+): boolean {
+  for (const r of stage.neurons.values()) if (r === root) return true;
+  return false;
+}
+
+/** The result files a list of rows comes from, in order of first appearance. */
+function rowFiles(rows: TwigCandidate[], fallback: { name: string }): string[] {
+  return [...new Set(rows.map((c) => c._file ?? fallback.name))];
 }
 
 /**
@@ -403,23 +429,52 @@ interface TwigResult {
    * is expected to widen.
    */
   synapse_box_wide_nm?: [number, number, number];
+  /**
+   * Set on a combined list: the result files of the neurons it joins. Each
+   * row keeps its own file (_file) and neuron (_root); the graph check,
+   * decisions and staging work per member neuron.
+   */
+  members?: string[];
+}
+
+/** One list of the candidates of several neurons' results. */
+function combineResults(results: TwigResult[]): TwigResult {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+  return {
+    name: `${LOCAL_RESULT_PREFIX}multi_${results.length}_${stamp}.json`,
+    root_id: results.map((r) => r.root_id).join(","),
+    timestamp: new Date().toISOString(),
+    dataset: results[0]?.dataset,
+    models_used: [...new Set(results.map((r) => r.models_used))].join("; "),
+    merge_threshold: results[0]?.merge_threshold,
+    candidates: results.flatMap((r) => r.candidates),
+    members: results.map((r) => r.name),
+  };
 }
 
 function parseResult(name: string, text: string): TwigResult {
   // run_twigcapture writes NaN for the unused branch, which JSON.parse rejects.
   // Only replace bare NaN tokens in value position, never inside a string.
   const cleaned = text.replace(/:\s*NaN\s*([,}])/g, ": null$1");
-  const obj = JSON.parse(cleaned);
+  return parseResultObject(name, JSON.parse(cleaned));
+}
+
+/**
+ * A parsed result object -> TwigResult. Also the entry point for results
+ * computed in this browser (twig_local_results.ts), which are already
+ * objects. Candidates are copied so the stored object is not stamped.
+ */
+function parseResultObject(name: string, obj: any): TwigResult {
   if (!Array.isArray(obj.candidates)) {
     throw new Error(`${name}: no "candidates" array -- not an AMP result file`);
   }
   // Orphan-first files (run_twigcapture_v2_orph.py) name their root seed_id.
   const rootId = String(obj.root_id ?? obj.seed_id ?? "unknown");
-  const candidates = obj.candidates as TwigCandidate[];
-  for (const c of candidates) {
-    c._file = name;
-    c._root = rootId;
-  }
+  const candidates = (obj.candidates as TwigCandidate[]).map((c) => ({
+    ...c,
+    _file: name,
+    _root: rootId,
+  }));
   return {
     name,
     root_id: rootId,
@@ -477,18 +532,33 @@ const TWIG_CAPTURE_DATE = "20261121";
 const DEFAULT_CATALOG_URL =
   "https://catmaid2.hms.harvard.edu/twigcapture_aedes/";
 
-function readStoredCatalogUrl(): string {
+/**
+ * The remembered catalog, per dataset: a reviewer who works on BANC and on
+ * Aedes must not have one's catalog carried over to the other. Falls back to
+ * the dataset's own catalog, then to the old shared key and default.
+ */
+function readStoredCatalogUrl(dataset?: TwigDataset): string {
+  const fallback = dataset?.catalogUrl ?? DEFAULT_CATALOG_URL;
   try {
-    return localStorage.getItem(CATALOG_URL_KEY) ?? DEFAULT_CATALOG_URL;
+    if (dataset !== undefined) {
+      return (
+        localStorage.getItem(`${CATALOG_URL_KEY}:${dataset.key}`) ?? fallback
+      );
+    }
+    return localStorage.getItem(CATALOG_URL_KEY) ?? fallback;
   } catch {
-    return DEFAULT_CATALOG_URL;
+    return fallback;
   }
 }
 
-function storeCatalogUrl(url: string) {
+function storeCatalogUrl(url: string, dataset?: TwigDataset) {
+  const key =
+    dataset !== undefined
+      ? `${CATALOG_URL_KEY}:${dataset.key}`
+      : CATALOG_URL_KEY;
   try {
-    if (url) localStorage.setItem(CATALOG_URL_KEY, url);
-    else localStorage.removeItem(CATALOG_URL_KEY);
+    if (url) localStorage.setItem(key, url);
+    else localStorage.removeItem(key);
   } catch {
     // no persistence available; the tab still works for this session
   }
@@ -662,7 +732,12 @@ export class TwigCaptureTab extends Tab {
         rows: TwigCandidate[];
         selected: Set<string>;
         roots: Map<string, bigint>;
-        neuron: bigint | undefined;
+        /**
+         * Each staged neuron's root today, by its result file. One entry for
+         * a single neuron; several when a combined list (several neurons
+         * opened together from the Twig Selector) is staged.
+         */
+        neurons: Map<string, bigint>;
       }
     | undefined;
   /** A Merge staged run in progress. */
@@ -747,6 +822,13 @@ export class TwigCaptureTab extends Tab {
     this.neuronFilters = { ...saved.neuron };
     const { element } = this;
     element.classList.add("neuroglancer-twig-capture-tab");
+    // Results computed in this browser (Twig Selector). The store is on the
+    // layer because this tab is disposed whenever the panel hides.
+    const local = layer.localTwigResults;
+    this.registerDisposer(local.changed.add(() => this.syncLocal()));
+    void local.ready.then(() => {
+      if (!this.wasDisposed) this.syncLocal();
+    });
     element.appendChild(this.makeCatalogRow());
     element.appendChild(this.makeResultSelectRow());
     element.appendChild(this.makeFilterRow());
@@ -842,12 +924,13 @@ export class TwigCaptureTab extends Tab {
     // A link's catalog wins over this browser's remembered one: the point of
     // putting it in the state is that the link is self-contained.
     urlInput.value = this.catalogUrl =
-      this.layer.twigCapture.catalogUrl || readStoredCatalogUrl();
+      this.layer.twigCapture.catalogUrl ||
+      readStoredCatalogUrl(datasetForUrls(this.sourceUrls()));
     const connect = () => {
       const value = urlInput.value.trim();
       this.catalogUrl = value;
       this.publish();
-      storeCatalogUrl(value);
+      storeCatalogUrl(value, datasetForUrls(this.sourceUrls()));
       if (value) void this.loadCatalog(value);
     };
     urlInput.addEventListener("keydown", (event: KeyboardEvent) => {
@@ -1014,7 +1097,11 @@ export class TwigCaptureTab extends Tab {
       // can be resolved to a URL, and a tab opened before the fetch returned
       // would show an empty list under a link that promised a neuron.
       const want = this.layer.twigCapture.file;
-      if (want && !this.results.some((r) => r.name === want)) {
+      // A result computed in this browser is not in any catalog; syncLocal
+      // opens it from the layer's store instead.
+      if (want.startsWith(LOCAL_RESULT_PREFIX)) {
+        // nothing to fetch
+      } else if (want && !this.results.some((r) => r.name === want)) {
         void this.loadUrl(base + want);
       } else if (!want && this.active === undefined) {
         // No neuron named: the all-neurons view.
@@ -1611,6 +1698,55 @@ export class TwigCaptureTab extends Tab {
     return row;
   }
 
+  /**
+   * Pick up results computed in this browser: list every one in the result
+   * chooser, and open the one the Twig Selector asked for (or the one a
+   * shared link names, if this browser has it).
+   */
+  private syncLocal() {
+    const local = this.layer.localTwigResults;
+    const want =
+      local.pendingOpen ??
+      (this.active === undefined &&
+      this.layer.twigCapture.file.startsWith(LOCAL_RESULT_PREFIX)
+        ? this.layer.twigCapture.file
+        : undefined);
+    local.pendingOpen = undefined;
+    const combined = local.pendingCombined;
+    local.pendingCombined = undefined;
+    // Drop local results that were deleted from the store.
+    this.results = this.results.filter(
+      (r) => !r.name.startsWith(LOCAL_RESULT_PREFIX) || local.get(r.name),
+    );
+    if (this.active && !this.results.includes(this.active))
+      this.active = undefined;
+    for (const json of local.results) {
+      const existing = this.results.find((r) => r.name === json.name);
+      if (existing && json.name !== want) continue;
+      const result = parseResultObject(json.name, json as LocalResultJson);
+      if (json.name === want) {
+        this.addResult(result);
+        this.publish();
+        void this.refreshAgainstGraph(result);
+      } else {
+        this.results.push(result);
+        this.fileCache.set(result.name, Promise.resolve(result));
+      }
+    }
+    if (combined !== undefined && combined.length) {
+      const members = combined
+        .map((n) => this.results.find((r) => r.name === n))
+        .filter((r): r is TwigResult => r !== undefined);
+      if (members.length) {
+        const result = combineResults(members);
+        this.addResult(result);
+        this.publish();
+        void this.refreshAgainstGraph(result);
+      }
+    }
+    this.render();
+  }
+
   private async loadUrl(url: string) {
     try {
       const response = await fetch(url);
@@ -1922,6 +2058,10 @@ export class TwigCaptureTab extends Tab {
       }
       return;
     }
+    if (result.members !== undefined) {
+      await this.refreshMembers(result, loadedFor !== undefined);
+      return;
+    }
     const rows = this.filtered();
     this.refreshButton.disabled = true;
     this.refreshButton.textContent = "Refreshing\u2026";
@@ -2109,6 +2249,28 @@ export class TwigCaptureTab extends Tab {
     if (!this.decisionsAllowed()) return;
     const store = this.store(result.dataset);
     if (store === undefined) return;
+    if (result.members !== undefined) {
+      // A combined list: every member neuron's decisions, in one map (keyed
+      // by candidate segment, which does not collide across neurons).
+      try {
+        const all = new Map<string, DecisionRow>();
+        for (const file of result.members) {
+          const own = await this.resultForFile(file);
+          if (own === undefined) continue;
+          const root = await this.currentNeuronRoot(own);
+          for (const [k, v] of await store.fetchForNeuron(root)) all.set(k, v);
+          if (this.active !== result) return;
+        }
+        this.decisions = all;
+        this.render();
+      } catch (e) {
+        StatusMessage.showTemporaryMessage(
+          `Twig Capture: could not read decisions: ${e}`,
+          5000,
+        );
+      }
+      return;
+    }
     try {
       const root = await this.currentNeuronRoot(result);
       if (this.active !== result) return;
@@ -2547,9 +2709,12 @@ export class TwigCaptureTab extends Tab {
     const graph = this.graphene();
     if (graph?.getRoot === undefined) return undefined;
     const own = except?.merge_sink?.supervoxel_id;
+    // Level-2+ rows (via_root) have their sink on a suggestion, not on the
+    // neuron, so they say nothing about the neuron's root.
     const svs = [
       ...new Set(
         result.candidates
+          .filter((c) => !c.via_root && (c.hop ?? 1) <= 1)
           .map((c) => c.merge_sink?.supervoxel_id)
           .filter((sv): sv is string => !!sv && sv !== own),
       ),
@@ -2646,7 +2811,7 @@ export class TwigCaptureTab extends Tab {
       b.textContent = `Merge staged (${n})`;
       b.disabled = n === 0;
       b.title =
-        "Merge the ticked candidates into this neuron, one at a time. Each is " +
+        `Merge the ticked candidates into ${this.active?.members ? "their neurons, neuron by neuron" : "this neuron"}, one at a time. Each is ` +
         "re-resolved from its supervoxels first; one that changed hands " +
         "since inference, or whose contact is no longer on the neuron, is " +
         "skipped and left for you. A failed merge stops the run.";
@@ -2667,7 +2832,7 @@ export class TwigCaptureTab extends Tab {
       this.checking !== undefined ||
       this.graphene()?.graphServer === undefined;
     b.title =
-      "Stage every listed candidate of this neuron that can still be merged " +
+      `Stage every listed candidate of ${this.active.members ? `these ${this.active.members.length} neurons` : "this neuron"} that can still be merged ` +
       "(not already joined, not judged no_merge, new_neuron or " +
       "split_needed) and show them " +
       "all in the " +
@@ -2705,7 +2870,7 @@ export class TwigCaptureTab extends Tab {
   /** The staged row whose candidate is shown in the view as `root`. */
   private stagedKeyForRoot(root: bigint): string | undefined {
     const stage = this.activeStage();
-    if (stage === undefined || root === stage.neuron) return undefined;
+    if (stage === undefined || isStagedNeuron(stage, root)) return undefined;
     for (const [key, r] of stage.roots) if (r === root) return key;
     return undefined;
   }
@@ -2753,7 +2918,11 @@ export class TwigCaptureTab extends Tab {
     for (const c of stage.rows) {
       const key = rowKey(c);
       const root = stage.roots.get(key);
-      if (root === undefined || root === stage.neuron || this.isJoined(c)) {
+      if (
+        root === undefined ||
+        isStagedNeuron(stage, root) ||
+        this.isJoined(c)
+      ) {
         continue;
       }
       if (ids !== null && !ids.has(root)) continue;
@@ -2790,7 +2959,7 @@ export class TwigCaptureTab extends Tab {
       rows,
       selected: new Set(rows.map(rowKey)),
       roots: new Map<string, bigint>(),
-      neuron: undefined as bigint | undefined,
+      neurons: new Map<string, bigint>(),
     };
     this.stage = stage;
     this.render();
@@ -2802,10 +2971,19 @@ export class TwigCaptureTab extends Tab {
       group.visibleSegments.clear();
       group.selectedSegments.clear();
     });
-    const consensus = await this.neuronRootConsensus(result);
-    if (this.stage !== stage) return;
-    stage.neuron = consensus?.root ?? this.targetRoots.get(result.name);
-    if (stage.neuron !== undefined) this.showSegment(stage.neuron);
+    // Each neuron in the list (one, or several in a combined list), at its
+    // root today.
+    for (const file of rowFiles(rows, result)) {
+      const own = await this.resultForFile(file);
+      if (this.stage !== stage) return;
+      const consensus = own ? await this.neuronRootConsensus(own) : undefined;
+      if (this.stage !== stage) return;
+      const root = consensus?.root ?? this.targetRoots.get(file);
+      if (root !== undefined) {
+        stage.neurons.set(file, root);
+        this.showSegment(root);
+      }
+    }
     const queue = [...rows];
     const worker = async () => {
       for (;;) {
@@ -2816,7 +2994,7 @@ export class TwigCaptureTab extends Tab {
             BigInt(c.merge_source!.supervoxel_id),
           );
           if (this.stage !== stage) return;
-          if (root === stage.neuron) {
+          if (root === stage.neurons.get(c._file ?? result.name)) {
             // Already part of the neuron: nothing to merge.
             this.mergeStatus.set(rowKey(c), "already");
             continue;
@@ -2840,7 +3018,11 @@ export class TwigCaptureTab extends Tab {
     if (on) stage.selected.add(key);
     else stage.selected.delete(key);
     const root = stage.roots.get(key);
-    if (root !== undefined && root !== stage.neuron && !this.isJoined(c)) {
+    if (
+      root !== undefined &&
+      !isStagedNeuron(stage, root) &&
+      !this.isJoined(c)
+    ) {
       if (on) this.showSegment(root);
       else this.hideSegment(root);
     }
@@ -2879,34 +3061,54 @@ export class TwigCaptureTab extends Tab {
     if (this.batch !== undefined) return;
     const picks = this.stagedPicks();
     if (picks.length === 0) return;
-    const neuron = await this.neuronRootConsensus(result);
-    if (neuron === undefined) {
-      StatusMessage.showTemporaryMessage(
-        "Twig Capture: could not establish this neuron's root today from " +
-          "its contact points, so nothing was merged. Merge one at a time.",
-        8000,
-      );
-      return;
+    // One group per neuron, in list order. Each neuron's root is
+    // established ONCE, up front, from several of its own contact points;
+    // the run refuses to start if any neuron's points disagree.
+    const groups = new Map<string, TwigCandidate[]>();
+    for (const c of picks) {
+      const file = c._file ?? result.name;
+      let g = groups.get(file);
+      if (g === undefined) groups.set(file, (g = []));
+      g.push(c);
     }
-    if (neuron.agree !== neuron.total) {
-      StatusMessage.showTemporaryMessage(
-        `Twig Capture: nothing merged. Only ${neuron.agree} of ` +
-          `${neuron.total} of this neuron's contact points are on ` +
-          `${neuron.root}; it may have been split since inference. Check ` +
-          "it, then merge one at a time.",
-        10000,
-      );
-      return;
+    const expectedRoot = new Map<string, bigint>();
+    for (const file of groups.keys()) {
+      const own = await this.resultForFile(file);
+      const neuron = own ? await this.neuronRootConsensus(own) : undefined;
+      const label = own?.root_id ?? file;
+      if (neuron === undefined) {
+        StatusMessage.showTemporaryMessage(
+          `Twig Capture: could not establish neuron ${label}'s root today ` +
+            "from its contact points, so nothing was merged. Merge one at a time.",
+          8000,
+        );
+        return;
+      }
+      if (neuron.agree !== neuron.total) {
+        StatusMessage.showTemporaryMessage(
+          `Twig Capture: nothing merged. Only ${neuron.agree} of ` +
+            `${neuron.total} of neuron ${label}'s contact points are on ` +
+            `${neuron.root}; it may have been split since inference. Check ` +
+            "it, then merge one at a time.",
+          10000,
+        );
+        return;
+      }
+      expectedRoot.set(file, neuron.root);
     }
     const syn = picks.reduce((a, c) => a + (c.cand_synapses_total ?? 0), 0);
+    const into =
+      groups.size === 1
+        ? `neuron ${(await this.resultForFile([...groups.keys()][0]))?.root_id ?? result.root_id}`
+        : `${groups.size} neurons`;
     const ok = window.confirm(
-      `Merge ${picks.length} staged candidate(s) into neuron ` +
-        `${result.root_id}` +
-        `${String(neuron.root) !== result.root_id ? ` (today ${neuron.root})` : ""}?\n` +
+      `Merge ${picks.length} staged candidate(s) into ${into}?\n` +
         `  ${syn} synapses on them in total.\n\n` +
-        "They are merged one at a time. Before each, both sides are " +
+        "They are merged one at a time" +
+        (groups.size > 1 ? ", neuron by neuron" : "") +
+        ". Before each, both sides are " +
         "re-resolved from their supervoxels; a candidate that has changed " +
-        "hands since inference, or whose contact is no longer on this " +
+        "hands since inference, or whose contact is no longer on its " +
         "neuron, is SKIPPED and left for you. A failed merge stops the run, " +
         "and Stop ends it after the current merge.\n\n" +
         "Each merge edits the shared segmentation and is attributed to you.",
@@ -2917,29 +3119,32 @@ export class TwigCaptureTab extends Tab {
     this.batch = batch;
     const tally = { merged: 0, already: 0, skipped: 0 };
     let failed: TwigCandidate | undefined;
-    let expected = neuron.root;
     try {
-      for (const c of picks) {
-        if (batch.stop) break;
-        // Unticked while the run was going.
-        if (!stage.selected.has(rowKey(c))) {
-          batch.total--;
-          continue;
+      outer: for (const [file, rows] of groups) {
+        let expected = expectedRoot.get(file)!;
+        for (const c of rows) {
+          if (batch.stop) break outer;
+          // Unticked while the run was going.
+          if (!stage.selected.has(rowKey(c))) {
+            batch.total--;
+            continue;
+          }
+          const out = await this.doMerge(c, { neuron: expected });
+          batch.done++;
+          if (out === "merged") {
+            tally.merged++;
+            expected = this.targetRoots.get(file) ?? expected;
+            stage.neurons.set(file, expected);
+          } else if (out === "already") {
+            tally.already++;
+          } else if (out === "skipped") {
+            tally.skipped++;
+          } else {
+            failed = c;
+            break outer;
+          }
+          this.updateBulkButtons();
         }
-        const out = await this.doMerge(c, { neuron: expected });
-        batch.done++;
-        if (out === "merged") {
-          tally.merged++;
-          expected = this.targetRoots.get(result.name) ?? expected;
-        } else if (out === "already") {
-          tally.already++;
-        } else if (out === "skipped") {
-          tally.skipped++;
-        } else {
-          failed = c;
-          break;
-        }
-        this.updateBulkButtons();
       }
     } finally {
       this.batch = undefined;
@@ -2959,6 +3164,81 @@ export class TwigCaptureTab extends Tab {
         (left ? `. ${left} still staged.` : "."),
       10000,
     );
+  }
+
+  /**
+   * The graph check for a combined list: each member neuron's root today
+   * (from one of its own level-1 sinks), then every row against ITS neuron.
+   */
+  private async refreshMembers(result: TwigResult, atLoad: boolean) {
+    const graph = this.graphene();
+    if (graph?.getRoot === undefined || result.members === undefined) return;
+    const rows = this.filtered();
+    this.refreshButton.disabled = true;
+    this.refreshButton.textContent = "Refreshing\u2026";
+    if (atLoad) {
+      this.checking = { done: 0, total: rows.length };
+      this.render();
+    }
+    try {
+      for (const file of result.members) {
+        const own = await this.resultForFile(file);
+        const sink = own?.candidates.find(
+          (c) => c.merge_sink && !c.via_root && (c.hop ?? 1) <= 1,
+        )?.merge_sink;
+        const root = sink
+          ? await graph.getRoot(BigInt(sink.supervoxel_id))
+          : own
+            ? await graph.getRoot(BigInt(own.root_id))
+            : undefined;
+        if (root !== undefined) this.targetRoots.set(file, root);
+      }
+      if (atLoad && this.active !== result) return;
+      let checked = 0;
+      const queue = [...rows];
+      const worker = async () => {
+        for (;;) {
+          const c = queue.shift();
+          if (c === undefined) return;
+          const target = this.targetRoots.get(c._file ?? "");
+          const sv = c.merge_source?.supervoxel_id;
+          try {
+            const root = sv
+              ? await graph.getRoot!(BigInt(sv))
+              : await graph.getRoot!(BigInt(c.target_segment_id));
+            const key = rowKey(c);
+            if (target !== undefined && root === target) {
+              if (this.mergeStatus.get(key) !== "done") {
+                this.mergeStatus.set(key, "already");
+              }
+            } else if (this.mergeStatus.get(key) === "already") {
+              this.mergeStatus.delete(key);
+            }
+          } catch {
+            // leave this row alone
+          }
+          checked++;
+          if (this.checking !== undefined) this.checking.done = checked;
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(8, rows.length || 1) }, worker),
+      );
+    } finally {
+      this.checking = undefined;
+      this.refreshButton.disabled = false;
+      this.refreshButton.textContent = "Refresh";
+      this.render();
+    }
+  }
+
+  /** A loaded result by file name (the combined list's member neurons). */
+  private async resultForFile(file: string): Promise<TwigResult | undefined> {
+    try {
+      return await this.fetchResultFile(file);
+    } catch {
+      return undefined;
+    }
   }
 
   /** The rows to filter: the active neuron's, else the all-neurons table. */
@@ -3100,7 +3380,9 @@ export class TwigCaptureTab extends Tab {
     removeChildren(this.fileSelect);
     for (const result of this.results) {
       const option = document.createElement("option");
-      option.textContent = `${result.root_id}  (${result.candidates.length})`;
+      option.textContent =
+        `${result.root_id}  (${result.candidates.length})` +
+        (result.name.startsWith(LOCAL_RESULT_PREFIX) ? "  [this browser]" : "");
       option.title = result.name;
       this.fileSelect.appendChild(option);
     }
@@ -3175,7 +3457,7 @@ export class TwigCaptureTab extends Tab {
       note.classList.add("neuroglancer-twig-capture-hint");
       note.classList.add("neuroglancer-twig-capture-stage-note");
       note.textContent =
-        `Staged: ${rows.length} candidate(s) of this neuron, frozen from the ` +
+        `Staged: ${rows.length} candidate(s) of ${this.active?.members ? `${this.active.members.length} neurons` : "this neuron"}, frozen from the ` +
         "filters when staged. The view shows only the neuron and the ticked " +
         "candidates. Untick any you do not want, then Merge staged. Clear " +
         "returns to the filtered list.";
@@ -3345,6 +3627,21 @@ export class TwigCaptureTab extends Tab {
         `ran; file ${candidate._file}). Merge joins it to that neuron.` +
         (this.neuronMeta ? `\n\n${neuronTooltip(annot)}` : "");
       main.appendChild(neuron);
+    }
+
+    if ((candidate.hop ?? 1) > 1 && candidate.parent_root === undefined) {
+      const tag = document.createElement("span");
+      tag.classList.add("neuroglancer-twig-capture-tag");
+      tag.classList.add("neuroglancer-twig-capture-tag-hop");
+      tag.textContent = `level ${candidate.hop}`;
+      tag.title =
+        `A level-${candidate.hop} suggestion: it attaches to ` +
+        (candidate.via_root
+          ? `${candidate.via_root}, an earlier suggestion, `
+          : "the neuron ") +
+        "and was found by treating the earlier confident suggestions as " +
+        "already merged. Merge that one first.";
+      main.appendChild(tag);
     }
 
     if (candidate.likely_mito) {
@@ -3527,7 +3824,9 @@ export class TwigCaptureTab extends Tab {
         (candidate._file ?? "").startsWith("orph_");
       const sinkRoot = ref0Seed(this.active, candidate);
       const sides: Record<"sink" | "source", [string, string]> = {
-        sink: [orph ? "seed" : "neuron", sinkRoot],
+        sink: candidate.via_root
+          ? ["via", candidate.via_root]
+          : [orph ? "seed" : "neuron", sinkRoot],
         source: ["candidate", candidate.target_segment_id],
       };
       const sided: [Verdict, string, ("sink" | "source")[], string][] = [

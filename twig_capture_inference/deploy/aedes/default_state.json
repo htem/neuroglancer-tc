@@ -1,0 +1,51 @@
+{
+ "title": "Twig Capture: Aedes",
+ "dimensions": {
+  "x": [
+   8e-09,
+   "m"
+  ],
+  "y": [
+   8e-09,
+   "m"
+  ],
+  "z": [
+   4.5e-08,
+   "m"
+  ]
+ },
+ "position": [
+  49152.5,
+  36864.5,
+  3741.5
+ ],
+ "crossSectionScale": 1,
+ "projectionScale": 262144,
+ "layers": [
+  {
+   "type": "image",
+   "source": "precomputed://gs://zetta_lee_mosquito_001_alignment_central/img/v2_sharded",
+   "tab": "source",
+   "name": "em"
+  },
+  {
+   "type": "segmentation",
+   "source": "graphene://middleauth+https://cave.fanc-fly.com/segmentation/table/wclee_aedes_brain",
+   "toolBindings": {
+    "M": "grapheneMergeSegments",
+    "C": "grapheneMulticutSegments",
+    "F": "grapheneFindPath"
+   },
+   "tab": "twigCapture",
+   "twigCapture": {
+    "catalogUrl": "https://catmaid2.hms.harvard.edu/twigcapture_aedes/"
+   },
+   "name": "seg"
+  }
+ ],
+ "selectedLayer": {
+  "visible": true,
+  "layer": "seg"
+ },
+ "layout": "xy-3d"
+}

@@ -2205,6 +2205,17 @@ class GrapheneGraphSource extends SegmentationGraphSource {
     return this.graphServer.getRoot(segment, timestamp);
   }
 
+  /**
+   * Authenticated fetch of `path` under the chunkedgraph table URL (or of an
+   * absolute https URL, e.g. the L2 cache), with the same credentials the
+   * layer uses. For in-browser Twig Capture, which needs leaves, roots and
+   * L2 attributes the graph source does not otherwise expose.
+   */
+  fetchGraph(path: string, init: RequestInit = {}) {
+    const { fetchOkImpl, baseUrl } = this.httpSource;
+    return fetchOkImpl(/^https?:/.test(path) ? path : `${baseUrl}${path}`, init);
+  }
+
   async isL2CacheUrlAvailable() {
     if (this.l2CacheAvailable !== undefined) {
       return this.l2CacheAvailable;

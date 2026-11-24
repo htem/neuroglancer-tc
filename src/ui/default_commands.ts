@@ -189,6 +189,13 @@ const STATIC_COMMANDS: readonly BuiltinCommand[] = [
     description: "Assign a new random color seed to segmentation layers.",
   },
   {
+    id: "twig-predict",
+    label: "Twig Capture: Predict Merges",
+    description:
+      "Queue the segment under the mouse (else the visible segments) in the " +
+      "Twig Selector and run in-browser merge prediction on it.",
+  },
+  {
     id: "clear-segments",
     label: "Clear Selected Segments",
     description: "Deselect all currently selected segments.",
