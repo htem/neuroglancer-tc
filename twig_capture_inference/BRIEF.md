@@ -70,8 +70,16 @@ At 1.26 s/patch, CPU alone takes about 30 minutes for one fragment
    into the Conv. With that, **all 3D Convs run on WebGPU.**
 3. Next it failed on `GlobalAveragePool` ("kernelShape.length > 2 is not
    supported for NHWC"). `explicit_pad.py` now replaces it with
-   `ReduceMean(axes=[2,3,4], keepdims=1)`. That version is verified on CPU and
-   **not yet tested on WebGPU.** That is the next click.
+   `ReduceMean(axes=[2,3,4], keepdims=1)`. Verified on CPU.
+4. (2026-11-23, headless Chromium 1243 on O2, SwiftShader adapter, ORT
+   1.22.0) `local_fp16pad.onnx`: the session now builds on WebGPU, so
+   `ReduceMean` is accepted. The run fails only because SwiftShader lacks
+   `shader-f16` ("'f16' type used without 'f16' extension enabled" in the
+   Cast kernel), so every p comes out 0.5000. This is a SwiftShader limit;
+   Metal and NVIDIA have f16. The padded graph now has only Cast, Pad, Conv,
+   Relu, Add, ReduceMean, Flatten and Gemm, all in ORT Web's WebGPU op set.
+   Still to run: fp16pad on a real GPU (Mac click, or the gpu_requeue job
+   below), and `local_fp32pad.onnx` (new, 133 MB) on SwiftShader.
 
 ## How to test (browser)
 
@@ -81,7 +89,7 @@ Page: https://radagast.hms.harvard.edu/twigcapture_dev/bench.html
 The radagast folder `/twigcapture_dev/` is
 `/n/data3_vast/hms/neurobio/htem2/twig_capture/dev/` on O2. It also holds:
 
-- the three `.onnx` files;
+- the `.onnx` files (fp32, fp16, fp16pad, fp32pad);
 - `ref_input_2x3x18x128x128_f32.bin` (2 patches, float32);
 - `ref_output.json` (PyTorch's p for those patches).
 
@@ -89,7 +97,8 @@ The model files are not in git (too large); rebuild them with the scripts
 below.
 
 The page has one button per backend and model: WebGPU fp16, WebGPU fp16
-explicit padding, WebGPU fp32, WASM fp16, WASM fp32. Each run logs:
+explicit padding, WebGPU fp32, WebGPU fp32 explicit padding, WASM fp16,
+WASM fp32. Graph optimisation is off for every `*pad` model. Each run logs:
 
 - the GPU adapter;
 - the model download time and the session start time;
@@ -121,6 +130,24 @@ python scripts/explicit_pad.py <dev>/local_fp16.onnx <dev>/local_fp16pad.onnx
 
 The scripts import `model_utils` from the twigcapture checkout
 (`/n/data3_vast/hms/neurobio/htem2/users/ab714/twigcapture/scripts`).
+
+### Headless, on O2 (`headless/`)
+
+`headless/bench.mjs` drives the same page with Playwright and Chromium and
+prints its log. **Never run it on a login node**: RC kills Chrome there.
+Use `srun -p interactive` or `sbatch headless/bench.sh`, which asks
+gpu_requeue (account wilson) for one GPU and starts Chromium with Vulkan
+WebGPU flags. `bench.sh` runs from `$BENCH_DIR` (default
+`~/jobs/browser_bench`), which must hold `bench.mjs` and
+`node_modules/playwright-core` (`npm i playwright-core`). The Chromium
+build is `~/.cache/ms-playwright/chromium-1243`.
+
+- The first argument is the list of buttons to click, as `ep:model` pairs,
+  e.g. `webgpu:fp16pad,wasm:fp16`. `bench.sh` takes it from `$WHICH`.
+- `STOP=<regex>` ends each run early, e.g. `STOP='FAILED|patch 1:'` skips the
+  timing loop, which is very slow on SwiftShader.
+- Without a GPU, Chromium falls back to SwiftShader, which has no f16, so it
+  can only check fp32 models.
 
 ## Next steps
 

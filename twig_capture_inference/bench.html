@@ -17,6 +17,7 @@ against PyTorch on two reference patches. Pick a backend and model; results go b
 <button data-ep="webgpu" data-m="fp16">WebGPU · fp16</button>
 <button data-ep="webgpu" data-m="fp16pad">WebGPU · fp16, explicit padding</button>
 <button data-ep="webgpu" data-m="fp32">WebGPU · fp32</button>
+<button data-ep="webgpu" data-m="fp32pad">WebGPU · fp32, explicit padding</button>
 <button data-ep="wasm" data-m="fp16">WASM (CPU) · fp16</button>
 <button data-ep="wasm" data-m="fp32">WASM (CPU) · fp32</button>
 </div>
@@ -52,9 +53,9 @@ async function run(ep, m) {
     const buf = await (await fetch(`local_${m}.onnx`)).arrayBuffer();
     log(`model download ${(buf.byteLength/1e6).toFixed(0)} MB in ${((performance.now()-t)/1000).toFixed(1)} s`);
     t = performance.now();
-    // fp16pad: the explicit Pad nodes must survive, and ORT's optimiser fuses
+    // *pad models: the explicit Pad nodes must survive, and ORT's optimiser fuses
     // Pad+Conv back into one padded Conv -- the kernel WebGPU rejects.
-    const opt = m === "fp16pad" ? "disabled" : "all";
+    const opt = m.endsWith("pad") ? "disabled" : "all";
     const s = await ort.InferenceSession.create(buf, {executionProviders: [ep], graphOptimizationLevel: opt});
     log(`graph optimisation: ${opt}`);
     log(`session ready in ${((performance.now()-t)/1000).toFixed(1)} s`);
