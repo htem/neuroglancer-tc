@@ -1,0 +1,80 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Merge Model Bench</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--line:#ddd;--ok:#1a7f37;--bad:#b42318}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#16181c;--fg:#e8e8e8;--mut:#9aa;--line:#333;--ok:#4ac26b;--bad:#ff7b72}}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;margin:0;padding:16px;max-width:900px}
+h1{font-size:18px;margin:0 0 4px} p{color:var(--mut);margin:4px 0 12px}
+button{font:inherit;padding:6px 12px;margin:0 6px 6px 0;cursor:pointer}
+pre{border:1px solid var(--line);padding:10px;white-space:pre-wrap;font:12px/1.4 ui-monospace,monospace;min-height:200px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+</style></head><body>
+<h1>Twig Capture merge model: in-browser bench</h1>
+<p>Scores the local classifier (r3d_18, input 3×18×128×128) with ONNX Runtime Web and checks the result
+against PyTorch on two reference patches. Pick a backend and model; results go below.</p>
+<div>
+<button data-ep="webgpu" data-m="fp16">WebGPU · fp16</button>
+<button data-ep="webgpu" data-m="fp16pad">WebGPU · fp16, explicit padding</button>
+<button data-ep="webgpu" data-m="fp32">WebGPU · fp32</button>
+<button data-ep="wasm" data-m="fp16">WASM (CPU) · fp16</button>
+<button data-ep="wasm" data-m="fp32">WASM (CPU) · fp32</button>
+</div>
+<pre id="log"></pre>
+<script>
+// ?ort=<version> picks the ONNX Runtime Web release (default 1.22.0).
+const ORT_VERSION = (new URLSearchParams(location.search).get("ort") || "1.22.0").replace(/[^0-9a-z.-]/gi, "");
+document.write(`<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.webgpu.min.js"><\/script>`);
+</script>
+<script>
+const log = (s, cls) => { const e = document.getElementById("log"); const sp = document.createElement("span");
+  if (cls) sp.className = cls; sp.textContent = s + "\n"; e.appendChild(sp); console.log("[bench] " + s); };
+const N = 18 * 128 * 128 * 3;
+let ref, refIn;
+async function assets() {
+  if (ref) return;
+  ref = await (await fetch("ref_output.json", {cache: "no-store"})).json();
+  refIn = new Float32Array(await (await fetch("ref_input_2x3x18x128x128_f32.bin")).arrayBuffer());
+}
+const pm = (l, i) => { const a = l[2*i], b = l[2*i+1], m = Math.max(a, b); return Math.exp(b-m) / (Math.exp(a-m) + Math.exp(b-m)); };
+async function run(ep, m) {
+  log(`\n=== ${ep} · ${m} ===`);
+  log(`onnxruntime-web ${ORT_VERSION}  crossOriginIsolated=${self.crossOriginIsolated}  cores=${navigator.hardwareConcurrency}  webgpu=${!!navigator.gpu}`);
+  try {
+    if (ep === "webgpu" && navigator.gpu) {
+      const ad = await navigator.gpu.requestAdapter();
+      const info = ad && (ad.info || (ad.requestAdapterInfo ? await ad.requestAdapterInfo() : {}));
+      log(`GPU adapter: ${info ? [info.vendor, info.architecture, info.description].filter(Boolean).join(" / ") : "none"}`);
+    }
+    ort.env.wasm.numThreads = self.crossOriginIsolated ? navigator.hardwareConcurrency : 1;
+    await assets();
+    let t = performance.now();
+    const buf = await (await fetch(`local_${m}.onnx`)).arrayBuffer();
+    log(`model download ${(buf.byteLength/1e6).toFixed(0)} MB in ${((performance.now()-t)/1000).toFixed(1)} s`);
+    t = performance.now();
+    // fp16pad: the explicit Pad nodes must survive, and ORT's optimiser fuses
+    // Pad+Conv back into one padded Conv -- the kernel WebGPU rejects.
+    const opt = m === "fp16pad" ? "disabled" : "all";
+    const s = await ort.InferenceSession.create(buf, {executionProviders: [ep], graphOptimizationLevel: opt});
+    log(`graph optimisation: ${opt}`);
+    log(`session ready in ${((performance.now()-t)/1000).toFixed(1)} s`);
+    const feed = (x, n) => ({x_local: new ort.Tensor("float32", x, [n, 3, 18, 128, 128])});
+    t = performance.now();
+    const out = (await s.run(feed(refIn, 2))).logits.data;
+    log(`first run (2 patches, includes warm-up/compile) ${((performance.now()-t)/1000).toFixed(1)} s`);
+    for (let i = 0; i < 2; i++) {
+      const p = pm(out, i), d = Math.abs(p - ref.p_torch[i]);
+      log(`  patch ${i}: p=${p.toFixed(4)}  torch=${ref.p_torch[i].toFixed(4)}  |dp|=${d.toExponential(1)}`, d < 1e-3 ? "ok" : "bad");
+    }
+    for (const n of [1, 4, 8]) {
+      const x = new Float32Array(n * N); for (let i = 0; i < n; i++) x.set(refIn.subarray((i % 2) * N, (i % 2 + 1) * N), i * N);
+      const reps = n === 1 ? 4 : 2; t = performance.now();
+      for (let r = 0; r < reps; r++) await s.run(feed(x, n));
+      const ms = (performance.now() - t) / (reps * n);
+      log(`  batch ${n}: ${ms.toFixed(0)} ms/patch  -> 1,500 candidates ≈ ${(ms*1500/60000).toFixed(1)} min`, "ok");
+    }
+    await s.release();
+  } catch (e) { log(`FAILED: ${e && e.message || e}`, "bad"); }
+}
+document.querySelectorAll("button").forEach(b => b.onclick = () => run(b.dataset.ep, b.dataset.m));
+</script></body></html>
