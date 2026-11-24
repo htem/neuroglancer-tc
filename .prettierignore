@@ -12,3 +12,4 @@ package-lock.json
 .venv
 pnpm-lock.yaml
 /twig_capture_inference/
+/src/layer/segmentation/twig_inference/volume_ops_fixture.json
