@@ -37,6 +37,11 @@ import { layerDataSourceSpecificationFromJson } from "#src/layer/layer_data_sour
 import * as json_keys from "#src/layer/segmentation/json_keys.js";
 import { registerLayerControls } from "#src/layer/segmentation/layer_controls.js";
 import {
+  TWIG_CAPTURE_JSON_KEY,
+  TwigCaptureState,
+  TwigCaptureTab,
+} from "#src/layer/segmentation/twig_capture_tab.js";
+import {
   MeshLayer,
   MeshSource,
   MultiscaleMeshLayer,
@@ -73,11 +78,6 @@ import type {
   SegmentationGraphSource,
   SegmentationGraphSourceConnection,
 } from "#src/segmentation_graph/source.js";
-import {
-  TWIG_CAPTURE_JSON_KEY,
-  TwigCaptureState,
-  TwigCaptureTab,
-} from "#src/layer/segmentation/twig_capture_tab.js";
 import { SegmentationGraphSourceTab } from "#src/segmentation_graph/source.js";
 import { SharedDisjointUint64Sets } from "#src/shared_disjoint_sets.js";
 import { SharedWatchableValue } from "#src/shared_watchable_value.js";

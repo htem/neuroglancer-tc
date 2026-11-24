@@ -88,8 +88,8 @@ import {
 } from "#src/layer/segmentation/twig_capture_table.js";
 import { StatusMessage } from "#src/status.js";
 import { Uint64Set } from "#src/uint64_set.js";
-import { NullarySignal } from "#src/util/signal.js";
 import { removeChildren } from "#src/util/dom.js";
+import { NullarySignal } from "#src/util/signal.js";
 import { Tab } from "#src/widget/tab_view.js";
 
 /** The layer JSON key this tab's state lives under. */
