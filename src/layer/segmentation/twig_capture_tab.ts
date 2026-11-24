@@ -405,6 +405,8 @@ interface GrapheneLike {
     }>;
   };
   state?: { replaceSegments(oldValues: Uint64Set, newValues: Uint64Set): void };
+  /** Authenticated chunkedgraph GET (GrapheneGraphSource.fetchGraph). */
+  fetchGraph?(path: string, init?: RequestInit): Promise<Response>;
 }
 
 /** One row of index.json, as scripts/make_results_index.py writes it. */
@@ -3186,30 +3188,66 @@ export class TwigCaptureTab extends Tab {
       if (g === undefined) groups.set(file, (g = []));
       g.push(c);
     }
+    // Each neuron's root today, and whether it is safe to proceed. Safe
+    // means: not split since inference. A changed root alone (a test merge,
+    // someone else's merges) is expected and only warned about; a split may
+    // have detached part of the neuron, so it still stops the run. Every
+    // candidate is re-resolved before its own merge regardless, and one whose
+    // contact is no longer on the neuron is skipped.
     const expectedRoot = new Map<string, bigint>();
+    const warnings: string[] = [];
     for (const file of groups.keys()) {
       const own = await this.resultForFile(file);
-      const neuron = own ? await this.neuronRootConsensus(own) : undefined;
       const label = own?.root_id ?? file;
-      if (neuron === undefined) {
+      const neuron = own ? await this.neuronRootConsensus(own) : undefined;
+      const root =
+        neuron?.root ?? (own ? await this.neuronRootToday(own) : undefined);
+      if (own === undefined || root === undefined) {
         StatusMessage.showTemporaryMessage(
-          `Twig Capture: could not establish neuron ${label}'s root today ` +
-            "from its contact points, so nothing was merged. Merge one at a time.",
+          `Twig Capture: could not establish neuron ${label}'s root today, ` +
+            "so nothing was merged. Merge one at a time.",
           8000,
         );
         return;
       }
-      if (neuron.agree !== neuron.total) {
+      const since = own.timestamp ? Date.parse(own.timestamp) : NaN;
+      const edits = Number.isFinite(since)
+        ? await this.editsSince(root, since)
+        : undefined;
+      if (edits !== undefined && edits.splits > 0) {
         StatusMessage.showTemporaryMessage(
-          `Twig Capture: nothing merged. Only ${neuron.agree} of ` +
-            `${neuron.total} of neuron ${label}'s contact points are on ` +
-            `${neuron.root}; it may have been split since inference. Check ` +
-            "it, then merge one at a time.",
+          `Twig Capture: nothing merged. Neuron ${label} (now ${root}) has been ` +
+            `split ${edits.splits} time(s) since inference, last on ` +
+            `${new Date(edits.lastSplit!).toLocaleString()}; part of it may ` +
+            "have been detached. Check it, then merge one at a time.",
+          12000,
+        );
+        return;
+      }
+      const unanimous = neuron !== undefined && neuron.agree === neuron.total;
+      if (edits === undefined && !unanimous) {
+        // No edit history to go on: keep the old, strict rule.
+        StatusMessage.showTemporaryMessage(
+          `Twig Capture: nothing merged. Neuron ${label}'s contact points ` +
+            "disagree about its root and its edit history could not be read. " +
+            "Merge one at a time.",
           10000,
         );
         return;
       }
-      expectedRoot.set(file, neuron.root);
+      const bits: string[] = [];
+      if (String(root) !== own.root_id) bits.push(`now ${root}`);
+      if (edits !== undefined && edits.merges > 0) {
+        bits.push(`${edits.merges} merge(s) since inference, no splits`);
+      }
+      if (neuron !== undefined && !unanimous) {
+        bits.push(
+          `${neuron.total - neuron.agree} of ${neuron.total} sampled contact ` +
+            "points are no longer on it (their candidates will be skipped)",
+        );
+      }
+      if (bits.length) warnings.push(`  neuron ${label}: ${bits.join("; ")}`);
+      expectedRoot.set(file, root);
     }
     const syn = picks.reduce((a, c) => a + (c.cand_synapses_total ?? 0), 0);
     const into =
@@ -3226,7 +3264,10 @@ export class TwigCaptureTab extends Tab {
         "hands since inference, or whose contact is no longer on its " +
         "neuron, is SKIPPED and left for you. A failed merge stops the run, " +
         "and Stop ends it after the current merge.\n\n" +
-        "Each merge edits the shared segmentation and is attributed to you.",
+        "Each merge edits the shared segmentation and is attributed to you." +
+        (warnings.length
+          ? "\n\nNOTE, edited since inference:\n" + warnings.join("\n")
+          : ""),
     );
     if (!ok) return;
 
@@ -3344,6 +3385,57 @@ export class TwigCaptureTab extends Tab {
       this.refreshButton.disabled = false;
       this.refreshButton.textContent = "Refresh";
       this.render();
+    }
+  }
+
+  /** The neuron's root today, from one of its own level-1 contact points. */
+  private async neuronRootToday(
+    result: TwigResult,
+  ): Promise<bigint | undefined> {
+    const graph = this.graphene();
+    if (graph?.getRoot === undefined) return undefined;
+    const sink = result.candidates.find(
+      (c) => c.merge_sink && !c.via_root && (c.hop ?? 1) <= 1,
+    )?.merge_sink;
+    try {
+      return await graph.getRoot(BigInt(sink?.supervoxel_id ?? result.root_id));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Merges and splits in this root's history after `sinceMs` (the result's
+   * inference time), from the chunkedgraph's tabular change log. Undefined
+   * when the log cannot be read.
+   */
+  private async editsSince(
+    root: bigint,
+    sinceMs: number,
+  ): Promise<
+    { merges: number; splits: number; lastSplit?: number } | undefined
+  > {
+    const graph = this.graphene();
+    if (graph?.fetchGraph === undefined) return undefined;
+    try {
+      const r = await graph.fetchGraph(`/root/${root}/tabular_change_log`);
+      const log = await r.json();
+      const ts: Record<string, number> = log.timestamp ?? {};
+      const isMerge: Record<string, boolean> = log.is_merge ?? {};
+      let merges = 0;
+      let splits = 0;
+      let lastSplit: number | undefined;
+      for (const [k, t] of Object.entries(ts)) {
+        if (!(t > sinceMs)) continue;
+        if (isMerge[k]) merges++;
+        else {
+          splits++;
+          lastSplit = Math.max(lastSplit ?? 0, t);
+        }
+      }
+      return { merges, splits, lastSplit };
+    } catch {
+      return undefined;
     }
   }
 
