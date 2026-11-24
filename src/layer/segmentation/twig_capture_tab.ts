@@ -1783,12 +1783,23 @@ export class TwigCaptureTab extends Tab {
     const combined = local.pendingCombined;
     local.pendingCombined = undefined;
     // Drop local results that were deleted from the store.
+    // Drop local results deleted from the store or belonging to another
+    // dataset; a combined list (members) is not in the store and stays.
+    const ownStack = datasetForUrls(this.sourceUrls())?.datastack;
     this.results = this.results.filter(
-      (r) => !r.name.startsWith(LOCAL_RESULT_PREFIX) || local.get(r.name),
+      (r) =>
+        !r.name.startsWith(LOCAL_RESULT_PREFIX) ||
+        r.members !== undefined ||
+        (local.get(r.name) !== undefined &&
+          (ownStack === undefined || r.dataset === ownStack)),
     );
     if (this.active && !this.results.includes(this.active))
       this.active = undefined;
+    // The local store is per browser origin, and the BANC, Aedes and CRANTb
+    // viewers share one (radagast): list only this layer's dataset.
+    const datastack = datasetForUrls(this.sourceUrls())?.datastack;
     for (const json of local.results) {
+      if (datastack !== undefined && json.dataset !== datastack) continue;
       const existing = this.results.find((r) => r.name === json.name);
       if (existing && json.name !== want) continue;
       const result = parseResultObject(json.name, json as LocalResultJson);
