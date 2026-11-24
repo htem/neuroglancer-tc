@@ -11,3 +11,4 @@ package.json
 package-lock.json
 .venv
 pnpm-lock.yaml
+/twig_capture_inference/

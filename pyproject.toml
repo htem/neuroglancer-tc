@@ -54,6 +54,10 @@ local_scheme = "no-local-version"
 fallback_version = "0.0.0"
 parentdir_prefix_version = "neuroglancer-"
 
+[tool.ruff]
+# O2 model-export tooling for in-browser Twig Capture (see its BRIEF.md)
+extend-exclude = ["twig_capture_inference"]
+
 [tool.ruff.lint]
 select = [
   "E", # pycodestyle
@@ -77,6 +81,9 @@ exclude = [
   "^docs/",
   "^build/",
   "^testdata/",
+  # O2 model-export tooling for in-browser Twig Capture; imports the
+  # twigcapture checkout's model_utils, not part of the neuroglancer package
+  "^twig_capture_inference/",
 ]
 
 [[tool.mypy.overrides]]
