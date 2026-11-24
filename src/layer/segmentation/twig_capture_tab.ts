@@ -690,8 +690,16 @@ export class TwigCaptureTab extends Tab {
   /** candidate id -> outcome, so a row is not offered twice. */
   private mergeStatus = new Map<
     string,
-    "merging" | "done" | "failed" | "already" | "skipped"
+    "queued" | "merging" | "done" | "failed" | "already" | "skipped"
   >();
+  /**
+   * Graph edits (Merge, Undo/Redo, Merge staged) run strictly one at a time.
+   * Each merge gives the neuron a new root, and the chunkedgraph locks the
+   * root while it edits: clicking Merge down a list used to fire several
+   * edits at once on the same neuron, which was slow and often ended in
+   * "Retry". Clicks now queue here and the row reads "Queued" until its turn.
+   */
+  private editQueue: Promise<unknown> = Promise.resolve();
   /** Why a staged merge was skipped rather than made, by rowKey. */
   private skipReason = new Map<string, string>();
   private refreshButton = document.createElement("button");
@@ -2033,7 +2041,17 @@ export class TwigCaptureTab extends Tab {
    * Root ids change again on both paths, so the list is re-resolved afterwards
    * rather than assumed.
    */
-  private async undoOrRedo(candidate: TwigCandidate) {
+  private undoOrRedo(candidate: TwigCandidate) {
+    const key = rowKey(candidate);
+    if (this.mergeStatus.get(key) === "queued") return Promise.resolve();
+    this.mergeStatus.set(key, "queued");
+    this.render();
+    return this.serialEdit(() => this.undoOrRedoNow(candidate)).finally(() =>
+      this.clearQueued(key),
+    );
+  }
+
+  private async undoOrRedoNow(candidate: TwigCandidate) {
     const server = this.graphene()?.graphServer;
     const key = rowKey(candidate);
     const entry = this.history.get(key);
@@ -2494,7 +2512,37 @@ export class TwigCaptureTab extends Tab {
    * server rejects a stale root. Supervoxels never change, which is why
    * run_twigcapture.py records them.
    */
-  private async doMerge(
+  /** Queue one merge behind any graph edit already running (see editQueue). */
+  private doMerge(
+    row: TwigCandidate,
+    batch?: { neuron: bigint },
+  ): Promise<MergeOutcome> {
+    const key = rowKey(row);
+    const st = this.mergeStatus.get(key);
+    if (st === "queued" || st === "merging") return Promise.resolve("failed");
+    this.mergeStatus.set(key, "queued");
+    this.render();
+    return this.serialEdit(() => this.doMergeNow(row, batch)).finally(() =>
+      this.clearQueued(key),
+    );
+  }
+
+  /** An edit that ended without setting a status of its own is not still queued. */
+  private clearQueued(key: string) {
+    if (this.mergeStatus.get(key) === "queued") {
+      this.mergeStatus.delete(key);
+      this.render();
+    }
+  }
+
+  /** Run a graph edit after every edit queued before it has finished. */
+  private serialEdit<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.editQueue.then(fn);
+    this.editQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async doMergeNow(
     row: TwigCandidate,
     batch?: { neuron: bigint },
   ): Promise<MergeOutcome> {
@@ -2827,7 +2875,9 @@ export class TwigCaptureTab extends Tab {
 
   private isJoined(c: TwigCandidate): boolean {
     const st = this.mergeStatus.get(rowKey(c));
-    return st === "done" || st === "already" || st === "merging";
+    return (
+      st === "done" || st === "already" || st === "merging" || st === "queued"
+    );
   }
 
   /**
@@ -3969,14 +4019,17 @@ export class TwigCaptureTab extends Tab {
           ? "In neuron"
           : status === "merging"
             ? "\u2026"
-            : status === "failed"
-              ? "Retry"
-              : "Merge";
+            : status === "queued"
+              ? "Queued"
+              : status === "failed"
+                ? "Retry"
+                : "Merge";
     // Also while a staged run is going: merges must be strictly one at a
     // time, since each changes the neuron's root.
     merge.disabled =
       status === "done" ||
       status === "merging" ||
+      status === "queued" ||
       status === "already" ||
       this.batch !== undefined;
     merge.title =
@@ -4004,7 +4057,10 @@ export class TwigCaptureTab extends Tab {
       // no_merge about an executed merge is a false label in the GT. Merge
       // itself is already disabled in these states.
       const joined =
-        status === "already" || status === "done" || status === "merging";
+        status === "already" ||
+        status === "done" ||
+        status === "merging" ||
+        status === "queued";
       for (const [verdict, label, help] of [
         ["no_merge", "Not a merge", "Record that these are different neurons."],
         ["unsure", "Unsure", "Record that this one needs a second opinion."],
@@ -4103,7 +4159,7 @@ export class TwigCaptureTab extends Tab {
 
     // Undo / Redo, only where this session actually holds an operation id.
     const entry = this.history.get(key);
-    if (entry !== undefined && status !== "merging") {
+    if (entry !== undefined && status !== "merging" && status !== "queued") {
       const undo = document.createElement("button");
       undo.disabled = this.batch !== undefined;
       undo.classList.add("neuroglancer-twig-capture-merge");
