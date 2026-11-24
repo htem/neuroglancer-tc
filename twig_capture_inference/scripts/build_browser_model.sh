@@ -53,9 +53,13 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tc_model_XXXX")
 trap 'rm -rf "$WORK"' EXIT
 echo "== $NAME from $CKPT  ($(date))"
 
-"$PY" "$TWIGCAPTURE/scripts/export_local_onnx.py" "$CKPT" "$WORK/local_fp32.onnx"
-"$PY" "$HERE/make_bench_assets.py" "$WORK/local_fp32.onnx" "$CKPT" "$WORK" >/dev/null
-"$PY" "$HERE/conv3d_as_conv2d.py" "$WORK/local_fp32.onnx" "$WORK/local_fp32c2d.onnx" concat
+# make_bench_assets.py writes $WORK/local_fp32.onnx itself (a copy of its
+# input), so the export goes to another name. Its fp16 conversion warnings
+# are noise here.
+"$PY" "$TWIGCAPTURE/scripts/export_local_onnx.py" "$CKPT" "$WORK/export_fp32.onnx"
+PYTHONWARNINGS=ignore "$PY" "$HERE/make_bench_assets.py" \
+  "$WORK/export_fp32.onnx" "$CKPT" "$WORK" >/dev/null
+"$PY" "$HERE/conv3d_as_conv2d.py" "$WORK/export_fp32.onnx" "$WORK/local_fp32c2d.onnx" concat
 CHECK=$("$PY" "$HERE/check_onnx.py" "$WORK" "$WORK/local_fp32c2d.onnx")
 echo "$CHECK"
 DP=$(sed -nE 's/.*max\|dp\|=([0-9.e+-]+).*/\1/p' <<<"$CHECK")
