@@ -66,6 +66,8 @@ export interface SelectorSettings {
   chainThreshold: number;
   maxRegions: number;
   maxSites: number;
+  /** Largest candidate proposed, in L2 nodes (cluster runner: 20). */
+  maxCandidateL2: number;
   backend: Backend;
   modelUrl: string;
 }
@@ -75,6 +77,7 @@ const DEFAULT_SETTINGS: SelectorSettings = {
   chainThreshold: 0.75,
   maxRegions: 400,
   maxSites: 8,
+  maxCandidateL2: 20,
   backend: "auto",
   modelUrl: DEFAULT_MODEL_URL,
 };
@@ -194,7 +197,26 @@ export class TwigSelectorState {
       this.dataset()?.datastack,
     );
     if (r === undefined) return undefined;
-    return ((r as any).level ?? 1) >= this.settings.level ? r : undefined;
+    const x = r as any;
+    const st = this.settings;
+    // The result must have looked at least as far as the settings now ask:
+    // as deep a level, as large a partner, and every region unless it was
+    // capped at or above today's cap.
+    if ((x.level ?? 1) < st.level) return undefined;
+    if ((x.filters?.max_candidate_l2_nodes ?? 20) < (st.maxCandidateL2 ?? 20)) {
+      return undefined;
+    }
+    const searched = x.binned_regions_searched;
+    const total = x.binned_regions_total;
+    if (
+      typeof searched === "number" &&
+      typeof total === "number" &&
+      searched < total &&
+      searched < st.maxRegions
+    ) {
+      return undefined;
+    }
+    return r;
   }
 
   cachedAnyLevel(root: string) {
@@ -275,6 +297,7 @@ export class TwigSelectorState {
               chainThreshold: st.chainThreshold,
               maxRegions: st.maxRegions,
               maxSites: st.maxSites,
+              maxCandidateL2: st.maxCandidateL2 ?? 20,
               modelUrl: st.modelUrl,
             },
             (p) => {
@@ -596,6 +619,20 @@ export class TwigSelectorTab extends Tab {
       "Per level. One region is a 6.4 x 6.4 um search window around one " +
         "1.1 um bin of the object's L2 graph; a fragment needs a few, a " +
         "whole neuron hundreds to thousands.",
+    );
+    field(
+      "candidate L2 ≤",
+      num(
+        st.maxCandidateL2 ?? 20,
+        1,
+        1000000,
+        10,
+        (v) => (st.maxCandidateL2 = Math.round(v)),
+      ),
+      "Largest partner proposed, in L2 nodes. 20 (as the cluster runner) " +
+        "suits a neuron collecting small twigs. To find where a small " +
+        "FRAGMENT belongs -- usually onto a big neuron -- raise it (e.g. " +
+        "100000) so large partners are scored too.",
     );
     const sites = document.createElement("select");
     for (const [v, label] of [

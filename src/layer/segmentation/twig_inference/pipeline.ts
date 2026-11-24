@@ -65,6 +65,8 @@ export interface RunOptions {
   chainThreshold: number;
   /** Contact sites scored per pair (8 in the runner; 1 is ~3x less work). */
   maxSites: number;
+  /** Largest candidate proposed, in L2 nodes (default 20, as the cluster). */
+  maxCandidateL2?: number;
   modelUrl: string;
 }
 
@@ -339,7 +341,7 @@ export async function runTwigCapture(
       const candId = String(rootTable.ids[l]);
       const stats = keep.get(l)!;
       const nL2 = ctx.l2Count.get(candId) ?? 0;
-      if (nL2 > P.maxCandidateL2) {
+      if (nL2 > (opts.maxCandidateL2 ?? P.maxCandidateL2)) {
         reject(candId, "candidate_l2", { ...stats, num_l2_nodes: nL2 });
         continue;
       }
@@ -531,7 +533,7 @@ export async function runTwigCapture(
     prog.phase = `level ${hop}: L2 graph`;
     report();
     const all = await regionsFor(frontier, hop === 1);
-    const regions = all.slice(0, opts.maxRegions);
+    const regions = spreadRegions(all, opts.maxRegions);
     regionsTotal += all.length;
     prog.phase = `level ${hop}: regions`;
     prog.done = 0;
@@ -620,7 +622,7 @@ export async function runTwigCapture(
       max_contact_sites: opts.maxSites,
       min_contact_blob_voxels: P.minContactBlob,
       min_segment_voxels: P.minSegmentVoxels,
-      max_candidate_l2_nodes: P.maxCandidateL2,
+      max_candidate_l2_nodes: opts.maxCandidateL2 ?? P.maxCandidateL2,
       bin_size_xy: P.binXY,
       bin_size_z: P.binZ,
       max_em_zero_frac: P.maxEmZeroFrac,
@@ -641,4 +643,58 @@ export async function runTwigCapture(
       device: model.backend,
     },
   };
+}
+
+/**
+ * At most `max` regions, spread over the whole neuron.
+ *
+ * Bins come in chunkedgraph leaf order, which is spatially clustered, so
+ * taking the first `max` searched one end of a big neuron and none of the
+ * rest. Farthest-point sampling instead: start from the first bin, then
+ * repeatedly add the bin farthest (in nm, z scaled by its resolution as the
+ * bins are) from every bin picked so far. Deterministic, and with `max` at
+ * or above the count it returns every bin unchanged.
+ */
+export function spreadRegions(
+  all: [number, number, number][],
+  max: number,
+): [number, number, number][] {
+  if (all.length <= max) return all;
+  if (max <= 0) return [];
+  const n = all.length;
+  // Bin coordinates are 16 nm in x/y and z slices; compare in bin units,
+  // which is what the search windows are sized in.
+  const key = (c: [number, number, number]) => [
+    c[0] / 70,
+    c[1] / 70,
+    c[2] / 28,
+  ];
+  const pts = all.map(key);
+  const dist = new Float64Array(n).fill(Infinity);
+  const picked: number[] = [0];
+  const update = (j: number) => {
+    const q = pts[j];
+    for (let i = 0; i < n; ++i) {
+      const d =
+        (pts[i][0] - q[0]) ** 2 +
+        (pts[i][1] - q[1]) ** 2 +
+        (pts[i][2] - q[2]) ** 2;
+      if (d < dist[i]) dist[i] = d;
+    }
+  };
+  update(0);
+  while (picked.length < max) {
+    let best = -1;
+    let bestD = -1;
+    for (let i = 0; i < n; ++i) {
+      if (dist[i] > bestD) {
+        bestD = dist[i];
+        best = i;
+      }
+    }
+    if (best < 0 || bestD === 0) break;
+    picked.push(best);
+    update(best);
+  }
+  return picked.map((i) => all[i]);
 }
