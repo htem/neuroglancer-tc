@@ -84,9 +84,15 @@ and results survive a reload. Verdicts are still recorded in the dataset's
 merges onto the confident level-1 suggestions (p ≥ the chain threshold),
 and so on. Those rows say which suggestion they attach to ("via").
 
-**Speed.** On an Apple M-series GPU it takes about 10–15 s per region, so a
-few minutes for a small neuron and longer for a big one. On the CPU, expect
-about 3 s per patch. There, set sites/pair to 1 and cap max regions.
+**Speed.** The model runs on Twig Capture's own WebGPU network (adapted
+from Philipp Schlegel's Coda, see Acknowledgements): about 41 ms per patch
+on an Apple M1 Max, against 81 ms with ONNX Runtime. The next regions are
+cut out while the GPU scores the current one. Aedes `648518347555976042`
+(36 regions, 2,477 patches) went from 512 s to about 250 s, with identical
+suggestions. Expect about 7 s per region, so a few minutes for a small
+neuron and longer for a big one. On the CPU, expect about 3 s per patch.
+There, set sites/pair to 1 and cap max regions. The **device** setting can
+also pick **GPU (ONNX Runtime)**, the previous GPU path.
 
 ## Something went wrong?
 
@@ -137,3 +143,16 @@ replacing a file in place would leave browsers scoring with the old copy.
 See [BRIEF.md](BRIEF.md) for how it works, what has been measured against
 the cluster runner, and how to rebuild the model. `deploy/deploy.sh`
 builds and deploys the three viewers.
+
+## Acknowledgements
+
+The in-browser GPU model (`src/layer/segmentation/twig_inference/gpu/`) is
+adapted from **Philipp Schlegel's** hand-written WebGPU 3D ResNet in
+[Coda](https://github.com/navis-org/coda) (`src/packs/seam/gpuAssessor`,
+MIT licence, Copyright (c) 2026 NAVis). Philipp found that ONNX Runtime
+Web runs 3D convolutions through a naive shader, and replaced it with an
+implicit-matrix-multiply convolution in WGSL. We use his ONNX reader, his
+convolution, split-reduction and epilogue shaders (generalised from cubes
+to our 18 × 128 × 128 patch and (3, 7, 7) stem), and his in-flight scoring.
+Each ported file carries his MIT notice.
+

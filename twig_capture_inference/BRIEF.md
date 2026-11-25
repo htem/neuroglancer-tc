@@ -47,6 +47,77 @@ Steps:
 - **Checkpoint:** `joint_finetune_20261123_105038` ep8, Kevin's combined
   Aedes+BANC model, fine-tuned on reviewer decisions.
 
+### Our own WebGPU network (2026-11-25, adapted from Coda)
+
+ONNX Runtime Web runs a 3D Conv on WebGPU through a naive per-voxel shader
+(`Conv3DNaive`). Our Conv2d rewrite (below) sidestepped most of that, at
+82 ms/patch, about 1.5 TFLOP/s for the model's ~124 GFLOP. Philipp
+Schlegel's Coda (https://github.com/navis-org/coda,
+`src/packs/seam/gpuAssessor`, MIT) went further for SEAM's 3D ResNet-18: no
+ONNX Runtime at all, with every convolution an implicit matrix multiply in
+WGSL. `src/layer/segmentation/twig_inference/gpu/` is that approach, ported
+and generalised to our anisotropic patch:
+
+- `onnx_proto.ts`: Coda's ONNX reader (initializers and nodes only).
+- `r3d_plan.ts`: our r3d_18 as a fixed plan. Every weight is checked by
+  shape. It reads either the Conv2d rewrite we serve
+  (`local_fp32c2d.onnx`, with the depth taps unstacked again) or the plain
+  3D export, so no new model file is needed. BN is folded into the conv
+  biases by the export.
+- `r3d_shaders.ts`: a 64 × 64 output tile per workgroup, 8 × 4 per thread,
+  16 reduction terms per tile. Layers 3 and 4 split the reduction across
+  workgroups and add the partial sums in a second pass. Bias, ReLU and the
+  residual are folded into each conv. The head (pool, fc, ReLU, fc) is one
+  workgroup.
+- `r3d_network.ts`: buffers are allocated once and reused when dead, with
+  one submit and an 8-byte read back per patch. Up to 12 patches are in
+  flight.
+
+**Measured (Apple M1 Max, 32-core GPU, Chrome, the published
+`local_fp32c2d.onnx`):**
+
+| | ms/patch | |
+|---|---|---|
+| ONNX Runtime 1.22, WebGPU (c2d) | 80.4 | |
+| **our WebGPU network** | **40.7** | 3.0 TFLOP/s |
+
+- **Parity:** max \|dp\| against ONNX Runtime is 1.2e-7 over 24 patches.
+  ORT itself matches PyTorch exactly on the reference patches
+  (p 0.8288575, 0.5244967).
+- **Per step** (`gpu.profile`): stem 2.5 ms; each layer1 conv 5.1 ms
+  (3.2 TFLOP/s, 82 ms of 41); layer2 convs 2.9; layer3 1.6; layer4 1.0.
+  Every stage runs at 2.6–3.2 TFLOP/s, so what is left is the kernel's
+  own speed (plain f32, no subgroups), not the plan. Coda's figures were
+  measured on an M3 Max.
+- **The page checks it the first time.** When a model is first opened on
+  an adapter, two test patches are scored by both runtimes. If they differ
+  by more than 1e-4, or the network cannot be built, ONNX Runtime is used.
+  The verdict is kept in IndexedDB per model URL and adapter.
+- **Device setting:** auto and **GPU (WebGPU)** use our network.
+  **GPU (ONNX Runtime)** is the previous path.
+
+**End to end** (Aedes `648518347555976042`: 36 regions, 2,477 patches,
+432 suggestions, M1 Max). Busy seconds per phase (`benchmark.phase_seconds`):
+
+| | total | model | em_cutout | sites (CPU) | sv_cutout | cand_l2 | sv_roots |
+|---|---|---|---|---|---|---|---|
+| before: ORT, one region at a time | 512 s | 205 | 111 | 105 | 34 | 34 | 18 |
+| after: our network + overlap | 247–263 s | 164* | 90–101 | 90 | 26–32 | 33 | 32–39 |
+
+\* Overlapped with everything else. Busy time includes waiting while the
+page's main thread is busy with the next region, so it reads about
+66 ms/patch, against 41 alone.
+
+The suggestions are identical: the same 432 rows in the same order with
+the same prob_merge, and the same rejects. The next bottleneck is the
+page's own work: the CPU site building (~90 s) and the EM cutouts (~95 s,
+JPEG decode included). These now set the pace, not the GPU.
+
+**Measuring:** from the console, `m = await twigCaptureModel.open(url,
+"webgpu")`, then `await m.scorePatches([...])`, or
+`await m.gpu.profile(patch, 30)` for per-step times. `"webgpu-ort"` gives
+ONNX Runtime for comparison.
+
 ## What has been measured
 
 ONNX against PyTorch on the 2 reference patches:
@@ -154,7 +225,8 @@ and `twig_local_results.ts` beside it.
 | `precomputed_reader.ts` | exact cutouts from sharded or unsharded precomputed volumes (compressed_segmentation, jpeg, raw). gs:// is read through the GCS JSON API, for CORS |
 | `volume_ops.ts` | 1:1 port of `touching_labels_center`, `find_contact_sites`, `supervoxel_near`, the zoom(order=0) mask upsampling and `organelle_features` |
 | `pipeline.ts` | `run_twigcapture_v2.py`'s region loop; writes the runner's result schema |
-| `model.ts` | ONNX Runtime Web (from jsDelivr, pinned), WebGPU→WASM fallback, model cache |
+| `model.ts` | the runtimes: our WebGPU network (checked against ONNX Runtime once per model and adapter), else ONNX Runtime Web (from jsDelivr, pinned) on WebGPU or WASM; model cache |
+| `gpu/` | the WebGPU r3d_18, adapted from Coda (Philipp Schlegel, MIT): ONNX reader, plan, WGSL, buffers and submits |
 
 **Level.** Level 1 suggests merges onto the object. Level N+1 treats the
 level-N suggestions with p ≥ the chain threshold (default 0.75) as already
@@ -176,7 +248,8 @@ chip, and the sink side is labelled "via".
   supervoxels in a 200×200×120 region, the sampled voxels, and the EM mean
   and zero fraction (so JPEG decoding is exact).
 - In the viewer, the model gives exactly PyTorch's p on the reference patches:
-  - WebGPU (Apple M-series): 82 ms/patch;
+  - WebGPU (Apple M-series): 82 ms/patch with ONNX Runtime, 41 ms/patch with
+    our own WebGPU network (above, max |dp| 1.2e-7);
   - CPU (WASM): 3.1 s/patch.
 
 **Differences from the cluster runner:**

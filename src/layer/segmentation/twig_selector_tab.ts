@@ -191,7 +191,7 @@ export class TwigSelectorState {
   willUseGpu(): Promise<boolean> {
     const b = this.settings.backend;
     if (b === "wasm") return Promise.resolve(false);
-    if (b === "webgpu") return Promise.resolve(true);
+    if (b === "webgpu" || b === "webgpu-ort") return Promise.resolve(true);
     return (this.gpuProbe ??= webgpuAvailable());
   }
   /** Last known answer of willUseGpu, for drawing the plan synchronously. */
@@ -968,6 +968,7 @@ export class TwigSelectorTab extends Tab {
     for (const [v, label] of [
       ["auto", "auto"],
       ["webgpu", "GPU (WebGPU)"],
+      ["webgpu-ort", "GPU (ONNX Runtime)"],
       ["wasm", "CPU"],
     ] as const) {
       const o = document.createElement("option");
@@ -988,7 +989,9 @@ export class TwigSelectorTab extends Tab {
       "device",
       backend,
       "auto uses the GPU when the browser offers WebGPU, else the CPU. CPU " +
-        "works everywhere but is much slower.",
+        "works everywhere but is much slower. GPU runs Twig Capture's own " +
+        "WebGPU network (checked against ONNX Runtime the first time); " +
+        "GPU (ONNX Runtime) is the slower previous path.",
     );
     const model = document.createElement("input");
     model.type = "text";
