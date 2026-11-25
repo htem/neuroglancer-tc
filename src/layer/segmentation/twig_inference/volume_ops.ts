@@ -331,6 +331,11 @@ export function findContactSites(
   gap = 0,
   /** id2's box from labelBoxes, to skip finding it here. */
   box?: LabelBox,
+  /**
+   * Where `lab` sits in a larger cutout: added to the centroids (integers
+   * first, so they equal those computed on the whole cutout to the bit).
+   */
+  origin: readonly number[] = [0, 0, 0],
 ): Array<[number, [number, number, number]]> {
   const [lo, hi] = (box ?? labelBoxes(lab, s, [id2]).get(id2)!).map((v) => [
     ...v,
@@ -386,9 +391,9 @@ export function findContactSites(
     sites.push([
       size[l],
       [
-        sumx[l] / size[l] + lo[0],
-        sumy[l] / size[l] + lo[1],
-        sumz[l] / size[l] + lo[2],
+        sumx[l] / size[l] + (lo[0] + origin[0]),
+        sumy[l] / size[l] + (lo[1] + origin[1]),
+        sumz[l] / size[l] + (lo[2] + origin[2]),
       ],
     ]);
     if (sites.length >= maxSites) break;

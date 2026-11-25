@@ -27,6 +27,8 @@
  * - synapse counts are not computed (no synapse tables in the browser).
  */
 
+import { requestAsyncComputation } from "#src/async_computation/request.js";
+import { twigContactSites } from "#src/layer/segmentation/twig_inference/contact_sites_request.js";
 import type { TwigDataset } from "#src/layer/segmentation/twig_inference/datasets.js";
 import {
   TWIG_PARAMS,
@@ -38,10 +40,12 @@ import {
   IdTable,
   PrecomputedVolume,
 } from "#src/layer/segmentation/twig_inference/precomputed_reader.js";
-import type { Shape } from "#src/layer/segmentation/twig_inference/volume_ops.js";
+import type {
+  Shape,
+  findContactSites,
+} from "#src/layer/segmentation/twig_inference/volume_ops.js";
 import {
   PATCH_VOXELS,
-  findContactSites,
   labelBoxes,
   organelleFeatures,
   touchingLabelsCenter,
@@ -545,27 +549,55 @@ export async function runTwigCapture(
     // candidate's whole bbox, not the centre band) and only a pair with none
     // is measured across the gap; "all" widens every pair.
     tCpu = performance.now();
+    // On the async-computation workers, one candidate a task, each given
+    // only its crop: its box +- (2 + gap), clipped to the cutout, which is
+    // exactly what findContactSites crops to itself, so the sites are the
+    // same (offset back by the crop's corner).
     const sitesFor = new Map<number, ReturnType<typeof findContactSites>>();
     const boxes = labelBoxes(rootLab, s, keepIds);
-    for (const l of keepIds) {
-      const siteArgs = [
-        rootLab,
-        s,
-        target,
-        l,
-        P.minContactBlob,
-        opts.maxSites,
-      ] as const;
-      const box = boxes.get(l);
-      let sites = findContactSites(
-        ...siteArgs,
-        gapMode === "all" ? gap : 0,
-        box,
-      );
-      if (!sites.length && gap > 0 && gapMode !== "all")
-        sites = findContactSites(...siteArgs, gap, box);
-      sitesFor.set(l, sites);
-    }
+    const first = gapMode === "all" ? gap : 0;
+    const fallback = gap > 0 && gapMode !== "all" ? gap : undefined;
+    const margin = 2 + Math.max(first, fallback ?? 0);
+    await Promise.all(
+      keepIds.map(async (l) => {
+        const [blo, bhi] = boxes.get(l)!;
+        if (bhi[0] < 0) {
+          sitesFor.set(l, []);
+          return;
+        }
+        const lo = blo.map((v) => Math.max(0, v - margin));
+        const hi = bhi.map((v, d) => Math.min(s[d], v + margin + 1));
+        const cs: [number, number, number] = [
+          hi[0] - lo[0],
+          hi[1] - lo[1],
+          hi[2] - lo[2],
+        ];
+        const crop = new Uint32Array(cs[0] * cs[1] * cs[2]);
+        for (let z = 0; z < cs[2]; ++z)
+          for (let y = 0; y < cs[1]; ++y) {
+            const src = lo[0] + s[0] * (lo[1] + y + s[1] * (lo[2] + z));
+            crop.set(
+              rootLab.subarray(src, src + cs[0]),
+              cs[0] * (y + cs[1] * z),
+            );
+          }
+        const sites = await requestAsyncComputation(
+          twigContactSites,
+          signal,
+          [crop.buffer],
+          crop,
+          cs,
+          target,
+          l,
+          P.minContactBlob,
+          opts.maxSites,
+          first,
+          fallback,
+          lo as [number, number, number],
+        );
+        sitesFor.set(l, sites);
+      }),
+    );
     timer.add("contacts", performance.now() - tCpu);
     return {
       origin,
