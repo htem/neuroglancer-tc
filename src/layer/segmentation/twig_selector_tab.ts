@@ -35,6 +35,7 @@ import {
   DEFAULT_MODEL_URL,
   LARGE_MERGE_L2,
   NO_L2_LIMIT,
+  TWIG_PARAMS,
   datasetForUrls,
 } from "#src/layer/segmentation/twig_inference/datasets.js";
 import {
@@ -81,6 +82,8 @@ export interface SelectorSettings {
   maxCandidateL2: number;
   /** 2: saved after partners were uncapped (see loadSettings). */
   l2LimitVersion?: number;
+  /** contact_gap_voxels: 0 (touching only), 1 (default) or 2. */
+  contactGap: number;
   backend: Backend;
   modelUrl: string;
 }
@@ -93,6 +96,7 @@ const DEFAULT_SETTINGS: SelectorSettings = {
   maxSites: 8,
   maxCandidateL2: NO_L2_LIMIT,
   l2LimitVersion: 2,
+  contactGap: TWIG_PARAMS.contactGap,
   backend: "auto",
   modelUrl: DEFAULT_MODEL_URL,
 };
@@ -427,6 +431,13 @@ export class TwigSelectorState {
     if ((x.filters?.max_candidate_l2_nodes ?? 20) < want.maxCandidateL2) {
       return undefined;
     }
+    // Searched with another contact gap: a different candidate set.
+    if ((x.contact_gap_voxels ?? 0) !== st.contactGap) return undefined;
+    if (
+      st.contactGap > 0 &&
+      (x.contact_gap_mode ?? "all") !== TWIG_PARAMS.contactGapMode
+    )
+      return undefined;
     const searched = x.binned_regions_searched;
     const total = x.binned_regions_total;
     if (
@@ -547,6 +558,7 @@ export class TwigSelectorState {
               maxRegions: plan.maxRegions,
               maxSites: plan.maxSites,
               maxCandidateL2: plan.maxCandidateL2,
+              contactGap: st.contactGap,
               modelUrl: st.modelUrl,
             },
             (p) => {
@@ -963,6 +975,31 @@ export class TwigSelectorTab extends Tab {
       "Contact sites scored per pair (the largest first). The cluster runner " +
         "scores up to 8 and keeps the max; 1 is several times less work, " +
         "useful on CPU, but can miss a merge whose best site is not the largest.",
+    );
+    const gapSel = document.createElement("select");
+    for (const [v, label] of [
+      [0, "0 (touching only)"],
+      [1, "1 voxel (default)"],
+      [2, "2 voxels"],
+    ] as const) {
+      const o = document.createElement("option");
+      o.value = String(v);
+      o.textContent = label;
+      gapSel.appendChild(o);
+    }
+    gapSel.value = String(st.contactGap);
+    gapSel.addEventListener("change", () => {
+      st.contactGap = Number(gapSel.value);
+      state.saveSettings();
+    });
+    field(
+      "contact gap",
+      gapSel,
+      "Pieces up to this many supervoxel voxels apart (32 nm; FANC 34.4 nm) " +
+        "count as touching, as the cluster runner's --contact_gap. Merges " +
+        'across a thin gap become candidates; they are tagged "gap" in Twig ' +
+        "Capture, and are less reliable than touching ones. 0 is the old " +
+        "touching-only search.",
     );
     const backend = document.createElement("select");
     for (const [v, label] of [

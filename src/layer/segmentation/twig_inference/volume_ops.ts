@@ -147,6 +147,25 @@ export function label26(
 export interface NeighbourStats {
   contact_voxels: number;
   cand_voxels: number;
+  /**
+   * Found only because `gap` widened the search: the piece does not touch the
+   * target at supervoxel resolution (the runner's gap_contact).
+   */
+  gap_contact: boolean;
+}
+
+/**
+ * dilate26 `times` times: scipy's binary_dilation(structure 26-connected,
+ * iterations=times). Nothing outside the volume is ever set, as in scipy.
+ */
+export function dilate26Times(
+  mask: Uint8Array,
+  s: Shape,
+  times: number,
+): Uint8Array {
+  let out = mask;
+  for (let i = 0; i < times; ++i) out = dilate26(out, s);
+  return out === mask ? mask.slice() : out;
 }
 export type RejectReason =
   | "contact_below_min"
@@ -163,6 +182,18 @@ export function touchingLabelsCenter(
     minContact: number;
     maxContact: number;
     minSegment: number;
+    /**
+     * contact_gap_voxels (runner `CONTACT_GAP`): pieces up to this many
+     * supervoxel voxels apart count as touching. 0 is the old search.
+     */
+    gap?: number;
+    /**
+     * "all" (the runner's rule): every neighbour's contact is counted on the
+     * widened ring. "nontouching": neighbours that really touch keep the
+     * one-voxel ring (so their counts, and with them the contact cap, are
+     * exactly as at gap 0) and only the others are counted on the wide one.
+     */
+    gapMode?: "all" | "nontouching";
   },
 ): {
   keep: Map<number, NeighbourStats>;
@@ -188,7 +219,25 @@ export function touchingLabelsCenter(
         }
       }
   if (!any) return { keep, rejects };
-  const dil = dilate26(maskCentre, s);
+  const gap = opts.gap ?? 0;
+  const dil = dilate26Times(maskCentre, s, 1 + gap);
+  // Which neighbours really touch (one-voxel dilation), to flag the rest.
+  let really: Set<number> | undefined;
+  const contact1 = new Map<number, number>();
+  if (gap > 0) {
+    really = new Set();
+    const touch1 = dilate26(maskCentre, s);
+    for (let z = zb; z < sz - zb; ++z)
+      for (let y = yb; y < sy - yb; ++y)
+        for (let x = xb; x < sx - xb; ++x) {
+          const i = idx(s, x, y, z);
+          if (touch1[i] && !maskCentre[i]) {
+            const l = lab[i];
+            really.add(l);
+            contact1.set(l, (contact1.get(l) ?? 0) + 1);
+          }
+        }
+  }
   const contact = new Map<number, number>();
   for (let z = zb; z < sz - zb; ++z)
     for (let y = yb; y < sy - yb; ++y)
@@ -200,6 +249,9 @@ export function touchingLabelsCenter(
         contact.set(l, (contact.get(l) ?? 0) + 1);
       }
   if (contact.size === 0) return { keep, rejects };
+  if (really && opts.gapMode === "nontouching")
+    for (const l of contact.keys())
+      if (really.has(l)) contact.set(l, contact1.get(l)!);
   const sizes = new Map<number, number>();
   for (let i = 0; i < lab.length; ++i) {
     const l = lab[i];
@@ -212,14 +264,20 @@ export function touchingLabelsCenter(
       rejects.set(l, ["contact_above_max", ct, sz2]);
     else if (opts.minSegment > 0 && sz2 < opts.minSegment)
       rejects.set(l, ["segment_too_small", ct, sz2]);
-    else keep.set(l, { contact_voxels: ct, cand_voxels: sz2 });
+    else
+      keep.set(l, {
+        contact_voxels: ct,
+        cand_voxels: sz2,
+        gap_contact: really !== undefined && !really.has(l),
+      });
   }
   return { keep, rejects };
 }
 
 /**
  * find_contact_sites: contact blobs between id1 and id2, biggest first, as
- * (voxels, centroid in cutout coordinates). Computed on id2's bbox +-2.
+ * (voxels, centroid in cutout coordinates). Computed on id2's bbox
+ * +-(2 + gap), with both dilations widened by `gap` (create_contact_mask).
  */
 export function findContactSites(
   lab: Uint32Array,
@@ -228,6 +286,7 @@ export function findContactSites(
   id2: number,
   minVoxels: number,
   maxSites: number,
+  gap = 0,
 ): Array<[number, [number, number, number]]> {
   const [sx, sy, sz] = s;
   const lo = [sx, sy, sz];
@@ -244,7 +303,7 @@ export function findContactSites(
         if (z > hi[2]) hi[2] = z;
       }
   if (hi[0] < 0) return [];
-  const margin = 2;
+  const margin = 2 + gap;
   for (let d = 0; d < 3; ++d) {
     lo[d] = Math.max(0, lo[d] - margin);
     hi[d] = Math.min(s[d], hi[d] + margin + 1);
@@ -261,8 +320,8 @@ export function findContactSites(
         if (v === id1) m1[j] = 1;
         else if (v === id2) m2[j] = 1;
       }
-  const d1 = dilate26(m1, cs);
-  const d2 = dilate26(m2, cs);
+  const d1 = dilate26Times(m1, cs, 1 + gap);
+  const d2 = dilate26Times(m2, cs, 1 + gap);
   const contact = new Uint8Array(n);
   for (let j = 0; j < n; ++j) contact[j] = (d1[j] & m2[j]) | (d2[j] & m1[j]);
   const { labels, count } = label26(contact, cs);

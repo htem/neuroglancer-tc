@@ -80,6 +80,14 @@ Everything runs and is cached in your browser: the model is downloaded once,
 and results survive a reload. Verdicts are still recorded in the dataset's
 `twig_capture_decisions` CAVE table, as for cluster results.
 
+**Contact gap.** Pieces up to 1 supervoxel voxel (32 nm) apart count as
+touching by default, as the cluster runner's `--contact_gap 1`. This finds
+merges across a thin gap, such as a neck that vanishes at 32 nm. Those rows
+are tagged **gap** in Twig Capture (filter them with the gap facet), and
+they are less reliable than touching ones. Pairs that really touch are
+scored exactly as without the gap. The **contact gap** setting offers 0
+(touching only), 1 or 2.
+
 **Level.** Level 1 suggests merges onto the neuron. Level 2 also suggests
 merges onto the confident level-1 suggestions (p ≥ the chain threshold),
 and so on. Those rows say which suggestion they attach to ("via").

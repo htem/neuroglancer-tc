@@ -197,6 +197,23 @@ export const TWIG_PARAMS = {
    * 0 reproduces the old rep_coord-only search.
    */
   coveragePasses: 3,
+  /**
+   * contact_gap_voxels, as the cluster runner's --contact_gap: pieces up to
+   * this many supervoxel voxels apart count as touching, so a merge across a
+   * thin gap (a neck lost at 32 nm) becomes a candidate. Rows found only
+   * this way carry gap_contact: true, which Twig Capture tags "gap". 0
+   * reproduces the old touching-only search. The Selector can override it.
+   */
+  contactGap: 1,
+  /**
+   * How the gap applies (volume_ops touchingLabelsCenter): "nontouching"
+   * widens the search only for pieces that do not touch, so every touching
+   * pair keeps exactly its gap-0 contact count, sites and score, and the gap
+   * only adds rows. "all" is the cluster runner's rule, which widens it for
+   * every pair: on Aedes 648518347555976042 that moved 180 of 432 rows' p
+   * and pushed 14 touching candidates (up to p 0.94) past the contact cap.
+   */
+  contactGapMode: "nontouching" as "all" | "nontouching",
   maxEmZeroFrac: 0.05,
   l2MaxDtNm: 180,
   l2MaxSizeNm3: 4.0e8,

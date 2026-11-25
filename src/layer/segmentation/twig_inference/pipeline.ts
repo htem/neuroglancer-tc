@@ -70,6 +70,10 @@ export interface RunOptions {
   maxSites: number;
   /** Largest candidate proposed, in L2 nodes (default 20, as the cluster). */
   maxCandidateL2?: number;
+  /** contact_gap_voxels (default TWIG_PARAMS.contactGap). */
+  contactGap?: number;
+  /** How it applies (default TWIG_PARAMS.contactGapMode). */
+  contactGapMode?: "all" | "nontouching";
   modelUrl: string;
 }
 
@@ -264,6 +268,8 @@ export async function runTwigCapture(
     found: 0,
   };
   const timer = new PhaseTimer();
+  const gap = opts.contactGap ?? P.contactGap;
+  const gapMode = opts.contactGapMode ?? P.contactGapMode;
   const report = () => onProgress({ ...prog });
   const check = () => {
     if (signal.aborted) throw new DOMException("cancelled", "AbortError");
@@ -506,6 +512,8 @@ export async function runTwigCapture(
       minContact: P.minContactVoxels,
       maxContact: P.maxContactVoxels,
       minSegment: P.minSegmentVoxels,
+      gap,
+      gapMode,
     });
     for (const [l, [why, ct, sz]] of rejects) {
       const id = String(rootTable.ids[l]);
@@ -545,14 +553,21 @@ export async function runTwigCapture(
         reject(candId, "candidate_l2", { ...stats, num_l2_nodes: nL2 });
         continue;
       }
-      const sites = findContactSites(
+      // The runner's create_contact_mask: in "nontouching" mode a pair keeps
+      // its one-voxel interface (judged on the candidate's whole bbox, not
+      // the centre band) and only a pair with none is measured across the
+      // gap; "all" widens every pair.
+      const siteArgs = [
         rootLab,
         s,
         target,
         l,
         P.minContactBlob,
         opts.maxSites,
-      );
+      ] as const;
+      let sites = findContactSites(...siteArgs, gapMode === "all" ? gap : 0);
+      if (!sites.length && gap > 0 && gapMode !== "all")
+        sites = findContactSites(...siteArgs, gap);
       if (!sites.length) {
         reject(candId, "no_contact", stats);
         continue;
@@ -615,6 +630,9 @@ export async function runTwigCapture(
             num_l2_nodes: nL2,
             contact_voxels: stats.contact_voxels,
             cand_voxels: stats.cand_voxels,
+            // Found only because contact_gap_voxels widened the search: the
+            // two do not touch at supervoxel resolution (as the runner).
+            gap_contact: stats.gap_contact,
             cand_size_um3: +(
               (stats.cand_voxels * svNm * svNm * zRes) /
               1e9
@@ -900,6 +918,8 @@ export async function runTwigCapture(
     models_used: `local (in-browser, ${model.backend})`,
     local_model: opts.modelUrl,
     connectivity: 3,
+    contact_gap_voxels: gap,
+    contact_gap_mode: gapMode,
     decision_rule: "raw_local_prob",
     merge_threshold: P.reportThreshold,
     level: opts.level,

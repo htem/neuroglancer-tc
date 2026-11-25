@@ -261,6 +261,25 @@ chip, and the sink side is labelled "via".
   takes every second voxel of the 4 nm zarr.
 - No synapse counts.
 
+**Contact gap (2026-11-25), as the runner's `contact_gap_voxels` /
+`contact_gap_mode`** (twigcapture gap-merges 8d6ba0b). The default is N = 1,
+`nontouching`, set in `TWIG_PARAMS` and by the Selector's **contact gap**
+field:
+- The neighbour search counts a neighbour that touches the target's centre
+  mask on the one-voxel ring, as at N = 0. The (1+N) ring only adds
+  neighbours that do not touch, and those rows carry `gap_contact: true`.
+- The sites use a pair's one-voxel interface over the candidate's bbox if it
+  has any voxel, otherwise the (1+N) interface. "Touches" is judged on the
+  centre-masked ring in the search and on the whole bbox for the interface,
+  as in the runner.
+- The header records `contact_gap_voxels` and `contact_gap_mode`. A cached
+  result with another gap is not reused.
+- `all` is the runner's first rule, which widens every pair. On Aedes
+  `648518347555976042` it moved 180 of 432 rows' p and pushed 14 touching
+  candidates past max_contact (p up to 0.94 lost), for 3 true gap rows.
+- The fixture (`gen_volume_ops_fixture.py`) runs the runner's own functions
+  at gap 0 and 1. `volume_ops.spec.ts` also ports `test_contact_gap.py`.
+
 **CPU.** Runs single-threaded, because the page is not cross-origin isolated:
 COOP/COEP would break CAVE's login popup. Since 2026-11-25 it runs in a
 worker (`cpu_worker.ts`), so the viewer stays responsive. ORT's own worker
