@@ -190,6 +190,13 @@ export const TWIG_PARAMS = {
    */
   binXY: 70,
   binZ: 28,
+  /**
+   * Extra-region passes so every searched L2 node's full extent is searched,
+   * not only the band around its rep_coord (pipeline.ts, "Coverage of each
+   * L2 node's full extent"). As the cluster runner's filtering.coverage_passes;
+   * 0 reproduces the old rep_coord-only search.
+   */
+  coveragePasses: 3,
   maxEmZeroFrac: 0.05,
   l2MaxDtNm: 180,
   l2MaxSizeNm3: 4.0e8,

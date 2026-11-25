@@ -138,15 +138,23 @@ async function getL2Attributes(
   return out;
 }
 
-/** Roots of many supervoxels (chunkedgraph roots_binary, as caveclient). */
-async function getRoots(g: GraphAccess, svs: bigint[]): Promise<bigint[]> {
+/**
+ * Roots of many supervoxels (chunkedgraph roots_binary, as caveclient).
+ * With `stopLayer` 2, their L2 nodes instead.
+ */
+async function getRoots(
+  g: GraphAccess,
+  svs: bigint[],
+  stopLayer?: number,
+): Promise<bigint[]> {
   const out: bigint[] = [];
+  const path = "/roots_binary" + (stopLayer ? `?stop_layer=${stopLayer}` : "");
   for (let i = 0; i < svs.length; i += 20000) {
     const part = BigUint64Array.from(svs.slice(i, i + 20000));
     let got: BigUint64Array | undefined;
     for (let attempt = 0; attempt < 2 && !got; ++attempt) {
       try {
-        const r = await g.fetchGraph("/roots_binary", {
+        const r = await g.fetchGraph(path, {
           method: "POST",
           body: part.buffer as ArrayBuffer,
           headers: { "Content-Type": "application/octet-stream" },
@@ -238,16 +246,27 @@ export async function runTwigCapture(
   let regionsTotal = 0;
   let totalL2 = 0;
 
+  // Coverage (see coverageCentres): the L2 nodes this level searches, and
+  // cells of their voxels that a region saw outside its search band.
+  let keptL2 = new Set<bigint>();
+  const svL2 = new Map<bigint, bigint>();
+  let coverageCells = new Set<string>();
+  let coverageRegions = 0;
+  let coverageErrors = 0;
+
   /** L2 nodes of `roots` -> binned region centres (first node per bin). */
   const regionsFor = async (roots: string[], skipBackbone: boolean) => {
     const all: [number, number, number][] = [];
     const seen = new Set<string>();
+    keptL2 = new Set<bigint>();
     for (const r of roots) {
       const leaves = await getLeavesL2(graph, r);
       totalL2 += leaves.length;
       check();
       const attrs = await getL2Attributes(graph, leaves);
       check();
+      for (const id of keptL2Ids(leaves, attrs, skipBackbone))
+        keptL2.add(BigInt(id));
       for (const c of binL2(
         leaves,
         attrs,
@@ -268,6 +287,59 @@ export async function runTwigCapture(
       if (!bins.has(key)) bins.set(key, c);
     }
     return [...bins.values()];
+  };
+
+  /**
+   * Coverage, part 1: store (as COVERAGE_GRID cells, in global supervoxel
+   * voxels) the neuron's voxels that this cutout holds OUTSIDE its search
+   * band and that belong to an L2 node this level searches. Backbone/soma
+   * nodes skipped by binL2 stay skipped. A node that reaches past a band is
+   * connected and has voxels in it, so it always crosses the border zone and
+   * is seen here.
+   */
+  const recordOutOfBand = async (
+    svLab: Uint32Array,
+    rootLab: Uint32Array,
+    target: number,
+    origin: number[],
+  ) => {
+    const b = P.border;
+    const [X, Y, Z] = s;
+    const out: number[] = [];
+    const labs = new Set<number>();
+    for (let z = 0, i = 0; z < Z; ++z) {
+      const zIn = z >= b && z < Z - b;
+      for (let y = 0; y < Y; ++y) {
+        const yzIn = zIn && y >= b && y < Y - b;
+        for (let x = 0; x < X; ++x, ++i) {
+          if (rootLab[i] !== target) continue;
+          if (yzIn && x >= b && x < X - b) continue;
+          out.push(i);
+          labs.add(svLab[i]);
+        }
+      }
+    }
+    if (!out.length) return;
+    const svIds = ctx.sv.idTable.ids;
+    const need = [...labs].map((l) => svIds[l]).filter((sv) => !svL2.has(sv));
+    if (need.length) {
+      const l2 = await getRoots(graph, need, 2);
+      need.forEach((sv, k) => svL2.set(sv, l2[k]));
+    }
+    const keepLab = new Set(
+      [...labs].filter((l) => keptL2.has(svL2.get(svIds[l])!)),
+    );
+    if (!keepLab.size) return;
+    const G = COVERAGE_GRID;
+    for (const i of out) {
+      if (!keepLab.has(svLab[i])) continue;
+      const x = i % X;
+      const y = Math.floor(i / X) % Y;
+      const z = Math.floor(i / (X * Y));
+      coverageCells.add(
+        `${Math.floor((origin[0] + x) / G[0])},${Math.floor((origin[1] + y) / G[1])},${Math.floor((origin[2] + z) / G[2])}`,
+      );
+    }
   };
 
   /**
@@ -310,6 +382,13 @@ export async function runTwigCapture(
     for (let i = 0; i < svLab.length; ++i) {
       const l = svLab[i];
       if (l) rootLab[i] = svToRoot.get(l)!;
+    }
+    // Coverage: record this level's neuron voxels outside the search band.
+    try {
+      await recordOutOfBand(svLab, rootLab, target, origin);
+    } catch (e) {
+      if ((e as any)?.name === "AbortError") throw e;
+      coverageErrors++;
     }
     // Neighbours touching the (simulated) neuron in the centre box.
     const { keep, rejects } = touchingLabelsCenter(rootLab, s, target, {
@@ -546,7 +625,8 @@ export async function runTwigCapture(
     prog.done = 0;
     prog.total = regions.length;
     report();
-    for (const coord of regions) {
+    coverageCells = new Set();
+    const search = async (coord: [number, number, number]) => {
       check();
       try {
         await processRegion(coord, object, hop);
@@ -557,8 +637,37 @@ export async function runTwigCapture(
       }
       regionsSearched++;
       prog.done++;
-      prog.phase = `level ${hop}: regions`;
       report();
+    };
+    for (const coord of regions) {
+      prog.phase = `level ${hop}: regions`;
+      await search(coord);
+    }
+    // Coverage, part 2: extra regions on whatever part of a searched L2 node
+    // no band covered, then the same check on those, up to coveragePasses.
+    // Contact sites are claimed per site, so overlap adds no duplicates.
+    const centres = regions.map(regionCentre);
+    for (let pass = 0; pass < P.coveragePasses; ++pass) {
+      const G = COVERAGE_GRID;
+      const pts = [...coverageCells].map(
+        (k) =>
+          k.split(",").map((v, d) => Number(v) * G[d] + (G[d] >> 1)) as [
+            number,
+            number,
+            number,
+          ],
+      );
+      coverageCells = new Set();
+      const extra = coverageCentres(pts, centres);
+      if (!extra.length) break;
+      prog.total += extra.length;
+      for (const c of extra) {
+        centres.push(c);
+        coverageRegions++;
+        regionsTotal++;
+        prog.phase = `level ${hop}: coverage`;
+        await search([c[0] * 2, c[1] * 2, c[2]]);
+      }
     }
     frontier = [...best.entries()]
       .filter(([, b]) => b.hop === hop && b.p >= opts.chainThreshold)
@@ -632,6 +741,7 @@ export async function runTwigCapture(
       max_candidate_l2_nodes: opts.maxCandidateL2 ?? P.maxCandidateL2,
       bin_size_xy: P.binXY,
       bin_size_z: P.binZ,
+      coverage_passes: P.coveragePasses,
       max_em_zero_frac: P.maxEmZeroFrac,
       l2_max_dt_nm: P.l2MaxDtNm,
       l2_max_size_nm3: P.l2MaxSizeNm3,
@@ -647,6 +757,8 @@ export async function runTwigCapture(
       total_seconds: +((performance.now() - t0) / 1000).toFixed(1),
       patches_scored: prog.patches,
       region_errors: regionErrors,
+      coverage_regions: coverageRegions,
+      coverage_errors: coverageErrors,
       device: model.backend,
     },
   };
@@ -742,6 +854,85 @@ export function binL2(
     if (!bins.has(key)) bins.set(key, c);
   }
   return [...bins.values()];
+}
+
+/** The L2 nodes a run searches around: binL2's filter, without the binning. */
+export function keptL2Ids(
+  leaves: string[],
+  attrs: Record<string, any>,
+  skipBackbone: boolean,
+): string[] {
+  const P = TWIG_PARAMS;
+  return leaves.filter((id) => {
+    const a = attrs[id];
+    if (!a?.rep_coord_nm) return false;
+    return !(
+      skipBackbone &&
+      ((a.max_dt_nm ?? 0) > P.l2MaxDtNm ||
+        Number(a.size_nm3 ?? 0) > P.l2MaxSizeNm3)
+    );
+  });
+}
+
+// ---- Coverage of each L2 node's full extent -------------------------------
+//
+// A region is centred on an L2 node's rep_coord and finds contacts only in
+// its search band, P.border voxels in from each face of the cutout: +/-80
+// supervoxel voxels in xy and +/-40 sections in z. An L2 node is not a
+// point but a piece of the neuron filling up to one L2 chunk (256 x 256 x
+// 128 voxels in Aedes, 256^3 in BANC), several times the band. Binning
+// guaranteed that every kept rep_coord lies in some band, not that every
+// kept node's voxels do, so contacts on the far side of a big L2 node were
+// never searched, silently. Same bug and same fix as the cluster runner
+// (twigcapture scripts/run_twigcapture_v2.py, "Coverage of each L2 node's
+// full extent"): on GT, 3.0% (Aedes) and 5.3% (BANC) of touching merge
+// sites lay outside every band; on a BANC FB4Z neuron the fix costs +25%
+// regions and +13% time.
+
+/** Out-of-band voxels are kept per cell of this size (supervoxel voxels). */
+export const COVERAGE_GRID: [number, number, number] = [4, 4, 2];
+/** Band shrink for a point to count as covered: cell size + contact reach. */
+export const COVERAGE_MARGIN: [number, number, number] = [5, 5, 3];
+
+/** Half-size of a region's search band, in supervoxel voxels. */
+export function bandHalf(): [number, number, number] {
+  const P = TWIG_PARAMS;
+  const s = P.cutout;
+  return [s[0] / 2 - P.border, s[1] / 2 - P.border, s[2] / 2 - P.border];
+}
+
+/** A region coord (bin units in xy, sections in z) -> its cutout centre. */
+export function regionCentre(
+  coord: [number, number, number],
+): [number, number, number] {
+  return [Math.floor(coord[0] / 2), Math.floor(coord[1] / 2), coord[2]];
+}
+
+/**
+ * Greedy extra centres (supervoxel voxels) so that every point lies in some
+ * centre's band, shrunk by `margin`. Points already covered by `centres`
+ * add nothing. Deterministic, as the runner: points are visited in
+ * lexicographic order and each new centre sits on the first one uncovered.
+ */
+export function coverageCentres(
+  points: [number, number, number][],
+  centres: [number, number, number][],
+  margin: [number, number, number] = COVERAGE_MARGIN,
+): [number, number, number][] {
+  const h = bandHalf().map((v, d) => v - margin[d]);
+  const inBand = (p: number[], c: number[]) =>
+    p.every((v, d) => v >= c[d] - h[d] && v < c[d] + h[d]);
+  const left = points
+    .filter((p) => !centres.some((c) => inBand(p, c)))
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
+  const out: [number, number, number][] = [];
+  let todo = left;
+  while (todo.length) {
+    const c = todo[0];
+    out.push(c);
+    todo = todo.filter((p) => !inBand(p, c));
+  }
+  return out;
 }
 
 /** A neuron's size before running: L2 nodes, and level-1 regions a run would search. */
