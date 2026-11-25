@@ -1097,7 +1097,9 @@ export class TwigSelectorTab extends Tab {
       status.classList.add("neuroglancer-twig-capture-tag");
       const p = item.progress;
       if (item.status === "running" && p) {
-        status.textContent = `${p.phase}${p.total ? ` ${p.done}/${p.total}` : ""} · ${p.patches} patches · ${p.found} found`;
+        status.textContent =
+          `${p.phase}${p.total ? ` ${p.done}/${p.total}` : ""} · ${p.patches} patches · ${p.found} found` +
+          (p.msPerPatch ? ` · model ${p.msPerPatch} ms/patch` : "");
       } else if (item.status === "failed") {
         status.classList.add("neuroglancer-twig-capture-tag-warn");
         status.textContent = "failed";

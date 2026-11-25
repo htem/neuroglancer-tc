@@ -156,28 +156,37 @@ export class MergeModel {
    * p(merge) for n patches packed in x ([n, 3, 18, 128, 128] float32).
    */
   async score(x: Float32Array, n: number): Promise<Float32Array> {
-    const p = new Float32Array(n);
     const per = 3 * PATCH_VOXELS;
-    for (let i = 0; i < n; i += this.batchSize) {
-      const m = Math.min(this.batchSize, n - i);
+    return this.scorePatches(
+      Array.from({ length: n }, (_, i) => x.subarray(i * per, (i + 1) * per)),
+    );
+  }
+
+  /** p(merge) for each patch ([3, 18, 128, 128] float32 each), one at a time. */
+  async scorePatches(patches: Float32Array[]): Promise<Float32Array> {
+    const p = new Float32Array(patches.length);
+    for (let i = 0; i < patches.length; ++i) {
       const t = new this.ort.Tensor(
         "float32",
-        x.subarray(i * per, (i + m) * per),
-        [m, 3, 18, 128, 128],
+        patches[i],
+        [1, 3, 18, 128, 128],
       );
       const out = await this.session.run({ x_local: t });
       const logits = out.logits.data as Float32Array;
-      for (let j = 0; j < m; ++j) {
-        const a = logits[2 * j];
-        const b = logits[2 * j + 1];
-        const mx = Math.max(a, b);
-        const ea = Math.exp(a - mx);
-        const eb = Math.exp(b - mx);
-        p[i + j] = eb / (ea + eb);
-      }
+      const a = logits[0];
+      const b = logits[1];
+      const mx = Math.max(a, b);
+      const ea = Math.exp(a - mx);
+      const eb = Math.exp(b - mx);
+      p[i] = eb / (ea + eb);
       t.dispose?.();
     }
     return p;
+  }
+
+  /** What scores the patches, for the result's benchmark block. */
+  get runtime() {
+    return `onnxruntime-web ${ORT_VERSION} (${this.backend})`;
   }
 
   async release() {

@@ -79,6 +79,45 @@ export interface Progress {
   total: number;
   patches: number;
   found: number;
+  /** Model time per patch so far (ms), once a patch has been scored. */
+  msPerPatch?: number;
+}
+
+/**
+ * Time spent per phase of a run, in ms. Phases can overlap once regions are
+ * pipelined (see runTwigCapture), so they need not sum to the wall time:
+ * each is the wall time that phase was busy, summed over its calls.
+ */
+export class PhaseTimer {
+  readonly ms: Record<string, number> = {};
+  readonly calls: Record<string, number> = {};
+  add(phase: string, ms: number) {
+    this.ms[phase] = (this.ms[phase] ?? 0) + ms;
+    this.calls[phase] = (this.calls[phase] ?? 0) + 1;
+  }
+  async time<T>(phase: string, f: () => Promise<T>): Promise<T> {
+    const t = performance.now();
+    try {
+      return await f();
+    } finally {
+      this.add(phase, performance.now() - t);
+    }
+  }
+  sync<T>(phase: string, f: () => T): T {
+    const t = performance.now();
+    try {
+      return f();
+    } finally {
+      this.add(phase, performance.now() - t);
+    }
+  }
+  /** Seconds per phase, rounded, for the result's benchmark block. */
+  seconds(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(this.ms))
+      out[k] = +(v / 1000).toFixed(2);
+    return out;
+  }
 }
 
 interface L2Attr {
@@ -172,6 +211,15 @@ async function getRoots(
   return out;
 }
 
+/** Regions whose supervoxel cutouts are fetched ahead of the one processed. */
+const PREFETCH_REGIONS = 2;
+/**
+ * Patches that may wait for the model behind the region being processed
+ * (~3.5 MB each, so ~450 MB). At least one region always waits, however
+ * large, so the model is never idle while a region is cut out.
+ */
+const MAX_QUEUED_PATCHES = 128;
+
 async function pool<T>(items: T[], n: number, f: (t: T) => Promise<void>) {
   let i = 0;
   await Promise.all(
@@ -215,6 +263,7 @@ export async function runTwigCapture(
     patches: 0,
     found: 0,
   };
+  const timer = new PhaseTimer();
   const report = () => onProgress({ ...prog });
   const check = () => {
     if (signal.aborted) throw new DOMException("cancelled", "AbortError");
@@ -260,10 +309,12 @@ export async function runTwigCapture(
     const seen = new Set<string>();
     keptL2 = new Set<bigint>();
     for (const r of roots) {
-      const leaves = await getLeavesL2(graph, r);
+      const leaves = await timer.time("l2_graph", () => getLeavesL2(graph, r));
       totalL2 += leaves.length;
       check();
-      const attrs = await getL2Attributes(graph, leaves);
+      const attrs = await timer.time("l2_graph", () =>
+        getL2Attributes(graph, leaves),
+      );
       check();
       for (const id of keptL2Ids(leaves, attrs, skipBackbone))
         keptL2.add(BigInt(id));
@@ -347,30 +398,85 @@ export async function runTwigCapture(
    * accepted are simulated by relabelling them), and new neighbours are
    * proposed with hop = `hop`.
    */
-  const processRegion = async (
-    coord: [number, number, number],
-    object: Set<bigint>,
-    hop: number,
-  ) => {
-    // Supervoxel cutout, 200 x 200 x 120 at [svNm, svNm, z] (bins are half
-    // a supervoxel voxel).
-    const g = [Math.floor(coord[0] / 2), Math.floor(coord[1] / 2), coord[2]];
-    const origin = [g[0] - s[0] / 2, g[1] - s[1] / 2, g[2] - s[2] / 2];
-    const svLab = (await ctx.sv.cutout(origin, s, signal)) as Uint32Array;
+  /**
+   * A region's supervoxel cutout, 200 x 200 x 120 at [svNm, svNm, z] (bins
+   * are half a supervoxel voxel), with the roots of its supervoxels in
+   * ctx.svRoot. Neither depends on what earlier regions found, so the next
+   * regions' are fetched while this one is processed and scored (see
+   * `prefetch`); the result is the same as fetching each in turn.
+   */
+  const fetchRegion = async (origin: number[]) => {
+    const svLab = (await timer.time("sv_cutout", () =>
+      ctx.sv.cutout(origin, s, signal),
+    )) as Uint32Array;
     check();
     const svIds = ctx.sv.idTable.ids;
     // Supervoxels -> roots (cached; sv roots do not change mid-run).
+    const tCpu = performance.now();
     const present = new Set<number>();
     for (let i = 0; i < svLab.length; ++i) present.add(svLab[i]);
     present.delete(0);
     const need = [...present]
       .map((l) => svIds[l])
       .filter((sv) => !ctx.svRoot.has(sv));
+    timer.add("sites", performance.now() - tCpu);
     if (need.length) {
-      const roots = await getRoots(graph, need);
+      const roots = await timer.time("sv_roots", () => getRoots(graph, need));
       need.forEach((sv, i) => ctx.svRoot.set(sv, roots[i]));
     }
+    return { svLab, present };
+  };
+  const originOf = (coord: [number, number, number]) => {
+    const g = [Math.floor(coord[0] / 2), Math.floor(coord[1] / 2), coord[2]];
+    return [g[0] - s[0] / 2, g[1] - s[1] / 2, g[2] - s[2] / 2];
+  };
+  const fetched = new Map<string, ReturnType<typeof fetchRegion>>();
+  /** Start fetching these regions (at most PREFETCH_REGIONS outstanding). */
+  const prefetch = (coords: [number, number, number][]) => {
+    for (const c of coords) {
+      if (fetched.size >= PREFETCH_REGIONS) break;
+      const key = c.join(",");
+      if (fetched.has(key)) continue;
+      const f = fetchRegion(originOf(c));
+      f.catch(() => {}); // surfaced when the region is processed
+      fetched.set(key, f);
+    }
+  };
+  const fetchedRegion = (coord: [number, number, number]) => {
+    const key = coord.join(",");
+    const f = fetched.get(key) ?? fetchRegion(originOf(coord));
+    fetched.delete(key);
+    return f;
+  };
+
+  // Scoring runs behind the regions: a region queues its patches and the
+  // next region is cut out while the model scores them. Results are applied
+  // in region order, exactly as if each region had waited for its scores.
+  // `queuedPairs` stands in for `best` for pairs queued but not yet applied,
+  // which is all a later region reads of `best` within a level.
+  let scoring: Promise<void> = Promise.resolve();
+  const scoringJobs: { done: Promise<void>; patches: number }[] = [];
+  let queuedPatches = 0;
+  const queuedPairs = new Map<string, number>();
+  const drainScoring = async () => {
+    await scoring;
+    scoringJobs.length = 0;
+    queuedPatches = 0;
     check();
+  };
+
+  const processRegion = async (
+    coord: [number, number, number],
+    object: Set<bigint>,
+    hop: number,
+  ) => {
+    const origin = originOf(coord);
+    const { svLab, present } = await timer.time("wait_cutout", () =>
+      fetchedRegion(coord),
+    );
+    check();
+    const svIds = ctx.sv.idTable.ids;
+    let tCpu = performance.now();
     const rootTable = new IdTable();
     const target = rootTable.get(rootBig);
     const svToRoot = new Map<number, number>();
@@ -383,14 +489,18 @@ export async function runTwigCapture(
       const l = svLab[i];
       if (l) rootLab[i] = svToRoot.get(l)!;
     }
+    timer.add("sites", performance.now() - tCpu);
     // Coverage: record this level's neuron voxels outside the search band.
     try {
-      await recordOutOfBand(svLab, rootLab, target, origin);
+      await timer.time("coverage", () =>
+        recordOutOfBand(svLab, rootLab, target, origin),
+      );
     } catch (e) {
       if ((e as any)?.name === "AbortError") throw e;
       coverageErrors++;
     }
     // Neighbours touching the (simulated) neuron in the centre box.
+    tCpu = performance.now();
     const { keep, rejects } = touchingLabelsCenter(rootLab, s, target, {
       border: P.border,
       minContact: P.minContactVoxels,
@@ -399,7 +509,7 @@ export async function runTwigCapture(
     });
     for (const [l, [why, ct, sz]] of rejects) {
       const id = String(rootTable.ids[l]);
-      if (!best.has(id))
+      if (!best.has(id) && !queuedPairs.has(id))
         reject(id, why, { contact_voxels: ct, cand_voxels: sz });
     }
     // A pair scored at an earlier level keeps that level's score.
@@ -407,19 +517,23 @@ export async function runTwigCapture(
       const b = best.get(String(rootTable.ids[l]));
       return !b || b.hop === hop;
     });
+    timer.add("sites", performance.now() - tCpu);
     // Candidate L2 sizes (cached per root), in parallel.
-    await pool(cands, 8, async (l) => {
-      const id = String(rootTable.ids[l]);
-      if (!ctx.l2Count.has(id)) {
-        try {
-          ctx.l2Count.set(id, (await getLeavesL2(graph, id)).length);
-        } catch {
-          ctx.l2Count.set(id, 0);
+    await timer.time("cand_l2", () =>
+      pool(cands, 8, async (l) => {
+        const id = String(rootTable.ids[l]);
+        if (!ctx.l2Count.has(id)) {
+          try {
+            ctx.l2Count.set(id, (await getLeavesL2(graph, id)).length);
+          } catch {
+            ctx.l2Count.set(id, 0);
+          }
         }
-      }
-    });
+      }),
+    );
     check();
     // Contact sites -> patches.
+    tCpu = performance.now();
     const built: SiteBuilt[] = [];
     const pending: Float32Array[] = [];
     const foundPerPair = new Map<string, number>();
@@ -530,8 +644,10 @@ export async function runTwigCapture(
       if (reason && !built.some((b) => b.pair === candId))
         reject(candId, reason, stats);
     }
+    timer.add("sites", performance.now() - tCpu);
     // EM for each built site; drop out-of-volume / empty windows.
     const scoreIdx: number[] = [];
+    const tEm = performance.now();
     await pool(
       built.map((_, i) => i),
       6,
@@ -572,6 +688,11 @@ export async function runTwigCapture(
         scoreIdx.push(i);
       },
     );
+    timer.add("em_cutout", performance.now() - tEm);
+    // In site order, not the order the EM cutouts happened to arrive in, so
+    // a run's result (down to the order of its rejected_candidates log, and
+    // ties between a pair's sites) does not depend on network timing.
+    scoreIdx.sort((a, b) => a - b);
     check();
     for (const b of built) {
       // As the runner: a site that could not be scored releases its claim,
@@ -588,26 +709,72 @@ export async function runTwigCapture(
         });
       }
     }
-    // Score, and keep the best site per pair (max over sites).
+    // Score, and keep the best site per pair (max over sites): queued
+    // behind the regions, applied in order (see `scoring`).
     if (scoreIdx.length) {
-      prog.phase = `level ${hop}: scoring on ${model.backend === "webgpu" ? "GPU" : "CPU"}`;
-      report();
-      const x = new Float32Array(scoreIdx.length * 3 * PATCH_VOXELS);
-      scoreIdx.forEach((i, k) => x.set(pending[i], k * 3 * PATCH_VOXELS));
-      const p = await model.score(x, scoreIdx.length);
-      prog.patches += scoreIdx.length;
-      scoreIdx.forEach((i, k) => {
-        const b = built[i];
-        const prev = best.get(b.pair);
-        const scored = (prev?.scored ?? 0) + 1;
-        const found = Math.max(prev?.found ?? 0, foundPerPair.get(b.pair) ?? 0);
-        if (!prev || p[k] > prev.p)
-          best.set(b.pair, { ...b, p: p[k], found, scored, hop });
-        else Object.assign(prev, { found, scored });
+      // The patches themselves, not a packed copy: a queued region holds
+      // ~3.5 MB a patch until it is scored.
+      const patches = scoreIdx.map((i) => pending[i]);
+      const pairs = scoreIdx.map((i) => built[i].pair);
+      for (const id of pairs)
+        queuedPairs.set(id, (queuedPairs.get(id) ?? 0) + 1);
+      // Bound what waits for the model (memory), oldest region first.
+      while (
+        scoringJobs.length &&
+        queuedPatches + patches.length > MAX_QUEUED_PATCHES
+      ) {
+        const job = scoringJobs.shift()!;
+        await job.done;
+        queuedPatches -= job.patches;
+      }
+      queuedPatches += patches.length;
+      scoring = scoring.then(async () => {
+        try {
+          check();
+          prog.phase = `level ${hop}: scoring on ${model.backend === "webgpu" ? "GPU" : "CPU"}`;
+          report();
+          const p = await timer.time("model", () =>
+            model.scorePatches(patches),
+          );
+          patches.length = 0;
+          prog.patches += scoreIdx.length;
+          prog.msPerPatch = +(timer.ms.model / prog.patches).toFixed(1);
+          scoreIdx.forEach((i, k) => {
+            const b = built[i];
+            const prev = best.get(b.pair);
+            const scored = (prev?.scored ?? 0) + 1;
+            const found = Math.max(
+              prev?.found ?? 0,
+              foundPerPair.get(b.pair) ?? 0,
+            );
+            if (!prev || p[k] > prev.p)
+              best.set(b.pair, { ...b, p: p[k], found, scored, hop });
+            else Object.assign(prev, { found, scored });
+          });
+          prog.found = [...best.values()].filter(
+            (b) => b.p > P.reportThreshold,
+          ).length;
+          report();
+        } catch (e) {
+          // As a region whose scoring failed before: counted, logged, and
+          // the run goes on. A cancel stops the run when drained.
+          if ((e as any)?.name !== "AbortError") {
+            regionErrors++;
+            logEvent(
+              "warn",
+              `region ${coord.join(",")} (level ${hop}) scoring failed`,
+              e,
+            );
+          }
+        } finally {
+          for (const id of pairs) {
+            const n = queuedPairs.get(id)! - 1;
+            if (n) queuedPairs.set(id, n);
+            else queuedPairs.delete(id);
+          }
+        }
       });
-      prog.found = [...best.values()].filter(
-        (b) => b.p > P.reportThreshold,
-      ).length;
+      scoringJobs.push({ done: scoring, patches: scoreIdx.length });
     }
   };
 
@@ -639,10 +806,13 @@ export async function runTwigCapture(
       prog.done++;
       report();
     };
-    for (const coord of regions) {
+    for (let r = 0; r < regions.length; ++r) {
       prog.phase = `level ${hop}: regions`;
-      await search(coord);
+      prefetch(regions.slice(r, r + 1 + PREFETCH_REGIONS));
+      await search(regions[r]);
     }
+    // Coverage reads only what the regions themselves recorded, so the
+    // scoring queue need not drain first; it drains before the next level.
     // Coverage, part 2: extra regions on whatever part of a searched L2 node
     // no band covered, then the same check on those, up to coveragePasses.
     // Contact sites are claimed per site, so overlap adds no duplicates.
@@ -661,14 +831,19 @@ export async function runTwigCapture(
       const extra = coverageCentres(pts, centres);
       if (!extra.length) break;
       prog.total += extra.length;
-      for (const c of extra) {
-        centres.push(c);
+      const coords = extra.map(
+        (c) => [c[0] * 2, c[1] * 2, c[2]] as [number, number, number],
+      );
+      for (let r = 0; r < extra.length; ++r) {
+        centres.push(extra[r]);
         coverageRegions++;
         regionsTotal++;
         prog.phase = `level ${hop}: coverage`;
-        await search([c[0] * 2, c[1] * 2, c[2]]);
+        prefetch(coords.slice(r, r + 1 + PREFETCH_REGIONS));
+        await search(coords[r]);
       }
     }
+    await drainScoring();
     frontier = [...best.entries()]
       .filter(([, b]) => b.hop === hop && b.p >= opts.chainThreshold)
       .map(([id]) => id);
@@ -756,6 +931,13 @@ export async function runTwigCapture(
     benchmark: {
       total_seconds: +((performance.now() - t0) / 1000).toFixed(1),
       patches_scored: prog.patches,
+      // Busy seconds per phase (see PhaseTimer); "sites" is the CPU work of
+      // a region between its cutouts: roots -> labels, contacts, masks.
+      phase_seconds: timer.seconds(),
+      model_ms_per_patch: prog.patches
+        ? +((timer.ms.model ?? 0) / prog.patches).toFixed(1)
+        : null,
+      model_runtime: model.runtime,
       region_errors: regionErrors,
       coverage_regions: coverageRegions,
       coverage_errors: coverageErrors,
