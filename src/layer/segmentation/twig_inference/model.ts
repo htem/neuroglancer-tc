@@ -175,7 +175,7 @@ export class MergeModel {
   /** What scores the patches, for the result's benchmark block. */
   get runtime() {
     if (this.gpu)
-      return `twig-capture webgpu r3d (Coda-derived) on ${this.gpu.adapter}`;
+      return `twig-capture webgpu r3d (Coda-derived${this.gpu.frugal ? ", unrolled" : ""}) on ${this.gpu.adapter}`;
     return `onnxruntime-web ${ORT_VERSION} (${this.backend}${this.worker ? ", worker" : ""})`;
   }
 
@@ -183,6 +183,8 @@ export class MergeModel {
     modelUrl: string,
     backend: Backend,
     onProgress?: (msg: string) => void,
+    /** Force the Firefox shader form on or off (measuring only). */
+    frugal?: boolean,
   ): Promise<MergeModel> {
     const bytes = await getModelBytes(modelUrl, onProgress);
     const useGpu =
@@ -190,7 +192,7 @@ export class MergeModel {
       backend === "webgpu-ort" ||
       (backend === "auto" && (await webgpuAvailable()));
     if (useGpu && backend !== "webgpu-ort") {
-      const gpu = await openGpuNetwork(modelUrl, bytes, onProgress);
+      const gpu = await openGpuNetwork(modelUrl, bytes, onProgress, frugal);
       if (gpu) return new MergeModel(undefined, undefined, "webgpu", gpu);
     }
     if (!useGpu) {
@@ -304,12 +306,16 @@ async function openGpuNetwork(
   modelUrl: string,
   bytes: ArrayBuffer,
   onProgress?: (msg: string) => void,
+  frugal?: boolean,
 ): Promise<R3dNetwork | undefined> {
   let net: R3dNetwork | undefined;
   try {
     onProgress?.("starting model on GPU (WebGPU)…");
-    net = await R3dNetwork.build(r3dPlan(readOnnx(new Uint8Array(bytes))));
-    const key = `gpuParity:v1:${modelUrl}:${net.adapter}`;
+    net = await R3dNetwork.build(r3dPlan(readOnnx(new Uint8Array(bytes))), {
+      frugal,
+    });
+    const key =
+      `gpuParity:v1:${modelUrl}:${net.adapter}` + (net.frugal ? ":frugal" : "");
     let verdict = await idbGet<{ ok: boolean; maxDp: number }>(CACHE, key);
     if (!verdict) {
       onProgress?.("checking the GPU model against ONNX Runtime (once)…");
@@ -358,6 +364,7 @@ async function openGpuNetwork(
  * the WebGPU network `.gpu.profile(patch)`.
  */
 (globalThis as any).twigCaptureModel = {
-  open: (url: string, backend: Backend) => MergeModel.create(url, backend),
+  open: (url: string, backend: Backend, frugal?: boolean) =>
+    MergeModel.create(url, backend, undefined, frugal),
   parityPatches,
 };

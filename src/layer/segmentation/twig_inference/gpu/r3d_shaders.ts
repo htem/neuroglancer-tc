@@ -54,6 +54,15 @@
  * workgroups, each writing a partial sum, and a second pass (`reduceShader`)
  * adds them and applies the epilogue. WGSL has no float atomics.
  *
+ * ## Two forms for two shader translators
+ *
+ * Firefox's translator (on a Mac, where Coda measured it) charges for every
+ * loop iteration; Chrome's does not. So the 16-step inner loop can be
+ * written out (`ConvForm.unrolled`, Coda §18), chosen by `frugalShaders`.
+ * Both forms add the same terms in the same order, so the logits are equal
+ * to the bit. Coda's other Firefox change (a packed stem) belongs to its
+ * sparse stem, which this network does not have.
+ *
  * ## The epilogue
  *
  * Batch norm is folded into each conv's bias by the export, so after a conv
@@ -167,11 +176,35 @@ function epilogue(step: ConvStep): string {
   return lines.join("\n    ");
 }
 
+/** How a convolution is written; neither form changes a sum. */
+export interface ConvForm {
+  /** The inner loop's 16 steps written out (Firefox on a Mac). */
+  readonly unrolled?: boolean;
+}
+
+/**
+ * Firefox on a Mac, by name (Coda's `frugalShaders`): its translator
+ * charges for loop iterations, measured there; elsewhere the plain form.
+ */
+export function frugalShaders(
+  agent = globalThis.navigator?.userAgent,
+): boolean {
+  return (
+    typeof agent === "string" &&
+    agent.includes("Firefox/") &&
+    agent.includes("Macintosh")
+  );
+}
+
 /**
  * The convolution. Bindings: 0 input, 1 weights, 2 output (or partial sums
  * when split), 3 the bias, and 4 the residual, both only when not split.
  */
-export function convShader(step: ConvStep, layout: ConvLayout): string {
+export function convShader(
+  step: ConvStep,
+  layout: ConvLayout,
+  form: ConvForm = {},
+): string {
   const { k, chunks, splits } = layout;
   const [D, H, W] = step.inShape;
   const [OD, OH, OW] = step.outShape;
@@ -226,6 +259,20 @@ export function convShader(step: ConvStep, layout: ConvLayout): string {
       Bs[r * ${u(TILE_N)} + nn] = select(0.0, inp[ci * ${u(vi)} + base], inb && kidx < ${u(k)});
     }`;
 
+  const reductionStep = (
+    r: string,
+  ) => `${rows((i) => `      let a${i} = As[${r} * ${u(TILE_M)} + tm + ${u(i * MB)}];`)}
+${cols((j) => `      let b${j} = Bs[${r} * ${u(TILE_N)} + tn + ${u(j * NB)}];`)}
+${both((i, j) => `      acc${i}_${j} = fma(a${i}, b${j}, acc${i}_${j});`)}`;
+  const inner = form.unrolled
+    ? Array.from(
+        { length: TILE_K },
+        (_, r) => `    {\n${reductionStep(u(r))}\n    }`,
+      ).join("\n")
+    : `    for (var r = 0u; r < ${u(TILE_K)}; r++) {
+${reductionStep("r")}
+    }`;
+
   const write = (r: number, s: number) => {
     const m = `(m0 + tm + ${u(r * MB)})`;
     const n = `(n0 + tn + ${u(s * NB)})`;
@@ -276,11 +323,7 @@ ${both((r, s) => `  var acc${r}_${s} = 0.0;`)}
       As[e] = wt[a0 + (e / ${u(TILE_M)}) * ${u(step.cout)} + e % ${u(TILE_M)}];
     }
     workgroupBarrier();
-    for (var r = 0u; r < ${u(TILE_K)}; r++) {
-${rows((i) => `      let a${i} = As[r * ${u(TILE_M)} + tm + ${u(i * MB)}];`)}
-${cols((j) => `      let b${j} = Bs[r * ${u(TILE_N)} + tn + ${u(j * NB)}];`)}
-${both((i, j) => `      acc${i}_${j} = fma(a${i}, b${j}, acc${i}_${j});`)}
-    }
+${inner}
     workgroupBarrier();
   }
 ${both(write)}

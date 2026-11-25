@@ -37,6 +37,7 @@ import {
   convLayout,
   convShader,
   convWeightLayout,
+  frugalShaders,
   headShader,
   reduceShader,
 } from "#src/layer/segmentation/twig_inference/gpu/r3d_shaders.js";
@@ -214,6 +215,32 @@ describe("shaders", () => {
         expect(reduceShader(c, L.splits)).not.toMatch(/undefined|NaN/);
     }
     expect(headShader(plan.head)).not.toMatch(/undefined|NaN/);
+  });
+  it("writes the inner loop out in the Firefox form, the same terms in order", () => {
+    const c = plan.convs[1];
+    const L = convLayout(c);
+    const plain = convShader(c, L);
+    const unrolled = convShader(c, L, { unrolled: true });
+    expect(plain).toContain("for (var r = 0u; r < 16u; r++)");
+    expect(unrolled).not.toContain("for (var r = 0u");
+    // Every fma of the plain loop body appears once per step, in order.
+    const fmas = (code: string) => code.match(/acc\d_\d = fma/g)!.length;
+    expect(fmas(unrolled)).toBe(16 * fmas(plain));
+    expect(unrolled.indexOf("As[0u *")).toBeLessThan(
+      unrolled.indexOf("As[15u *"),
+    );
+  });
+  it("detects Firefox on a Mac only", () => {
+    const mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:160.0)";
+    expect(frugalShaders(`${mac} Gecko/20100101 Firefox/160.0`)).toBe(true);
+    expect(
+      frugalShaders(`${mac} AppleWebKit/537.36 Chrome/157.0 Safari/537.36`),
+    ).toBe(false);
+    expect(
+      frugalShaders(
+        "Mozilla/5.0 (Windows NT 10.0; rv:160.0) Gecko/20100101 Firefox/160.0",
+      ),
+    ).toBe(false);
   });
 });
 

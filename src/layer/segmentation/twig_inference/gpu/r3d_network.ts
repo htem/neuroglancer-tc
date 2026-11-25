@@ -52,6 +52,7 @@ import {
   convWeightFloats,
   convWeightLayout,
   FLAT,
+  frugalShaders,
   headShader,
   headWeights,
   reduceShader,
@@ -130,12 +131,31 @@ export class R3dNetwork {
 
   /** GPU memory held, in bytes: weights and every intermediate. */
   readonly bytes: number;
+  /** Built in the Firefox form (`frugalShaders`). */
+  frugal = false;
 
-  static async build(plan: R3dPlan, opts: { splitTarget?: number } = {}) {
+  /**
+   * `frugal`: the Firefox form of the shaders (unrolled inner loop), by
+   * default where `frugalShaders` says so. The logits are the same either way.
+   */
+  static async build(
+    plan: R3dPlan,
+    opts: { splitTarget?: number; frugal?: boolean } = {},
+  ) {
     const { device, adapter } = await r3dDevice();
     const owned: any[] = [];
+    const frugal = opts.frugal ?? frugalShaders();
     try {
-      return await assemble(device, adapter, plan, owned, opts.splitTarget);
+      const net = await assemble(
+        device,
+        adapter,
+        plan,
+        owned,
+        opts.splitTarget,
+        frugal,
+      );
+      net.frugal = frugal;
+      return net;
     } catch (e) {
       for (const b of owned) b.destroy();
       device.destroy();
@@ -266,6 +286,7 @@ async function assemble(
   plan: R3dPlan,
   owned: any[],
   splitTarget?: number,
+  frugal = false,
 ): Promise<R3dNetwork> {
   const limit = device.limits.maxStorageBufferBindingSize;
   const buffer = (bytes: number, mapped = false) => {
@@ -356,7 +377,7 @@ async function assemble(
       throw new Error(`${c.name}: an input is not computed before it`);
     const out = take(c.cout * voxelsOf(c.outShape) * 4);
     tensors.set(c.output, out);
-    const conv = await pipeline(convShader(c, L));
+    const conv = await pipeline(convShader(c, L, { unrolled: frugal }));
     if (L.splits === 1) {
       dispatches.push({
         name: c.name,
