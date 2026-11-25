@@ -248,7 +248,9 @@ export class DatasetContext {
       dataset.supervoxelResolution,
       48,
     );
-    this.em = new PrecomputedVolume(dataset.emUrl, dataset.emResolution, 512);
+    // 1,024 chunks (~270 MB of 128x128x16 uint8): room for the region being
+    // scored and the next one's prefetched EM (see prepareRegion).
+    this.em = new PrecomputedVolume(dataset.emUrl, dataset.emResolution, 1024);
   }
 }
 
@@ -325,11 +327,31 @@ const EM_CONCURRENCY = 12;
 /** Regions whose supervoxel cutouts are fetched ahead of the one processed. */
 const PREFETCH_REGIONS = 2;
 /**
- * Patches that may wait for the model behind the region being processed
- * (~3.5 MB each, so ~450 MB). At least one region always waits, however
- * large, so the model is never idle while a region is cut out.
+ * Patches that may wait for the model behind the region being processed,
+ * kept as bytes (~0.9 MB each, so ~450 MB). At least one region always
+ * waits, however large. Was 128 float patches (~1 region), which made the
+ * next region wait for the model before queueing and left the GPU idle
+ * while its EM arrived.
  */
-const MAX_QUEUED_PATCHES = 128;
+const MAX_QUEUED_PATCHES = 512;
+
+/** A patch as bytes: EM (0-255) then the two masks (0 or 1). */
+function packPatch(em: Uint8Array, x: Float32Array): Uint8Array {
+  const v = PATCH_VOXELS;
+  const out = new Uint8Array(3 * v);
+  out.set(em, 0);
+  for (let k = v; k < 3 * v; ++k) out[k] = x[k];
+  return out;
+}
+
+/** The model's floats for a packed patch, as the pipeline always wrote them. */
+function unpackPatch(b: Uint8Array): Float32Array {
+  const v = PATCH_VOXELS;
+  const x = new Float32Array(3 * v);
+  for (let k = 0; k < v; ++k) x[k] = (b[k] / 255) * 2 - 1;
+  for (let k = v; k < 3 * v; ++k) x[k] = b[k];
+  return x;
+}
 
 async function pool<T>(items: T[], n: number, f: (t: T) => Promise<void>) {
   let i = 0;
@@ -713,6 +735,27 @@ export async function runTwigCapture(
       }),
     );
     timer.add("contacts", performance.now() - tCpu);
+    // Prefetch the EM under every site found here into the chunk cache, so
+    // it arrives while the previous region is still finishing. Which sites
+    // are scored is decided later, in region order (claims); this only
+    // warms the cache, so the result cannot change. em_overflow sites are
+    // skipped, as finishRegion skips them.
+    for (const sites of sitesFor.values())
+      for (const [, centroid] of sites) {
+        const c = centroid.map((v) => Math.trunc(v));
+        const e = [
+          (origin[0] + c[0]) * emPerSv,
+          (origin[1] + c[1]) * emPerSv,
+          origin[2] + c[2],
+        ];
+        const lo = [e[0] - 64, e[1] - 64, e[2] - 9];
+        if (
+          lo.some((v, d) => v < emOff[d]) ||
+          lo.some((v, d) => v + [128, 128, 18][d] > emOff[d] + emSize[d])
+        )
+          continue;
+        ctx.em.prefetch(lo, [128, 128, 18]);
+      }
     return {
       origin,
       svLab,
@@ -747,7 +790,7 @@ export async function runTwigCapture(
     // Contact sites -> patches.
     const built: SiteBuilt[] = [];
     const pending: Float32Array[] = [];
-
+    const compact: Uint8Array[] = [];
     const foundPerPair = new Map<string, number>();
     for (const l of cands) {
       const candId = String(rootTable.ids[l]);
@@ -890,7 +933,10 @@ export async function runTwigCapture(
             x.subarray(2 * PATCH_VOXELS),
           ),
         );
-        for (let k = 0; k < em.length; ++k) x[k] = (em[k] / 255) * 2 - 1;
+        // Kept as bytes until scored (see `compact`): the EM byte and the two
+        // 0/1 masks, a quarter of the floats' memory.
+        compact[i] = packPatch(em, x);
+        pending[i] = undefined as any;
         scoreIdx.push(i);
       });
       timer.add("em_cutout", performance.now() - tEm);
@@ -920,7 +966,7 @@ export async function runTwigCapture(
       if (scoreIdx.length) {
         // The patches themselves, not a packed copy: a queued region holds
         // ~3.5 MB a patch until it is scored.
-        const patches = scoreIdx.map((i) => pending[i]);
+        const patches = scoreIdx.map((i) => compact[i]);
         const pairs = scoreIdx.map((i) => built[i].pair);
         for (const id of pairs)
           queuedPairs.set(id, (queuedPairs.get(id) ?? 0) + 1);
@@ -941,8 +987,17 @@ export async function runTwigCapture(
             check();
             prog.phase = `level ${hop}: scoring on ${model.backend === "webgpu" ? "GPU" : "CPU"}`;
             report();
+            // Expanded to the model's floats 16 at a time, just before
+            // scoring: the same values the floats held (unpackPatch).
             const p = await timer.time("model", () =>
-              tl.around("gpu", () => model.scorePatches(patches)),
+              tl.around("gpu", async () => {
+                const out = new Float32Array(patches.length);
+                for (let k = 0; k < patches.length; k += 16) {
+                  const part = patches.slice(k, k + 16).map(unpackPatch);
+                  out.set(await model.scorePatches(part), k);
+                }
+                return out;
+              }),
             );
             waitingPatches -= scoreIdx.length;
             tl.setQueue(waitingPatches);

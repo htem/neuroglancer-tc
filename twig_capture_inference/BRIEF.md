@@ -140,6 +140,18 @@ needed.
 
 See PR #2 for the numbers.
 
+**Round 4: scheduling (2026-11-25).**
+- Every result's `benchmark.timeline` says how long the GPU was idle and
+  what it waited for.
+- BANC's S3 requests are spread over three equivalent hostnames
+  (HTTP/1.1, 6 connections each).
+- The next region's EM is prefetched into a 1,024-chunk cache.
+- Queued patches are kept as bytes, so 512 can wait for the model
+  (~450 MB).
+
+Aedes N=1 runs in 157 s (was 174), with GPU idle 13% (was 28%). See
+PR #2.
+
 **Firefox form.** The unrolled inner loop (Coda §18) is built for Firefox
 on a Mac and is bit-identical (forced in Chrome: same p on 24 patches). It
 is not measured in Firefox: release Firefox 141 on macOS has no WebGPU, so
