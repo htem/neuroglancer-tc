@@ -1016,6 +1016,7 @@ export async function runTwigCapture(
     connectivity: 3,
     contact_gap_voxels: gap,
     contact_gap_mode: gapMode,
+    model_precision: model.precision,
     decision_rule: "raw_local_prob",
     merge_threshold: P.reportThreshold,
     level: opts.level,

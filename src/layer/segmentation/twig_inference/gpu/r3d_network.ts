@@ -46,14 +46,21 @@
  */
 
 import type { R3dPlan } from "#src/layer/segmentation/twig_inference/gpu/r3d_plan.js";
+import type {
+  Precision,
+  Tile,
+} from "#src/layer/segmentation/twig_inference/gpu/r3d_shaders.js";
 import {
   convLayout,
   convShader,
   convWeightFloats,
   convWeightLayout,
   FLAT,
+  DEFAULT_TILE,
+  F32,
   frugalShaders,
   headShader,
+  toHalfBits,
   headWeights,
   reduceShader,
   voxelsOf,
@@ -83,14 +90,20 @@ export interface StepTiming {
 }
 
 /** A high-performance WebGPU device with the adapter's buffer limits. */
-export async function r3dDevice(): Promise<{ device: any; adapter: string }> {
+export async function r3dDevice(
+  features: string[] = [],
+): Promise<{ device: any; adapter: string }> {
   const gpu = (navigator as any).gpu;
   if (!gpu) throw new Error("this browser offers no WebGPU");
   const adapter = await gpu.requestAdapter({
     powerPreference: "high-performance",
   });
   if (!adapter) throw new Error("WebGPU offered no adapter");
+  const missing = features.filter((f) => !adapter.features.has(f));
+  if (missing.length)
+    throw new Error(`this GPU lacks WebGPU feature(s) ${missing.join(", ")}`);
   const device = await adapter.requestDevice({
+    requiredFeatures: features,
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
@@ -133,6 +146,8 @@ export class R3dNetwork {
   readonly bytes: number;
   /** Built in the Firefox form (`frugalShaders`). */
   frugal = false;
+  precision: Precision = F32;
+  tile: Tile = DEFAULT_TILE;
 
   /**
    * `frugal`: the Firefox form of the shaders (unrolled inner loop), by
@@ -140,9 +155,16 @@ export class R3dNetwork {
    */
   static async build(
     plan: R3dPlan,
-    opts: { splitTarget?: number; frugal?: boolean } = {},
+    opts: {
+      splitTarget?: number;
+      frugal?: boolean;
+      precision?: Precision;
+      tile?: Tile;
+    } = {},
   ) {
-    const { device, adapter } = await r3dDevice();
+    const precision = opts.precision ?? F32;
+    const f16 = precision.store === "f16" || precision.math === "f16";
+    const { device, adapter } = await r3dDevice(f16 ? ["shader-f16"] : []);
     const owned: any[] = [];
     const frugal = opts.frugal ?? frugalShaders();
     try {
@@ -153,8 +175,12 @@ export class R3dNetwork {
         owned,
         opts.splitTarget,
         frugal,
+        precision,
+        opts.tile ?? DEFAULT_TILE,
       );
       net.frugal = frugal;
+      net.precision = precision;
+      net.tile = opts.tile ?? DEFAULT_TILE;
       return net;
     } catch (e) {
       for (const b of owned) b.destroy();
@@ -287,7 +313,11 @@ async function assemble(
   owned: any[],
   splitTarget?: number,
   frugal = false,
+  precision: Precision = F32,
+  tile: Tile = DEFAULT_TILE,
 ): Promise<R3dNetwork> {
+  /** Bytes per stored activation or weight. */
+  const SB = precision.store === "f16" ? 2 : 4;
   const limit = device.limits.maxStorageBufferBindingSize;
   const buffer = (bytes: number, mapped = false) => {
     if (bytes > limit)
@@ -306,6 +336,14 @@ async function assemble(
   const filled = (floats: number, fill: (into: Float32Array) => void) => {
     const b = buffer(floats * 4, true);
     fill(new Float32Array(b.getMappedRange(), 0, floats));
+    b.unmap();
+    return b;
+  };
+  /** A new buffer of these values as f16, through its mapped range. */
+  const halves = (a: Float32Array<ArrayBufferLike>) => {
+    const b = buffer(a.length * 2, true);
+    const into = new Uint16Array(b.getMappedRange(), 0, a.length);
+    for (let i = 0; i < a.length; ++i) into[i] = toHalfBits(a[i]);
     b.unmap();
     return b;
   };
@@ -332,7 +370,7 @@ async function assemble(
     free.set(b.size, list);
   };
 
-  const layouts = plan.convs.map((c) => convLayout(c, splitTarget));
+  const layouts = plan.convs.map((c) => convLayout(c, splitTarget, tile));
   const partialBytes = Math.max(
     4,
     ...plan.convs.map((c, i) =>
@@ -367,17 +405,22 @@ async function assemble(
   for (let i = 0; i < plan.convs.length; ++i) {
     const c = plan.convs[i];
     const L = layouts[i];
-    const wbuf = filled(convWeightFloats(c, L), (into) =>
-      convWeightLayout(c, L, c.weight(), into),
-    );
+    const wbuf =
+      SB === 4
+        ? filled(convWeightFloats(c, L), (into) =>
+            convWeightLayout(c, L, c.weight(), into),
+          )
+        : halves(convWeightLayout(c, L, c.weight()));
     const bias = upload(c.bias);
     const inp = tensors.get(c.input);
     const res = c.residual ? tensors.get(c.residual) : undefined;
     if (!inp || (c.residual && !res))
       throw new Error(`${c.name}: an input is not computed before it`);
-    const out = take(c.cout * voxelsOf(c.outShape) * 4);
+    const out = take(c.cout * voxelsOf(c.outShape) * SB);
     tensors.set(c.output, out);
-    const conv = await pipeline(convShader(c, L, { unrolled: frugal }));
+    const conv = await pipeline(
+      convShader(c, L, { unrolled: frugal, precision }),
+    );
     if (L.splits === 1) {
       dispatches.push({
         name: c.name,
@@ -395,7 +438,7 @@ async function assemble(
         group: bind(conv, [inp, wbuf, partial]),
         groups: L.groups,
       });
-      const red = await pipeline(reduceShader(c, L.splits));
+      const red = await pipeline(reduceShader(c, L.splits, precision));
       dispatches.push({
         name: `${c.name} sum`,
         pipeline: red,
@@ -417,7 +460,7 @@ async function assemble(
   const head = plan.head;
   const headIn = tensors.get(head.input);
   const logits = buffer(8);
-  const hp = await pipeline(headShader(head));
+  const hp = await pipeline(headShader(head, precision));
   dispatches.push({
     name: "head",
     pipeline: hp,

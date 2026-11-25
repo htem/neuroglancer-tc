@@ -46,6 +46,7 @@ import {
 } from "#src/layer/segmentation/twig_inference/diagnostics.js";
 import type { Backend } from "#src/layer/segmentation/twig_inference/model.js";
 import {
+  F16_STORAGE,
   MergeModel,
   putLocalModel,
   webgpuAvailable,
@@ -84,6 +85,9 @@ export interface SelectorSettings {
   l2LimitVersion?: number;
   /** contact_gap_voxels: 0 (touching only), 1 (default) or 2. */
   contactGap: number;
+  /** The WebGPU network's storage precision: "f32" (default) or "f16". */
+  gpuPrecision: "f32" | "f16";
+
   backend: Backend;
   modelUrl: string;
 }
@@ -97,6 +101,8 @@ const DEFAULT_SETTINGS: SelectorSettings = {
   maxCandidateL2: NO_L2_LIMIT,
   l2LimitVersion: 2,
   contactGap: TWIG_PARAMS.contactGap,
+  gpuPrecision: "f32",
+
   backend: "auto",
   modelUrl: DEFAULT_MODEL_URL,
 };
@@ -431,6 +437,12 @@ export class TwigSelectorState {
     if ((x.filters?.max_candidate_l2_nodes ?? 20) < want.maxCandidateL2) {
       return undefined;
     }
+    // Scored at another GPU precision.
+    if (
+      (x.model_precision ?? "f32") !== st.gpuPrecision &&
+      x.benchmark?.device === "webgpu"
+    )
+      return undefined;
     // Searched with another contact gap: a different candidate set.
     if ((x.contact_gap_voxels ?? 0) !== st.contactGap) return undefined;
     if (
@@ -528,7 +540,7 @@ export class TwigSelectorState {
         this.changed.dispatch();
         try {
           const st = this.settings;
-          const key = `${st.modelUrl}|${st.backend}`;
+          const key = `${st.modelUrl}|${st.backend}|${st.gpuPrecision}`;
           if (this.model?.key !== key) {
             await this.model?.model.release();
             this.model = undefined;
@@ -539,6 +551,8 @@ export class TwigSelectorState {
                 item.progress = { ...item.progress!, phase: msg };
                 this.changed.dispatch();
               },
+              undefined,
+              st.gpuPrecision === "f16" ? { precision: F16_STORAGE } : {},
             );
             this.model = { key, model };
           }
@@ -559,6 +573,7 @@ export class TwigSelectorState {
               maxSites: plan.maxSites,
               maxCandidateL2: plan.maxCandidateL2,
               contactGap: st.contactGap,
+
               modelUrl: st.modelUrl,
             },
             (p) => {
@@ -1000,6 +1015,28 @@ export class TwigSelectorTab extends Tab {
         'across a thin gap become candidates; they are tagged "gap" in Twig ' +
         "Capture, and are less reliable than touching ones. 0 is the old " +
         "touching-only search.",
+    );
+    const precSel = document.createElement("select");
+    for (const [v, label] of [
+      ["f32", "f32 (exact)"],
+      ["f16", "f16 (faster)"],
+    ] as const) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = label;
+      precSel.appendChild(o);
+    }
+    precSel.value = st.gpuPrecision;
+    precSel.addEventListener("change", () => {
+      st.gpuPrecision = precSel.value as "f32" | "f16";
+      state.saveSettings();
+    });
+    field(
+      "GPU precision",
+      precSel,
+      "f16 stores the WebGPU network's activations and weights as half floats " +
+        "(arithmetic stays f32): ~1.4x faster on an Apple M1 Max, with p within " +
+        "~1e-4 of f32. Needs a GPU with shader-f16; otherwise f32 is used.",
     );
     const backend = document.createElement("select");
     for (const [v, label] of [

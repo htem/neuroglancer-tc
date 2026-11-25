@@ -75,16 +75,76 @@ import type {
   HeadStep,
 } from "#src/layer/segmentation/twig_inference/gpu/r3d_plan.js";
 
-/** Output channels a workgroup computes. Every width in the network is a multiple. */
-const TILE_M = 64;
-/** Voxels a workgroup computes. */
-const TILE_N = 64;
-/** Output channels and voxels a thread computes. */
-const PER_M = 8;
-const PER_N = 4;
-/** Reduction terms a tile holds. */
-export const TILE_K = 16;
-const THREADS = (TILE_M / PER_M) * (TILE_N / PER_N);
+/**
+ * A convolution's tile: output channels (m) and voxels (n) a workgroup
+ * computes, per thread (perM x perN), and reduction terms a tile holds (k).
+ */
+export interface Tile {
+  readonly m: number;
+  readonly n: number;
+  readonly perM: number;
+  readonly perN: number;
+  readonly k: number;
+}
+/** Coda's tile, the fastest of five it swept on an M3 Max. */
+export const DEFAULT_TILE: Tile = { m: 64, n: 64, perM: 8, perN: 4, k: 16 };
+/** Reduction terms a tile holds, in the default tile. */
+export const TILE_K = DEFAULT_TILE.k;
+
+/** Whether this generator can write a tile (whole loads per thread). */
+export function tileValid(t: Tile): boolean {
+  const threads = (t.m / t.perM) * (t.n / t.perN);
+  return (
+    Number.isInteger(threads) &&
+    threads <= 256 &&
+    (t.k * t.n) % threads === 0 &&
+    (t.k * t.m) % threads === 0 &&
+    threads % t.n === 0 &&
+    64 % t.m === 0
+  );
+}
+
+/**
+ * Storage and arithmetic types. "f16" needs the adapter's shader-f16
+ * feature. The patch, partial sums, biases and the head stay f32.
+ */
+export interface Precision {
+  readonly store: "f32" | "f16";
+  readonly math: "f32" | "f16";
+}
+export const F32: Precision = { store: "f32", math: "f32" };
+
+/** f32 -> f16 bits, rounding to nearest even (IEEE 754 binary16). */
+export function toHalfBits(f: number): number {
+  const x = new Uint32Array(new Float32Array([f]).buffer)[0];
+  const sign = (x >>> 16) & 0x8000;
+  const e = (x >>> 23) & 0xff;
+  let m = x & 0x7fffff;
+  if (e === 0xff) return sign | 0x7c00 | (m ? 0x200 : 0);
+  let he = e - 127 + 15;
+  if (he >= 0x1f) return sign | 0x7c00;
+  if (he <= 0) {
+    if (he < -10) return sign;
+    m |= 0x800000;
+    const shift = 14 - he;
+    let hm = m >>> shift;
+    const rem = m & ((1 << shift) - 1);
+    const half = 1 << (shift - 1);
+    if (rem > half || (rem === half && hm & 1)) hm++;
+    return sign | hm;
+  }
+  let hm = m >>> 13;
+  const rem = m & 0x1fff;
+  if (rem > 0x1000 || (rem === 0x1000 && hm & 1)) {
+    hm++;
+    if (hm === 0x400) {
+      hm = 0;
+      he++;
+      if (he >= 0x1f) return sign | 0x7c00;
+    }
+  }
+  return sign | (he << 10) | hm;
+}
 
 /** Workgroup size of the one-thread-per-element passes. */
 export const FLAT = 256;
@@ -104,6 +164,7 @@ export interface ConvLayout {
   readonly splits: number;
   /** Workgroups along voxels, channels and splits. */
   readonly groups: readonly [number, number, number];
+  readonly tile: Tile;
 }
 
 export const voxelsOf = (s: readonly number[]) => s[0] * s[1] * s[2];
@@ -113,25 +174,32 @@ const tapsOf = (step: ConvStep) =>
 export function convLayout(
   step: ConvStep,
   splitTarget = SPLIT_TARGET,
+  tile: Tile = DEFAULT_TILE,
 ): ConvLayout {
-  if (step.cout % TILE_M)
+  if (step.cout % tile.m)
     throw new Error(
-      `${step.name}: ${step.cout} channels is not a multiple of ${TILE_M}`,
+      `${step.name}: ${step.cout} channels is not a multiple of ${tile.m}`,
     );
   const k = step.cin * tapsOf(step);
-  const chunks = Math.ceil(k / TILE_K);
-  const across = Math.ceil(voxelsOf(step.outShape) / TILE_N);
-  const tiles = across * (step.cout / TILE_M);
+  const chunks = Math.ceil(k / tile.k);
+  const across = Math.ceil(voxelsOf(step.outShape) / tile.n);
+  const tiles = across * (step.cout / tile.m);
   const splits = Math.max(
     1,
     Math.min(Math.floor(chunks / 8), Math.round(splitTarget / tiles)),
   );
-  return { k, chunks, splits, groups: [across, step.cout / TILE_M, splits] };
+  return {
+    k,
+    chunks,
+    splits,
+    groups: [across, step.cout / tile.m, splits],
+    tile,
+  };
 }
 
 /** Floats in a step's laid-out weights: `[k][Cout]`, zero-padded to whole tiles. */
 export function convWeightFloats(step: ConvStep, layout: ConvLayout): number {
-  return layout.chunks * TILE_K * step.cout;
+  return layout.chunks * layout.tile.k * step.cout;
 }
 
 /**
@@ -171,7 +239,9 @@ const u = (n: number) => `${n}u`;
 function epilogue(step: ConvStep): string {
   const lines = [`v = v + ep[m];`];
   if (step.residual)
-    lines.push(`v = max(v + res[m * ${u(voxelsOf(step.outShape))} + n], 0.0);`);
+    lines.push(
+      `v = max(v + f32(res[m * ${u(voxelsOf(step.outShape))} + n]), 0.0);`,
+    );
   else if (step.relu) lines.push(`v = max(v, 0.0);`);
   return lines.join("\n    ");
 }
@@ -180,6 +250,8 @@ function epilogue(step: ConvStep): string {
 export interface ConvForm {
   /** The inner loop's 16 steps written out (Firefox on a Mac). */
   readonly unrolled?: boolean;
+  /** Storage and arithmetic types (default f32). */
+  readonly precision?: Precision;
 }
 
 /**
@@ -205,7 +277,18 @@ export function convShader(
   layout: ConvLayout,
   form: ConvForm = {},
 ): string {
-  const { k, chunks, splits } = layout;
+  const { k, chunks, splits, tile } = layout;
+  const TILE_M = tile.m;
+  const TILE_N = tile.n;
+  const TILE_K = tile.k;
+  const PER_M = tile.perM;
+  const PER_N = tile.perN;
+  const THREADS = (TILE_M / PER_M) * (TILE_N / PER_N);
+  const prec = form.precision ?? F32;
+  const ST = prec.store;
+  const MT = prec.math;
+  const IT = step.input === "input" ? "f32" : ST;
+  const f16 = ST === "f16" || MT === "f16";
   const [D, H, W] = step.inShape;
   const [OD, OH, OW] = step.outShape;
   const [, KH, KW] = step.kernel;
@@ -247,7 +330,7 @@ export function convShader(
       let c0 = (q % ${u(cin / TILE_K)}) * ${u(TILE_K)};${address("tap")}
       for (var i = 0u; i < ${u(loadsB)}; i++) {
         let r = kb + i * ${u(rowStep)};
-        Bs[r * ${u(TILE_N)} + nn] = select(0.0, inp[(c0 + r) * ${u(vi)} + base], inb);
+        Bs[r * ${u(TILE_N)} + nn] = select(${ST}(0), ${ST}(inp[(c0 + r) * ${u(vi)} + base]), inb);
       }
     }`
     : `
@@ -256,13 +339,13 @@ export function convShader(
       let kidx = q * ${u(TILE_K)} + r;
       let ci = kidx % ${u(cin)};
       let tap = kidx / ${u(cin)};${address("tap")}
-      Bs[r * ${u(TILE_N)} + nn] = select(0.0, inp[ci * ${u(vi)} + base], inb && kidx < ${u(k)});
+      Bs[r * ${u(TILE_N)} + nn] = select(${ST}(0), ${ST}(inp[ci * ${u(vi)} + base]), inb && kidx < ${u(k)});
     }`;
 
   const reductionStep = (
     r: string,
-  ) => `${rows((i) => `      let a${i} = As[${r} * ${u(TILE_M)} + tm + ${u(i * MB)}];`)}
-${cols((j) => `      let b${j} = Bs[${r} * ${u(TILE_N)} + tn + ${u(j * NB)}];`)}
+  ) => `${rows((i) => `      let a${i} = ${MT}(As[${r} * ${u(TILE_M)} + tm + ${u(i * MB)}]);`)}
+${cols((j) => `      let b${j} = ${MT}(Bs[${r} * ${u(TILE_N)} + tn + ${u(j * NB)}]);`)}
 ${both((i, j) => `      acc${i}_${j} = fma(a${i}, b${j}, acc${i}_${j});`)}`;
   const inner = form.unrolled
     ? Array.from(
@@ -280,21 +363,21 @@ ${reductionStep("r")}
       ? `  if (${n} < ${u(vo)}) {
     let m = ${m};
     let n = ${n};
-    var v = acc${r}_${s};
+        var v = f32(acc${r}_${s});
     ${epilogue(step)}
-    outp[m * ${u(vo)} + n] = v;
+    outp[m * ${u(vo)} + n] = ${ST}(v);
   }`
-      : `  if (${n} < ${u(vo)}) { outp[(wg.z * ${u(step.cout)} + ${m}) * ${u(vo)} + ${n}] = acc${r}_${s}; }`;
+      : `  if (${n} < ${u(vo)}) { outp[(wg.z * ${u(step.cout)} + ${m}) * ${u(vo)} + ${n}] = f32(acc${r}_${s}); }`;
   };
 
-  return /* wgsl */ `
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read> wt: array<f32>;
-@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+  return /* wgsl */ `${f16 ? "enable f16;" : ""}
+@group(0) @binding(0) var<storage, read> inp: array<${IT}>;
+@group(0) @binding(1) var<storage, read> wt: array<${ST}>;
+@group(0) @binding(2) var<storage, read_write> outp: array<${splits === 1 ? ST : "f32"}>;
 ${splits === 1 ? "@group(0) @binding(3) var<storage, read> ep: array<f32>;" : ""}
-${splits === 1 && step.residual ? "@group(0) @binding(4) var<storage, read> res: array<f32>;" : ""}
-var<workgroup> As: array<f32, ${TILE_K * TILE_M}>;
-var<workgroup> Bs: array<f32, ${TILE_K * TILE_N}>;
+${splits === 1 && step.residual ? `@group(0) @binding(4) var<storage, read> res: array<${ST}>;` : ""}
+var<workgroup> As: array<${ST}, ${TILE_K * TILE_M}>;
+var<workgroup> Bs: array<${ST}, ${TILE_K * TILE_N}>;
 
 @compute @workgroup_size(${THREADS})
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
@@ -302,7 +385,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
   let m0 = wg.y * ${u(TILE_M)};
   let tm = li / ${u(NB)};
   let tn = li % ${u(NB)};
-${both((r, s) => `  var acc${r}_${s} = 0.0;`)}
+${both((r, s) => `  var acc${r}_${s} = ${MT}(0);`)}
 
   // The output voxel this thread gathers input for, fixed for the whole
   // reduction, and the corner of its window in the input.
@@ -334,14 +417,19 @@ ${both(write)}
  * Add a split step's partial sums and apply its epilogue. Bindings: 0
  * partials, 1 output, 2 bias, 3 the residual if any. A thread per element.
  */
-export function reduceShader(step: ConvStep, splits: number): string {
+export function reduceShader(
+  step: ConvStep,
+  splits: number,
+  precision: Precision = F32,
+): string {
   const vo = voxelsOf(step.outShape);
   const total = step.cout * vo;
-  return /* wgsl */ `
+  const ST = precision.store;
+  return /* wgsl */ `${ST === "f16" ? "enable f16;" : ""}
 @group(0) @binding(0) var<storage, read> part: array<f32>;
-@group(0) @binding(1) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(1) var<storage, read_write> outp: array<${ST}>;
 @group(0) @binding(2) var<storage, read> ep: array<f32>;
-${step.residual ? "@group(0) @binding(3) var<storage, read> res: array<f32>;" : ""}
+${step.residual ? `@group(0) @binding(3) var<storage, read> res: array<${ST}>;` : ""}
 
 @compute @workgroup_size(${FLAT})
 fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -351,8 +439,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let n = e % ${u(vo)};
   var v = 0.0;
   for (var s = 0u; s < ${u(splits)}; s++) { v = v + part[s * ${u(total)} + e]; }
-  ${epilogue(step)}
-  outp[e] = v;
+    ${epilogue(step)}
+  outp[e] = ${ST}(v);
 }`;
 }
 
@@ -361,15 +449,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
  * Bindings: 0 the last block's output, 1 the head's weights packed as
  * [w1 (hidden x channels), b1, w2 (2 x hidden), b2], 2 the two logits.
  */
-export function headShader(head: HeadStep): string {
+export function headShader(head: HeadStep, precision: Precision = F32): string {
+  const ST = precision.store;
   const { channels: C, voxels: V, hidden: Hd } = head;
   const perC = Math.ceil(C / FLAT);
   const perH = Math.ceil(Hd / FLAT);
   const oB1 = Hd * C;
   const oW2 = oB1 + Hd;
   const oB2 = oW2 + 2 * Hd;
-  return /* wgsl */ `
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
+  return /* wgsl */ `${ST === "f16" ? "enable f16;" : ""}
+@group(0) @binding(0) var<storage, read> inp: array<${ST}>;
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 var<workgroup> feat: array<f32, ${C}>;
@@ -382,7 +471,7 @@ fn main(@builtin(local_invocation_index) li: u32) {
     let c = li + i * ${u(FLAT)};
     if (c < ${u(C)}) {
       var t = 0.0;
-      for (var n = 0u; n < ${u(V)}; n++) { t = t + inp[c * ${u(V)} + n]; }
+      for (var n = 0u; n < ${u(V)}; n++) { t = t + f32(inp[c * ${u(V)} + n]); }
       feat[c] = t / ${V}.0;
     }
   }

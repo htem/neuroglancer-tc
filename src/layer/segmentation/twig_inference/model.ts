@@ -41,6 +41,10 @@ import { logEvent } from "#src/layer/segmentation/twig_inference/diagnostics.js"
 import { readOnnx } from "#src/layer/segmentation/twig_inference/gpu/onnx_proto.js";
 import { R3dNetwork } from "#src/layer/segmentation/twig_inference/gpu/r3d_network.js";
 import { r3dPlan } from "#src/layer/segmentation/twig_inference/gpu/r3d_plan.js";
+import type {
+  Precision,
+  Tile,
+} from "#src/layer/segmentation/twig_inference/gpu/r3d_shaders.js";
 import { ORT_VERSION } from "#src/layer/segmentation/twig_inference/ort_version.js";
 import { PATCH_VOXELS } from "#src/layer/segmentation/twig_inference/volume_ops.js";
 import {
@@ -53,8 +57,18 @@ const ORT_URL = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dis
 
 export type Backend = "auto" | "webgpu" | "webgpu-ort" | "wasm";
 
+/** The WebGPU network's precision and tile shape (r3d_shaders.ts). */
+export interface GpuOptions {
+  precision?: Precision;
+  tile?: Tile;
+}
+
 /** Largest |p| difference from ONNX Runtime the WebGPU network may show. */
 export const PARITY_MAX_DP = 1e-4;
+/** The same for f16 storage (measured 1.2e-4 against f32 on 24 patches). */
+export const PARITY_MAX_DP_F16 = 1e-3;
+/** f16 storage, f32 arithmetic and accumulation: the "f16" GPU precision. */
+export const F16_STORAGE: Precision = { store: "f16", math: "f32" };
 
 let ortPromise: Promise<any> | undefined;
 
@@ -172,10 +186,15 @@ export class MergeModel {
     private worker?: CpuWorker,
   ) {}
 
+  /** Storage precision of what scores the patches ("f32" off the GPU network). */
+  get precision(): "f32" | "f16" {
+    return this.gpu?.precision.store ?? "f32";
+  }
+
   /** What scores the patches, for the result's benchmark block. */
   get runtime() {
     if (this.gpu)
-      return `twig-capture webgpu r3d (Coda-derived${this.gpu.frugal ? ", unrolled" : ""}) on ${this.gpu.adapter}`;
+      return `twig-capture webgpu r3d (Coda-derived${this.gpu.frugal ? ", unrolled" : ""}${this.gpu.precision.store === "f16" ? `, ${this.gpu.precision.store} storage ${this.gpu.precision.math} math` : ""}) on ${this.gpu.adapter}`;
     return `onnxruntime-web ${ORT_VERSION} (${this.backend}${this.worker ? ", worker" : ""})`;
   }
 
@@ -185,6 +204,8 @@ export class MergeModel {
     onProgress?: (msg: string) => void,
     /** Force the Firefox shader form on or off (measuring only). */
     frugal?: boolean,
+    /** The WebGPU network's precision and tile (default f32, Coda's tile). */
+    gpuOptions: GpuOptions = {},
   ): Promise<MergeModel> {
     const bytes = await getModelBytes(modelUrl, onProgress);
     const useGpu =
@@ -192,7 +213,21 @@ export class MergeModel {
       backend === "webgpu-ort" ||
       (backend === "auto" && (await webgpuAvailable()));
     if (useGpu && backend !== "webgpu-ort") {
-      const gpu = await openGpuNetwork(modelUrl, bytes, onProgress, frugal);
+      // f16 needs shader-f16: without it (or if it fails its check), f32.
+      const gpu =
+        (await openGpuNetwork(
+          modelUrl,
+          bytes,
+          onProgress,
+          frugal,
+          gpuOptions,
+        )) ??
+        (gpuOptions.precision
+          ? await openGpuNetwork(modelUrl, bytes, onProgress, frugal, {
+              ...gpuOptions,
+              precision: undefined,
+            })
+          : undefined);
       if (gpu) return new MergeModel(undefined, undefined, "webgpu", gpu);
     }
     if (!useGpu) {
@@ -307,15 +342,22 @@ async function openGpuNetwork(
   bytes: ArrayBuffer,
   onProgress?: (msg: string) => void,
   frugal?: boolean,
+  gpuOptions: GpuOptions = {},
 ): Promise<R3dNetwork | undefined> {
   let net: R3dNetwork | undefined;
   try {
     onProgress?.("starting model on GPU (WebGPU)…");
     net = await R3dNetwork.build(r3dPlan(readOnnx(new Uint8Array(bytes))), {
       frugal,
+      ...gpuOptions,
     });
     const key =
-      `gpuParity:v1:${modelUrl}:${net.adapter}` + (net.frugal ? ":frugal" : "");
+      `gpuParity:v1:${modelUrl}:${net.adapter}` +
+      (net.frugal ? ":frugal" : "") +
+      (gpuOptions.precision
+        ? `:${gpuOptions.precision.store}${gpuOptions.precision.math}`
+        : "") +
+      (gpuOptions.tile ? `:${Object.values(gpuOptions.tile).join("x")}` : "");
     let verdict = await idbGet<{ ok: boolean; maxDp: number }>(CACHE, key);
     if (!verdict) {
       onProgress?.("checking the GPU model against ONNX Runtime (once)…");
@@ -330,7 +372,9 @@ async function openGpuNetwork(
       }
       const got = probs(await net.logitsFor(split(x, 2)), 2);
       const maxDp = Math.max(...[0, 1].map((i) => Math.abs(got[i] - ref[i])));
-      verdict = { ok: maxDp <= PARITY_MAX_DP && Number.isFinite(maxDp), maxDp };
+      const tol =
+        net.precision.store === "f16" ? PARITY_MAX_DP_F16 : PARITY_MAX_DP;
+      verdict = { ok: maxDp <= tol && Number.isFinite(maxDp), maxDp };
       logEvent(
         verdict.ok ? "info" : "warn",
         `WebGPU network vs ONNX Runtime (${ep}): max|dp| ${maxDp.toExponential(2)}` +
@@ -364,7 +408,17 @@ async function openGpuNetwork(
  * the WebGPU network `.gpu.profile(patch)`.
  */
 (globalThis as any).twigCaptureModel = {
-  open: (url: string, backend: Backend, frugal?: boolean) =>
-    MergeModel.create(url, backend, undefined, frugal),
+  open: (
+    url: string,
+    backend: Backend,
+    frugal?: boolean,
+    gpuOptions?: GpuOptions,
+  ) => MergeModel.create(url, backend, undefined, frugal, gpuOptions),
+  /** The WebGPU network alone, with no ONNX Runtime check (measuring). */
+  network: async (url: string, opts: GpuOptions & { frugal?: boolean } = {}) =>
+    R3dNetwork.build(
+      r3dPlan(readOnnx(new Uint8Array(await getModelBytes(url)))),
+      opts,
+    ),
   parityPatches,
 };
