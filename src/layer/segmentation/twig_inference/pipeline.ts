@@ -79,6 +79,11 @@ export interface RunOptions {
   contactGap?: number;
   /** How it applies (default TWIG_PARAMS.contactGapMode). */
   contactGapMode?: "all" | "nontouching";
+  /**
+   * Early stop (opt-in): once a pair has a site with p >= this, its other
+   * sites are skipped, so its reported p is a lower bound. Off when unset.
+   */
+  earlyStopP?: number;
   modelUrl: string;
 }
 
@@ -277,6 +282,8 @@ export async function runTwigCapture(
   const timer = new PhaseTimer();
   const gap = opts.contactGap ?? P.contactGap;
   const gapMode = opts.contactGapMode ?? P.contactGapMode;
+  const earlyStopP = opts.earlyStopP;
+  let skippedSites = 0;
   const report = () => onProgress({ ...prog });
   const check = () => {
     if (signal.aborted) throw new DOMException("cancelled", "AbortError");
@@ -738,13 +745,13 @@ export async function runTwigCapture(
         reject(candId, reason, stats);
     }
     timer.add("sites", performance.now() - tCpu);
-    // EM for each built site; drop out-of-volume / empty windows.
-    const scoreIdx: number[] = [];
-    const tEm = performance.now();
-    await pool(
-      built.map((_, i) => i),
-      EM_CONCURRENCY,
-      async (i) => {
+    // EM and scores for these of the region's sites (all of them, unless
+    // early stop splits them into stages).
+    const emAndScore = async (subset: number[]) => {
+      // EM for each built site; drop out-of-volume / empty windows.
+      const scoreIdx: number[] = [];
+      const tEm = performance.now();
+      await pool(subset, EM_CONCURRENCY, async (i) => {
         const b = built[i];
         const e = b.row._emCentre as number[];
         const lo = [e[0] - 64, e[1] - 64, e[2] - 9];
@@ -779,95 +786,132 @@ export async function runTwigCapture(
         );
         for (let k = 0; k < em.length; ++k) x[k] = (em[k] / 255) * 2 - 1;
         scoreIdx.push(i);
-      },
-    );
-    timer.add("em_cutout", performance.now() - tEm);
-    // In site order, not the order the EM cutouts happened to arrive in, so
-    // a run's result (down to the order of its rejected_candidates log, and
-    // ties between a pair's sites) does not depend on network timing.
-    scoreIdx.sort((a, b) => a - b);
-    check();
-    for (const b of built) {
-      // As the runner: a site that could not be scored releases its claim,
-      // so another region where its EM window is usable can still try it.
-      if (b.row._reject) {
-        const seen = claimed.get(b.pair);
-        const k = seen?.indexOf(b.claim) ?? -1;
-        if (k >= 0) seen!.splice(k, 1);
-      }
-      if (b.row._reject && !scoreIdx.some((i) => built[i].pair === b.pair)) {
-        reject(b.pair, b.row._reject, {
-          contact_voxels: b.row.contact_voxels,
-          cand_voxels: b.row.cand_voxels,
-        });
-      }
-    }
-    // Score, and keep the best site per pair (max over sites): queued
-    // behind the regions, applied in order (see `scoring`).
-    if (scoreIdx.length) {
-      // The patches themselves, not a packed copy: a queued region holds
-      // ~3.5 MB a patch until it is scored.
-      const patches = scoreIdx.map((i) => pending[i]);
-      const pairs = scoreIdx.map((i) => built[i].pair);
-      for (const id of pairs)
-        queuedPairs.set(id, (queuedPairs.get(id) ?? 0) + 1);
-      // Bound what waits for the model (memory), oldest region first.
-      while (
-        scoringJobs.length &&
-        queuedPatches + patches.length > MAX_QUEUED_PATCHES
-      ) {
-        const job = scoringJobs.shift()!;
-        await job.done;
-        queuedPatches -= job.patches;
-      }
-      queuedPatches += patches.length;
-      scoring = scoring.then(async () => {
-        try {
-          check();
-          prog.phase = `level ${hop}: scoring on ${model.backend === "webgpu" ? "GPU" : "CPU"}`;
-          report();
-          const p = await timer.time("model", () =>
-            model.scorePatches(patches),
-          );
-          patches.length = 0;
-          prog.patches += scoreIdx.length;
-          prog.msPerPatch = +(timer.ms.model / prog.patches).toFixed(1);
-          scoreIdx.forEach((i, k) => {
-            const b = built[i];
-            const prev = best.get(b.pair);
-            const scored = (prev?.scored ?? 0) + 1;
-            const found = Math.max(
-              prev?.found ?? 0,
-              foundPerPair.get(b.pair) ?? 0,
-            );
-            if (!prev || p[k] > prev.p)
-              best.set(b.pair, { ...b, p: p[k], found, scored, hop });
-            else Object.assign(prev, { found, scored });
-          });
-          prog.found = [...best.values()].filter(
-            (b) => b.p > P.reportThreshold,
-          ).length;
-          report();
-        } catch (e) {
-          // As a region whose scoring failed before: counted, logged, and
-          // the run goes on. A cancel stops the run when drained.
-          if ((e as any)?.name !== "AbortError") {
-            regionErrors++;
-            logEvent(
-              "warn",
-              `region ${coord.join(",")} (level ${hop}) scoring failed`,
-              e,
-            );
-          }
-        } finally {
-          for (const id of pairs) {
-            const n = queuedPairs.get(id)! - 1;
-            if (n) queuedPairs.set(id, n);
-            else queuedPairs.delete(id);
-          }
-        }
       });
-      scoringJobs.push({ done: scoring, patches: scoreIdx.length });
+      timer.add("em_cutout", performance.now() - tEm);
+      // In site order, not the order the EM cutouts happened to arrive in, so
+      // a run's result (down to the order of its rejected_candidates log, and
+      // ties between a pair's sites) does not depend on network timing.
+      scoreIdx.sort((a, b) => a - b);
+      check();
+      for (const bi of subset) {
+        const b = built[bi];
+        // As the runner: a site that could not be scored releases its claim,
+        // so another region where its EM window is usable can still try it.
+        if (b.row._reject) {
+          const seen = claimed.get(b.pair);
+          const k = seen?.indexOf(b.claim) ?? -1;
+          if (k >= 0) seen!.splice(k, 1);
+        }
+        if (b.row._reject && !scoreIdx.some((i) => built[i].pair === b.pair)) {
+          reject(b.pair, b.row._reject, {
+            contact_voxels: b.row.contact_voxels,
+            cand_voxels: b.row.cand_voxels,
+          });
+        }
+      }
+      // Score, and keep the best site per pair (max over sites): queued
+      // behind the regions, applied in order (see `scoring`).
+      if (scoreIdx.length) {
+        // The patches themselves, not a packed copy: a queued region holds
+        // ~3.5 MB a patch until it is scored.
+        const patches = scoreIdx.map((i) => pending[i]);
+        const pairs = scoreIdx.map((i) => built[i].pair);
+        for (const id of pairs)
+          queuedPairs.set(id, (queuedPairs.get(id) ?? 0) + 1);
+        // Bound what waits for the model (memory), oldest region first.
+        while (
+          scoringJobs.length &&
+          queuedPatches + patches.length > MAX_QUEUED_PATCHES
+        ) {
+          const job = scoringJobs.shift()!;
+          await job.done;
+          queuedPatches -= job.patches;
+        }
+        queuedPatches += patches.length;
+        scoring = scoring.then(async () => {
+          try {
+            check();
+            prog.phase = `level ${hop}: scoring on ${model.backend === "webgpu" ? "GPU" : "CPU"}`;
+            report();
+            const p = await timer.time("model", () =>
+              model.scorePatches(patches),
+            );
+            patches.length = 0;
+            prog.patches += scoreIdx.length;
+            prog.msPerPatch = +(timer.ms.model / prog.patches).toFixed(1);
+            scoreIdx.forEach((i, k) => {
+              const b = built[i];
+              const prev = best.get(b.pair);
+              const scored = (prev?.scored ?? 0) + 1;
+              const found = Math.max(
+                prev?.found ?? 0,
+                foundPerPair.get(b.pair) ?? 0,
+              );
+              if (!prev || p[k] > prev.p)
+                best.set(b.pair, { ...b, p: p[k], found, scored, hop });
+              else Object.assign(prev, { found, scored });
+            });
+            prog.found = [...best.values()].filter(
+              (b) => b.p > P.reportThreshold,
+            ).length;
+            report();
+          } catch (e) {
+            // As a region whose scoring failed before: counted, logged, and
+            // the run goes on. A cancel stops the run when drained.
+            if ((e as any)?.name !== "AbortError") {
+              regionErrors++;
+              logEvent(
+                "warn",
+                `region ${coord.join(",")} (level ${hop}) scoring failed`,
+                e,
+              );
+            }
+          } finally {
+            for (const id of pairs) {
+              const n = queuedPairs.get(id)! - 1;
+              if (n) queuedPairs.set(id, n);
+              else queuedPairs.delete(id);
+            }
+          }
+        });
+        scoringJobs.push({ done: scoring, patches: scoreIdx.length });
+      }
+    };
+    const all = built.map((_, i) => i);
+    const releaseClaim = (i: number) => {
+      const seen = claimed.get(built[i].pair);
+      const k = seen?.indexOf(built[i].claim) ?? -1;
+      if (k >= 0) seen!.splice(k, 1);
+    };
+    if (!earlyStopP) {
+      await emAndScore(all);
+    } else {
+      // Early stop (opt-in): a pair stops once a site scores >= earlyStopP.
+      // Decided on settled scores only, so a run is still deterministic:
+      // earlier regions' scores are drained first, then each pair's first
+      // site here, then its other sites only if it is still below.
+      const confident = (i: number) =>
+        (best.get(built[i].pair)?.p ?? 0) >= earlyStopP;
+      await drainScoring();
+      const live = all.filter((i) => !confident(i));
+      all.filter(confident).forEach(releaseClaim);
+      const firstOf = new Set<string>();
+      const stage1: number[] = [];
+      const stage2: number[] = [];
+      for (const i of live) {
+        if (firstOf.has(built[i].pair)) stage2.push(i);
+        else {
+          firstOf.add(built[i].pair);
+          stage1.push(i);
+        }
+      }
+      skippedSites += all.length - live.length;
+      await emAndScore(stage1);
+      await drainScoring();
+      const rest = stage2.filter((i) => !confident(i));
+      stage2.filter(confident).forEach(releaseClaim);
+      skippedSites += stage2.length - rest.length;
+      if (rest.length) await emAndScore(rest);
     }
   };
 
@@ -1017,6 +1061,9 @@ export async function runTwigCapture(
     contact_gap_voxels: gap,
     contact_gap_mode: gapMode,
     model_precision: model.precision,
+    // Early stop: rows at or above this p may have unscored sites, so their
+    // p is a lower bound. null when off.
+    early_stop_p: earlyStopP ?? null,
     decision_rule: "raw_local_prob",
     merge_threshold: P.reportThreshold,
     level: opts.level,
@@ -1057,6 +1104,7 @@ export async function runTwigCapture(
       model_runtime: model.runtime,
       region_errors: regionErrors,
       coverage_regions: coverageRegions,
+      early_stop_skipped_sites: skippedSites,
       coverage_errors: coverageErrors,
       device: model.backend,
     },

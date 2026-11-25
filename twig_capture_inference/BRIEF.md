@@ -129,6 +129,17 @@ Coda's search-side ideas (a step per queue, several ends at once) map onto
 this overlap. A worker pool for the contact search is the next step if
 needed.
 
+**Round 3 (2026-11-25).**
+- The contact search runs on neuroglancer's async-computation workers, one
+  candidate's crop per task. It is identical, and the N=1 run takes 180 s
+  (was 226).
+- The fp16 path (setting "GPU precision") is off: it gives the same
+  suggestion set but a ranking that differs in 20 places.
+- Tile shapes are a parameter; none beat Coda's by more than 2%.
+- "Stop at first confident site" (`early_stop_p` in the header) is opt-in.
+
+See PR #2 for the numbers.
+
 **Firefox form.** The unrolled inner loop (Coda §18) is built for Firefox
 on a Mac and is bit-identical (forced in Chrome: same p on 24 patches). It
 is not measured in Firefox: release Firefox 141 on macOS has no WebGPU, so

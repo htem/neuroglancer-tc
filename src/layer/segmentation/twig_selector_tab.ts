@@ -87,7 +87,8 @@ export interface SelectorSettings {
   contactGap: number;
   /** The WebGPU network's storage precision: "f32" (default) or "f16". */
   gpuPrecision: "f32" | "f16";
-
+  /** Stop scoring a pair's sites at the first with p >= EARLY_STOP_P. */
+  earlyStop: boolean;
   backend: Backend;
   modelUrl: string;
 }
@@ -102,7 +103,7 @@ const DEFAULT_SETTINGS: SelectorSettings = {
   l2LimitVersion: 2,
   contactGap: TWIG_PARAMS.contactGap,
   gpuPrecision: "f32",
-
+  earlyStop: false,
   backend: "auto",
   modelUrl: DEFAULT_MODEL_URL,
 };
@@ -152,6 +153,9 @@ export interface RunPlan {
   /** Rough wall time in minutes on this device. */
   minutes: number;
 }
+
+/** The early-stop threshold: the high (confident) threshold. */
+const EARLY_STOP_P = 0.9;
 
 /** Region budget per level when chosen automatically. */
 const AUTO_REGIONS_GPU = 300;
@@ -437,6 +441,9 @@ export class TwigSelectorState {
     if ((x.filters?.max_candidate_l2_nodes ?? 20) < want.maxCandidateL2) {
       return undefined;
     }
+    // Made with early stop on or off when the setting is the other.
+    if ((x.early_stop_p ?? null) !== (st.earlyStop ? EARLY_STOP_P : null))
+      return undefined;
     // Scored at another GPU precision.
     if (
       (x.model_precision ?? "f32") !== st.gpuPrecision &&
@@ -573,7 +580,7 @@ export class TwigSelectorState {
               maxSites: plan.maxSites,
               maxCandidateL2: plan.maxCandidateL2,
               contactGap: st.contactGap,
-
+              earlyStopP: st.earlyStop ? EARLY_STOP_P : undefined,
               modelUrl: st.modelUrl,
             },
             (p) => {
@@ -1015,6 +1022,21 @@ export class TwigSelectorTab extends Tab {
         'across a thin gap become candidates; they are tagged "gap" in Twig ' +
         "Capture, and are less reliable than touching ones. 0 is the old " +
         "touching-only search.",
+    );
+    const early = document.createElement("input");
+    early.type = "checkbox";
+    early.checked = st.earlyStop;
+    early.addEventListener("change", () => {
+      st.earlyStop = early.checked;
+      state.saveSettings();
+    });
+    field(
+      "stop at first confident site",
+      early,
+      `Once a pair has a site with p >= ${EARLY_STOP_P}, skip its other sites. ` +
+        "Fewer patches, but such rows' p is a lower bound (the result records " +
+        "early_stop_p). Off by default: it waits for each region's scores, so " +
+        "regions overlap less.",
     );
     const precSel = document.createElement("select");
     for (const [v, label] of [
