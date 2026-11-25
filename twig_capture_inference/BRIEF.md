@@ -262,10 +262,21 @@ chip, and the sink side is labelled "via".
 - No synapse counts.
 
 **CPU.** Runs single-threaded, because the page is not cross-origin isolated:
-COOP/COEP would break CAVE's login popup. The UI stalls during each patch,
-because ORT's worker proxy cannot start from the CDN script. Bundling
-onnxruntime-web would allow both. On CPU, set sites/pair to 1 and keep
-max regions small.
+COOP/COEP would break CAVE's login popup. Since 2026-11-25 it runs in a
+worker (`cpu_worker.ts`), so the viewer stays responsive. ORT's own worker
+proxy cannot start from the cross-origin CDN script, so the worker is made
+from a Blob, which has the page's origin, and loads the same pinned ORT with
+`importScripts`. On the M1 Max: 3.3 s/patch, the same as on the page, with
+the main thread never blocked for more than 1 ms (it used to stall ~3 s
+per patch). If the worker cannot be made (e.g. a CSP forbidding blob
+workers), ORT runs on the page as before. With the region overlap, the
+site building and cutouts now also run while the worker scores. On CPU,
+set sites/pair to 1 and keep max regions small.
+
+**Cluster runner on CPU** (not changed here): the same Conv2d rewrite
+halves onnxruntime's CPU time against the 3D graph (370 vs 716 ms/patch on
+the Mac; 382 ms measured again 2026-11-25). A CPU-only O2 run could score
+`local_fp32c2d.onnx` with onnxruntime instead of PyTorch.
 
 **End-to-end runs (2026-11-24, Apple M-series, Chrome, WebGPU):**
 

@@ -27,7 +27,8 @@
  *   built), ONNX Runtime on WebGPU is used instead, and the verdict is kept
  *   per model and adapter so later opens skip the check.
  * - **webgpu-ort**: ONNX Runtime Web on WebGPU, the previous path.
- * - **wasm**: ONNX Runtime Web on the CPU.
+ * - **wasm**: ONNX Runtime Web on the CPU, in a worker where the browser
+ *   allows it (see cpu_worker.ts), so the viewer stays responsive.
  *
  * ONNX Runtime is loaded on first use from jsDelivr (pinned version) rather
  * than bundled, so the viewer build does not carry ~20 MB of wasm for people
@@ -35,6 +36,7 @@
  * so they are downloaded once per browser.
  */
 
+import { CpuWorker } from "#src/layer/segmentation/twig_inference/cpu_worker.js";
 import { logEvent } from "#src/layer/segmentation/twig_inference/diagnostics.js";
 import { readOnnx } from "#src/layer/segmentation/twig_inference/gpu/onnx_proto.js";
 import { R3dNetwork } from "#src/layer/segmentation/twig_inference/gpu/r3d_network.js";
@@ -166,13 +168,15 @@ export class MergeModel {
     readonly backend: "webgpu" | "wasm",
     /** The WebGPU network, when it runs the model instead of ONNX Runtime. */
     readonly gpu?: R3dNetwork,
+    /** The CPU worker, when ONNX Runtime runs there. */
+    private worker?: CpuWorker,
   ) {}
 
   /** What scores the patches, for the result's benchmark block. */
   get runtime() {
     if (this.gpu)
       return `twig-capture webgpu r3d (Coda-derived) on ${this.gpu.adapter}`;
-    return `onnxruntime-web ${ORT_VERSION} (${this.backend})`;
+    return `onnxruntime-web ${ORT_VERSION} (${this.backend}${this.worker ? ", worker" : ""})`;
   }
 
   static async create(
@@ -188,6 +192,11 @@ export class MergeModel {
     if (useGpu && backend !== "webgpu-ort") {
       const gpu = await openGpuNetwork(modelUrl, bytes, onProgress);
       if (gpu) return new MergeModel(undefined, undefined, "webgpu", gpu);
+    }
+    if (!useGpu) {
+      const worker = await CpuWorker.open(bytes, onProgress);
+      if (worker)
+        return new MergeModel(undefined, undefined, "wasm", undefined, worker);
     }
     const ort = await loadOrt();
     const { session, ep } = await ortSession(
@@ -211,11 +220,13 @@ export class MergeModel {
   async scorePatches(patches: Float32Array[]): Promise<Float32Array> {
     const n = patches.length;
     if (this.gpu) return probs(await this.gpu.logitsFor(patches), n);
+    if (this.worker) return probs(await this.worker.logits(patches), n);
     return probs(await ortLogits(this.ort, this.session, patches), n);
   }
 
   async release() {
     this.gpu?.destroy();
+    this.worker?.close();
     await this.session?.release?.();
   }
 }
