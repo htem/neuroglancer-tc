@@ -113,6 +113,28 @@ the same prob_merge, and the same rejects. The next bottleneck is the
 page's own work: the CPU site building (~90 s) and the EM cutouts (~95 s,
 JPEG decode included). These now set the pace, not the GPU.
 
+**The search side (2026-11-25).** Once the GPU was fast, the page's own
+work set the pace. With finer phases (`labels`, `touching`, `contacts`,
+`sites`), N=1 on the reference root showed `contacts`
+(`findContactSites`) at 107 s of 264 s. Each candidate scanned the whole
+cutout to find its bounding box. `labelBoxes` now finds every candidate's
+box in one pass. A region's search work (labels, neighbour search, partner
+sizes, contact sites) also runs while the previous region fetches its EM
+(`prepareRegion`); claims, rejects and scores stay in region order
+(`finishRegion`). The EM pool went from 6 to 12. The results are identical
+to the field (rows, p, rejects and reject log, at N=0 and N=1). N=1:
+302 s → 226 s (contacts 107 → 69 s). What remains is mostly the
+per-candidate dilations, the EM fetches (~93 s, overlapped) and the model.
+Coda's search-side ideas (a step per queue, several ends at once) map onto
+this overlap. A worker pool for the contact search is the next step if
+needed.
+
+**Firefox form.** The unrolled inner loop (Coda §18) is built for Firefox
+on a Mac and is bit-identical (forced in Chrome: same p on 24 patches). It
+is not measured in Firefox: release Firefox 141 on macOS has no WebGPU, so
+those users run the CPU worker. Forced in Chrome on the M1 Max, it is 2x
+slower.
+
 **Measuring:** from the console, `m = await twigCaptureModel.open(url,
 "webgpu")`, then `await m.scorePatches([...])`, or
 `await m.gpu.profile(patch, 30)` for per-step times. `"webgpu-ort"` gives

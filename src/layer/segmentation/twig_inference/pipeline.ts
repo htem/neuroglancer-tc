@@ -42,6 +42,7 @@ import type { Shape } from "#src/layer/segmentation/twig_inference/volume_ops.js
 import {
   PATCH_VOXELS,
   findContactSites,
+  labelBoxes,
   organelleFeatures,
   touchingLabelsCenter,
   voxelNear,
@@ -215,6 +216,8 @@ async function getRoots(
   return out;
 }
 
+/** EM cutouts fetched at once per region (was 6). */
+const EM_CONCURRENCY = 12;
 /** Regions whose supervoxel cutouts are fetched ahead of the one processed. */
 const PREFETCH_REGIONS = 2;
 /**
@@ -471,10 +474,16 @@ export async function runTwigCapture(
     check();
   };
 
-  const processRegion = async (
+  /**
+   * A region's work that reads nothing earlier regions write (claims, scores,
+   * rejects): roots -> labels, coverage cells, the neighbour search, partner
+   * sizes and every candidate's contact sites. It runs while the previous
+   * region's EM is fetched (see `search`); `finishRegion` then does the rest
+   * in region order, so the result is the same as one region at a time.
+   */
+  const prepareRegion = async (
     coord: [number, number, number],
     object: Set<bigint>,
-    hop: number,
   ) => {
     const origin = originOf(coord);
     const { svLab, present } = await timer.time("wait_cutout", () =>
@@ -495,7 +504,7 @@ export async function runTwigCapture(
       const l = svLab[i];
       if (l) rootLab[i] = svToRoot.get(l)!;
     }
-    timer.add("sites", performance.now() - tCpu);
+    timer.add("labels", performance.now() - tCpu);
     // Coverage: record this level's neuron voxels outside the search band.
     try {
       await timer.time("coverage", () =>
@@ -515,20 +524,11 @@ export async function runTwigCapture(
       gap,
       gapMode,
     });
-    for (const [l, [why, ct, sz]] of rejects) {
-      const id = String(rootTable.ids[l]);
-      if (!best.has(id) && !queuedPairs.has(id))
-        reject(id, why, { contact_voxels: ct, cand_voxels: sz });
-    }
-    // A pair scored at an earlier level keeps that level's score.
-    const cands = [...keep.keys()].filter((l) => {
-      const b = best.get(String(rootTable.ids[l]));
-      return !b || b.hop === hop;
-    });
-    timer.add("sites", performance.now() - tCpu);
-    // Candidate L2 sizes (cached per root), in parallel.
+    timer.add("touching", performance.now() - tCpu);
+    // Partner sizes (cached per root), in parallel.
+    const keepIds = [...keep.keys()];
     await timer.time("cand_l2", () =>
-      pool(cands, 8, async (l) => {
+      pool(keepIds, 8, async (l) => {
         const id = String(rootTable.ids[l]);
         if (!ctx.l2Count.has(id)) {
           try {
@@ -540,8 +540,65 @@ export async function runTwigCapture(
       }),
     );
     check();
-    // Contact sites -> patches.
+    // Each candidate's contact sites. The runner's create_contact_mask: in
+    // "nontouching" mode a pair keeps its one-voxel interface (judged on the
+    // candidate's whole bbox, not the centre band) and only a pair with none
+    // is measured across the gap; "all" widens every pair.
     tCpu = performance.now();
+    const sitesFor = new Map<number, ReturnType<typeof findContactSites>>();
+    const boxes = labelBoxes(rootLab, s, keepIds);
+    for (const l of keepIds) {
+      const siteArgs = [
+        rootLab,
+        s,
+        target,
+        l,
+        P.minContactBlob,
+        opts.maxSites,
+      ] as const;
+      const box = boxes.get(l);
+      let sites = findContactSites(
+        ...siteArgs,
+        gapMode === "all" ? gap : 0,
+        box,
+      );
+      if (!sites.length && gap > 0 && gapMode !== "all")
+        sites = findContactSites(...siteArgs, gap, box);
+      sitesFor.set(l, sites);
+    }
+    timer.add("contacts", performance.now() - tCpu);
+    return {
+      origin,
+      svLab,
+      rootTable,
+      target,
+      rootLab,
+      keep,
+      rejects,
+      sitesFor,
+    };
+  };
+  type Prepared = Awaited<ReturnType<typeof prepareRegion>>;
+
+  const finishRegion = async (
+    prep: Prepared,
+    coord: [number, number, number],
+    hop: number,
+  ) => {
+    const { origin, svLab, rootTable, target, rootLab, keep, rejects } = prep;
+    const svIds = ctx.sv.idTable.ids;
+    const tCpu = performance.now();
+    for (const [l, [why, ct, sz]] of rejects) {
+      const id = String(rootTable.ids[l]);
+      if (!best.has(id) && !queuedPairs.has(id))
+        reject(id, why, { contact_voxels: ct, cand_voxels: sz });
+    }
+    // A pair scored at an earlier level keeps that level's score.
+    const cands = [...keep.keys()].filter((l) => {
+      const b = best.get(String(rootTable.ids[l]));
+      return !b || b.hop === hop;
+    });
+    // Contact sites -> patches.
     const built: SiteBuilt[] = [];
     const pending: Float32Array[] = [];
     const foundPerPair = new Map<string, number>();
@@ -553,21 +610,7 @@ export async function runTwigCapture(
         reject(candId, "candidate_l2", { ...stats, num_l2_nodes: nL2 });
         continue;
       }
-      // The runner's create_contact_mask: in "nontouching" mode a pair keeps
-      // its one-voxel interface (judged on the candidate's whole bbox, not
-      // the centre band) and only a pair with none is measured across the
-      // gap; "all" widens every pair.
-      const siteArgs = [
-        rootLab,
-        s,
-        target,
-        l,
-        P.minContactBlob,
-        opts.maxSites,
-      ] as const;
-      let sites = findContactSites(...siteArgs, gapMode === "all" ? gap : 0);
-      if (!sites.length && gap > 0 && gapMode !== "all")
-        sites = findContactSites(...siteArgs, gap);
+      const sites = prep.sitesFor.get(l)!;
       if (!sites.length) {
         reject(candId, "no_contact", stats);
         continue;
@@ -668,7 +711,7 @@ export async function runTwigCapture(
     const tEm = performance.now();
     await pool(
       built.map((_, i) => i),
-      6,
+      EM_CONCURRENCY,
       async (i) => {
         const b = built[i];
         const e = b.row._emCentre as number[];
@@ -811,11 +854,31 @@ export async function runTwigCapture(
     prog.total = regions.length;
     report();
     coverageCells = new Set();
-    const search = async (coord: [number, number, number]) => {
+    // A region is prepared (prepareRegion) while the previous one fetches
+    // its EM and finishes; `next` is the region after this one, if any.
+    const prepared = new Map<string, Promise<Prepared>>();
+    const prepare = (c: [number, number, number]) => {
+      const key = c.join(",");
+      let p = prepared.get(key);
+      if (!p) {
+        p = prepareRegion(c, object);
+        p.catch(() => {}); // surfaced when the region is finished
+        prepared.set(key, p);
+      }
+      return p;
+    };
+    const search = async (
+      coord: [number, number, number],
+      next?: [number, number, number],
+    ) => {
       check();
       try {
-        await processRegion(coord, object, hop);
+        const prep = await prepare(coord);
+        prepared.delete(coord.join(","));
+        if (next) prepare(next);
+        await finishRegion(prep, coord, hop);
       } catch (e) {
+        prepared.delete(coord.join(","));
         if ((e as any)?.name === "AbortError") throw e;
         regionErrors++;
         logEvent("warn", `region ${coord.join(",")} (level ${hop}) failed`, e);
@@ -824,10 +887,11 @@ export async function runTwigCapture(
       prog.done++;
       report();
     };
+
     for (let r = 0; r < regions.length; ++r) {
       prog.phase = `level ${hop}: regions`;
       prefetch(regions.slice(r, r + 1 + PREFETCH_REGIONS));
-      await search(regions[r]);
+      await search(regions[r], regions[r + 1]);
     }
     // Coverage reads only what the regions themselves recorded, so the
     // scoring queue need not drain first; it drains before the next level.
@@ -858,7 +922,7 @@ export async function runTwigCapture(
         regionsTotal++;
         prog.phase = `level ${hop}: coverage`;
         prefetch(coords.slice(r, r + 1 + PREFETCH_REGIONS));
-        await search(coords[r]);
+        await search(coords[r], coords[r + 1]);
       }
     }
     await drainScoring();

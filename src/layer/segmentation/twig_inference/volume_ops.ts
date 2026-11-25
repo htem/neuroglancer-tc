@@ -274,6 +274,48 @@ export function touchingLabelsCenter(
   return { keep, rejects };
 }
 
+/** A label's bounding box in a cutout: inclusive [lo, hi] per axis. */
+export type LabelBox = [[number, number, number], [number, number, number]];
+
+/**
+ * Every listed label's bounding box, in one pass over the cutout.
+ * findContactSites would otherwise scan the whole cutout once per candidate
+ * to find its box (~80 scans of 4.8M voxels a region; 107 s of a 264 s run).
+ */
+export function labelBoxes(
+  lab: Uint32Array,
+  s: Shape,
+  labels: Iterable<number>,
+): Map<number, LabelBox> {
+  const boxes = new Map<number, LabelBox>();
+  for (const l of labels)
+    boxes.set(l, [
+      [Infinity, Infinity, Infinity],
+      [-1, -1, -1],
+    ]);
+  const [sx, sy, sz] = s;
+  let last = -1;
+  let box: LabelBox | undefined;
+  for (let z = 0, i = 0; z < sz; ++z)
+    for (let y = 0; y < sy; ++y)
+      for (let x = 0; x < sx; ++x, ++i) {
+        const l = lab[i];
+        if (l !== last) {
+          last = l;
+          box = boxes.get(l);
+        }
+        if (!box) continue;
+        const [lo, hi] = box;
+        if (x < lo[0]) lo[0] = x;
+        if (y < lo[1]) lo[1] = y;
+        if (z < lo[2]) lo[2] = z;
+        if (x > hi[0]) hi[0] = x;
+        if (y > hi[1]) hi[1] = y;
+        if (z > hi[2]) hi[2] = z;
+      }
+  return boxes;
+}
+
 /**
  * find_contact_sites: contact blobs between id1 and id2, biggest first, as
  * (voxels, centroid in cutout coordinates). Computed on id2's bbox
@@ -287,21 +329,12 @@ export function findContactSites(
   minVoxels: number,
   maxSites: number,
   gap = 0,
+  /** id2's box from labelBoxes, to skip finding it here. */
+  box?: LabelBox,
 ): Array<[number, [number, number, number]]> {
-  const [sx, sy, sz] = s;
-  const lo = [sx, sy, sz];
-  const hi = [-1, -1, -1];
-  for (let z = 0; z < sz; ++z)
-    for (let y = 0; y < sy; ++y)
-      for (let x = 0; x < sx; ++x) {
-        if (lab[idx(s, x, y, z)] !== id2) continue;
-        if (x < lo[0]) lo[0] = x;
-        if (y < lo[1]) lo[1] = y;
-        if (z < lo[2]) lo[2] = z;
-        if (x > hi[0]) hi[0] = x;
-        if (y > hi[1]) hi[1] = y;
-        if (z > hi[2]) hi[2] = z;
-      }
+  const [lo, hi] = (box ?? labelBoxes(lab, s, [id2]).get(id2)!).map((v) => [
+    ...v,
+  ]);
   if (hi[0] < 0) return [];
   const margin = 2 + gap;
   for (let d = 0; d < 3; ++d) {
