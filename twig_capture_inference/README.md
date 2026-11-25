@@ -9,15 +9,15 @@ clock shows real time: 13:05 for all 57 regions. The GIF is a time-lapse
 while the model runs. The 63 candidates at p ≥ 0.9 are then staged with
 **Stage all**. The cursor rests on **Merge staged** without clicking it.*
 
-![Twig Capture demo on CRANTb: the cluster results for 440 neurons, sorted by synapses, then one neuron's confident candidates staged for review](docs/twig_capture_crantb_demo.gif)
+![Twig Selector demo on CRANTb: a neuron is queued, merges are predicted in the browser, and the confident candidates are staged for review](docs/twig_capture_crantb_demo.gif)
 
-*CRANTb cluster results in the **Twig Capture** tab: 440 neurons, ranked
-by the synapses each candidate would add. The top suggestions bring 1,113,
-829, 753 and 616 synapses. Clicking a row shows the neuron and the candidate
-in 3D and in the EM. The top one, for neuron `576460752681808812`, has
-already been confirmed and merged by a proofreader, so it shows as part of
-the neuron. That neuron's other 56 candidates at p ≥ 0.75 (342 synapses) are
-then staged. The cursor rests on **Merge staged** without clicking it.*
+*CRANTb `576460752626597271` (410 L2 nodes), the same flow on the ant
+dataset. The neuron is queued in the **Twig Selector** and merge candidates
+are predicted on this laptop's GPU. The clock shows real time: 35:09 for all
+237 regions, 604 suggestions. The GIF is a time-lapse while the model runs.
+The 22 candidates at p ≥ 0.9 (pieces of up to 19 L2 nodes) are then staged
+with **Stage all**. The cursor rests on **Merge staged** without clicking
+it.*
 
 ## Links
 
