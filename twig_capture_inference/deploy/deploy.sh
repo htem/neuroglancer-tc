@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Deploy the Twig Capture viewer (this branch's build) to the three dataset
+# Deploy the Twig Capture viewer (this branch's build) to the dataset
 # folders served by radagast:
 #
 #   https://radagast.hms.harvard.edu/twigcapture_banc/
 #   https://radagast.hms.harvard.edu/twigcapture_aedes/
 #   https://radagast.hms.harvard.edu/twigcapture_crantb/
+#   https://radagast.hms.harvard.edu/twigcapture_fanc/
+#
+# FANC has no cluster results yet (no results_fanc/ to link), so its Twig
+# Capture tab starts empty and the viewer opens on the Twig Selector.
 #
 # One build, copied into each folder with that folder's default_state.json
 # (a link with no state opens the folder's dataset; see
@@ -31,21 +35,21 @@ node --experimental-strip-types ./build_tools/cli.ts build --output "$OUT"
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-for k in banc aedes crantb; do
+for k in banc aedes crantb fanc; do
   mkdir -p "$STAGE/twigcapture_$k"
   cp -R "$OUT/." "$STAGE/twigcapture_$k/"
   cp "$HERE/$k/default_state.json" "$STAGE/twigcapture_$k/"
 done
 
 # One ssh session (one Duo prompt): upload a tarball, then swap folders.
-tar -C "$STAGE" -czf "$STAGE/site.tgz" twigcapture_banc twigcapture_aedes twigcapture_crantb
+tar -C "$STAGE" -czf "$STAGE/site.tgz" twigcapture_banc twigcapture_aedes twigcapture_crantb twigcapture_fanc
 scp "$STAGE/site.tgz" "$HOST:/tmp/twigcapture_site.$$.tgz"
 ssh "$HOST" bash -s -- "$BASE" "/tmp/twigcapture_site.$$.tgz" <<'EOF'
 set -euo pipefail
 BASE="$1"; TGZ="$2"
 mkdir -p "$BASE/.incoming"
 tar -C "$BASE/.incoming" -xzf "$TGZ"
-for k in banc aedes crantb; do
+for k in banc aedes crantb fanc; do
   d="$BASE/twigcapture_$k"
   rm -rf "$d.prev"
   [ -d "$d" ] && mv "$d" "$d.prev"
@@ -60,4 +64,4 @@ rm -rf "$BASE/.incoming" "$TGZ"
 ls -ld "$BASE"/twigcapture_*
 EOF
 echo "Deployed. Check:"
-for k in banc aedes crantb; do echo "  https://radagast.hms.harvard.edu/twigcapture_$k/"; done
+for k in banc aedes crantb fanc; do echo "  https://radagast.hms.harvard.edu/twigcapture_$k/"; done

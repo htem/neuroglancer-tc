@@ -1,0 +1,51 @@
+{
+ "title": "Twig Capture: FANC",
+ "dimensions": {
+  "x": [
+   4.3e-09,
+   "m"
+  ],
+  "y": [
+   4.3e-09,
+   "m"
+  ],
+  "z": [
+   4.5e-08,
+   "m"
+  ]
+ },
+ "position": [
+  46357.5,
+  98272.5,
+  1613.5
+ ],
+ "crossSectionScale": 1,
+ "projectionScale": 524288,
+ "layers": [
+  {
+   "type": "image",
+   "source": "precomputed://gs://lee-lab_female-adult-nerve-cord/alignmentV4/em/rechunked",
+   "tab": "source",
+   "name": "em"
+  },
+  {
+   "type": "segmentation",
+   "source": "graphene://middleauth+https://cave.fanc-fly.com/segmentation/table/mar2021_prod",
+   "toolBindings": {
+    "M": "grapheneMergeSegments",
+    "C": "grapheneMulticutSegments",
+    "F": "grapheneFindPath"
+   },
+   "tab": "twigSelector",
+   "twigCapture": {
+    "catalogUrl": "https://radagast.hms.harvard.edu/twigcapture_fanc/results/"
+   },
+   "name": "seg"
+  }
+ ],
+ "selectedLayer": {
+  "visible": true,
+  "layer": "seg"
+ },
+ "layout": "xy-3d"
+}

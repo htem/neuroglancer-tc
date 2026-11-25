@@ -16,11 +16,15 @@
 
 /**
  * Per-dataset settings for in-browser Twig Capture, transcribed from
- * twigcapture configs/{banc,aedes,crantb}.yaml (branch banc-fragments).
+ * twigcapture configs/{banc,aedes,crantb,fanc}.yaml (branch banc-fragments).
  *
- * The pipeline is the same for every dataset; only data sources and the z
- * resolution differ. The dataset is picked by matching the segmentation
- * layer's graphene table.
+ * The pipeline is the same for every dataset; only data sources and the
+ * resolutions differ. BANC, Aedes and CRANTb cut supervoxels at 32 nm and
+ * read EM at 8 nm; FANC has no 32 nm mip and uses 34.4 / 8.6 nm. Everything
+ * the pipeline computes in nm is derived from these (see gridOf), and the EM
+ * must always be exactly 4x finer than the supervoxels in xy, as the model's
+ * inputs are 4 EM voxels per mask voxel. The dataset is picked by matching
+ * the segmentation layer's graphene table.
  */
 
 export interface TwigDataset {
@@ -32,9 +36,9 @@ export interface TwigDataset {
   table: string;
   /** Watershed supervoxels under the graphene layer (precomputed). */
   supervoxelUrl: string;
-  /** Supervoxel scale used for cutouts: [32, 32, z]. */
+  /** Supervoxel scale used for cutouts: [32, 32, z] (FANC [34.4, 34.4, 45]). */
   supervoxelResolution: [number, number, number];
-  /** EM read at 8 nm in xy. */
+  /** EM, read at 1/4 of the supervoxel xy resolution (8 nm; FANC 8.6 nm). */
   emUrl: string;
   emResolution: [number, number, number];
   /**
@@ -106,7 +110,43 @@ export const TWIG_DATASETS: TwigDataset[] = [
     emUrl: "precomputed://gs://dkronauer-ant-001-alignment-final/aligned",
     emResolution: [8, 8, 42],
   },
+  {
+    key: "fanc",
+    label: "FANC",
+    datastack: "fanc_production_mar2021",
+    table: "mar2021_prod",
+    catalogUrl: "https://radagast.hms.harvard.edu/twigcapture_fanc/results/",
+    synapseTable: "synapses_nov2022",
+    supervoxelUrl: "precomputed://gs://fanc-fly_segmentation/mar2021/ws",
+    supervoxelResolution: [34.4, 34.4, 45],
+    emUrl:
+      "precomputed://gs://lee-lab_female-adult-nerve-cord/alignmentV4/em/rechunked",
+    emResolution: [8.6, 8.6, 45],
+    note:
+      "FANC has no 32 nm supervoxel mip: cutouts are at 34.4 nm and EM at " +
+      "8.6 nm, so the model sees ~7.5% more tissue per patch than it was " +
+      "trained on (no FANC training data yet). There is no " +
+      "twig_capture_decisions table on FANC yet, so verdicts cannot be saved.",
+  },
 ];
+
+/**
+ * A dataset's grids, in nm. Region bins are half the supervoxel xy voxel
+ * (16 nm for BANC/Aedes/CRANTb, 17.2 nm for FANC) so that a supervoxel
+ * cutout centre is bin / 2; the EM is `emPerSv` times finer in xy.
+ */
+export function gridOf(
+  ds: Pick<TwigDataset, "supervoxelResolution" | "emResolution">,
+) {
+  const [svNm, , zRes] = ds.supervoxelResolution;
+  const emPerSv = svNm / ds.emResolution[0];
+  if (Math.abs(emPerSv - 4) > 1e-6 || ds.emResolution[2] !== zRes)
+    throw new Error(
+      `EM ${ds.emResolution.join("x")} nm must be 1/4 of supervoxels ` +
+        `${ds.supervoxelResolution.join("x")} nm in xy, same z`,
+    );
+  return { svNm, binNm: svNm / 2, zRes, emPerSv: 4 };
+}
 
 /** The dataset whose graphene table appears in any of the layer's URLs. */
 export function datasetForUrls(urls: string[]): TwigDataset | undefined {
@@ -118,8 +158,8 @@ export function datasetForUrls(urls: string[]): TwigDataset | undefined {
 }
 
 /**
- * Pipeline parameters (configs/*.yaml `filtering`, identical for the three
- * datasets). The synapse-density gate (min_synapses_within) is not applied:
+ * Pipeline parameters (configs/*.yaml `filtering`, identical for every
+ * dataset). The synapse-density gate (min_synapses_within) is not applied:
  * it needs a precomputed per-dataset grid that only exists on the cluster, and
  * the orphan-first runner already runs without it.
  */
@@ -144,7 +184,10 @@ export const TWIG_PARAMS = {
   maxCandidateL2: 20,
   maxContactSites: 8,
   minContactBlob: 10,
-  /** Region bins, in 16 nm (xy) and z-voxel units: 1120 x 1120 x 28 slices. */
+  /**
+   * Region bins, in bin units (half a supervoxel: 16 nm, FANC 17.2 nm) in
+   * xy and z voxels: 1120 x 1120 nm x 28 slices (FANC 1204 nm).
+   */
   binXY: 70,
   binZ: 28,
   maxEmZeroFrac: 0.05,

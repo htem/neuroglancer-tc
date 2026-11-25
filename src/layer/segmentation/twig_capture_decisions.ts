@@ -90,6 +90,12 @@ export const DECISION_ALLOWLIST: readonly string[] = [
   // --dataset crantb. Leave this entry out of a deployment until that table
   // exists: without it the writer has nowhere to post.
   "https://data.proofreading.zetta.ai/segmentation/table/kronauer_ant_x1",
+  // FANC (fanc_production_mar2021, table mar2021_prod) is deliberately NOT
+  // listed: it has no twig_capture_decisions table yet. Creating one
+  // (twigcapture scripts/cave/create_twig_capture_tables.py --dataset fanc
+  // --create) awaits approval; add
+  //   "https://cave.fanc-fly.com/segmentation/table/mar2021_prod"
+  // here only after it exists.
 ];
 
 /**
@@ -162,6 +168,8 @@ const CTR_VOXEL_NM = [8, 8, 45];
  */
 const CTR_VOXEL_NM_BY_DATASTACK: Record<string, readonly number[]> = {
   kronauer_ant: [8, 8, 42],
+  // FANC's EM base grid (4.3 x 4.3 x 45), what its Neuroglancer state uses.
+  fanc_production_mar2021: [4.3, 4.3, 45],
 };
 
 function ctrVoxels(nm: readonly number[], datastack?: string): string {
