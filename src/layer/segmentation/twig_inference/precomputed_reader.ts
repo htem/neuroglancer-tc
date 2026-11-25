@@ -112,6 +112,31 @@ function whenOnline(signal?: AbortSignal): Promise<void> {
  * browser reports itself offline it waits for the connection instead.
  * Other HTTP statuses are returned to the caller as they are.
  */
+/**
+ * Equivalent hostnames for public S3 buckets served over HTTP/1.1, where
+ * Chrome opens at most 6 connections per host. Requests are spread over the
+ * bucket's virtual-hosted, path-style and regional endpoints (verified to
+ * serve identical bytes with `Access-Control-Allow-Origin: *`), tripling
+ * the connections. GCS is HTTP/2 and needs none.
+ */
+const MIRRORS: Record<string, string[]> = {
+  "https://bossdb-open-data.s3.amazonaws.com/": [
+    "https://bossdb-open-data.s3.amazonaws.com/",
+    "https://s3.amazonaws.com/bossdb-open-data/",
+    "https://s3.us-east-1.amazonaws.com/bossdb-open-data/",
+  ],
+};
+let mirrorTurn = 0;
+let mirrorsOn = true;
+/** One of `url`'s equivalent hosts, in turn; `url` itself if it has none. */
+export function mirrored(url: string): string {
+  if (!mirrorsOn) return url;
+  for (const [base, alts] of Object.entries(MIRRORS))
+    if (url.startsWith(base))
+      return alts[mirrorTurn++ % alts.length] + url.slice(base.length);
+  return url;
+}
+
 export async function fetchRetrying(
   url: string,
   init: RequestInit = {},
@@ -121,7 +146,7 @@ export async function fetchRetrying(
   for (let attempt = 0; ; ++attempt) {
     await whenOnline(signal);
     try {
-      const r = await fetch(url, { ...init, signal });
+      const r = await fetch(mirrored(url), { ...init, signal });
       if ((r.status === 429 || r.status >= 500) && attempt < attempts - 1) {
         throw new Error(`HTTP ${r.status} for ${url}`);
       }
@@ -133,6 +158,58 @@ export async function fetchRetrying(
   }
 }
 
+/**
+ * Per-host fetch statistics for the run timeline (pipeline.ts): requests,
+ * bytes, and requests in flight (fetch through the body), with their time
+ * integral for a mean.
+ */
+export interface HostStats {
+  requests: number;
+  bytes: number;
+  inflight: number;
+  maxInflight: number;
+  /** Integral of `inflight` over time, in request-ms. */
+  weighted: number;
+  last: number;
+}
+export const hostStats = new Map<string, HostStats>();
+
+async function tracked(
+  url: string,
+  read: () => Promise<Uint8Array>,
+): Promise<Uint8Array> {
+  const host = new URL(url, globalThis.location?.href).host;
+  let s = hostStats.get(host);
+  if (!s) {
+    s = {
+      requests: 0,
+      bytes: 0,
+      inflight: 0,
+      maxInflight: 0,
+      weighted: 0,
+      last: performance.now(),
+    };
+    hostStats.set(host, s);
+  }
+  const step = () => {
+    const t = performance.now();
+    s!.weighted += s!.inflight * (t - s!.last);
+    s!.last = t;
+  };
+  step();
+  s.inflight++;
+  s.requests++;
+  if (s.inflight > s.maxInflight) s.maxInflight = s.inflight;
+  try {
+    const b = await read();
+    s.bytes += b.byteLength;
+    return b;
+  } finally {
+    step();
+    s.inflight--;
+  }
+}
+
 async function fetchRange(
   url: string,
   start: number,
@@ -140,6 +217,15 @@ async function fetchRange(
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
   if (end <= start) return new Uint8Array(0);
+  return tracked(url, () => fetchRangeUntracked(url, start, end, signal));
+}
+
+async function fetchRangeUntracked(
+  url: string,
+  start: number,
+  end: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   const r = await fetchRetrying(
     url,
     { headers: { Range: `bytes=${start}-${end - 1}` } },
@@ -299,6 +385,32 @@ export class PrecomputedVolume {
     return out;
   }
 
+  /**
+   * Start loading the chunks under [lo, lo+shape) into the chunk cache
+   * without copying anything out, so a later cutout there is a cache hit.
+   * Failures are left to that cutout.
+   */
+  prefetch(lo: readonly number[], shape: readonly number[]) {
+    if (!this.scale) return;
+    const { chunk_sizes, voxel_offset, size } = this.scale;
+    const cs = chunk_sizes[0];
+    const c0 = [0, 1, 2].map((d) =>
+      Math.floor((Math.max(lo[d], voxel_offset[d]) - voxel_offset[d]) / cs[d]),
+    );
+    const c1 = [0, 1, 2].map((d) =>
+      Math.floor(
+        (Math.min(lo[d] + shape[d], voxel_offset[d] + size[d]) -
+          1 -
+          voxel_offset[d]) /
+          cs[d],
+      ),
+    );
+    for (let cz = c0[2]; cz <= c1[2]; ++cz)
+      for (let cy = c0[1]; cy <= c1[1]; ++cy)
+        for (let cx = c0[0]; cx <= c1[0]; ++cx)
+          this.getChunk([cx, cy, cz]).catch(() => {});
+  }
+
   private getChunk(c: number[], signal?: AbortSignal) {
     const key = c.join(",");
     let p = this.chunks.get(key);
@@ -331,14 +443,18 @@ export class PrecomputedVolume {
       bytes = got;
     } else {
       const name = `${lo[0]}-${hi[0]}_${lo[1]}-${hi[1]}_${lo[2]}-${hi[2]}`;
-      const r = await fetchRetrying(
-        this.objectUrl(`${key}/${name}`),
-        {},
-        signal,
-      );
-      if (r.status === 404) return null;
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      bytes = new Uint8Array(await r.arrayBuffer());
+      const url = this.objectUrl(`${key}/${name}`);
+      let missing = false;
+      bytes = await tracked(url, async () => {
+        const r = await fetchRetrying(url, {}, signal);
+        if (r.status === 404) {
+          missing = true;
+          return new Uint8Array(0);
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return new Uint8Array(await r.arrayBuffer());
+      });
+      if (missing) return null;
       if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
     }
     const n = csz[0] * csz[1] * csz[2];
@@ -512,3 +628,9 @@ async function decodeJpegGray(
   for (let i = 0; i < out.length; ++i) out[i] = rgba[4 * i];
   return out;
 }
+
+/** For measuring: `twigCaptureFetch.setMirrors(false)` in the console. */
+(globalThis as any).twigCaptureFetch = {
+  hostStats,
+  setMirrors: (on: boolean) => (mirrorsOn = on),
+};

@@ -36,9 +36,11 @@ import {
 } from "#src/layer/segmentation/twig_inference/datasets.js";
 import { logEvent } from "#src/layer/segmentation/twig_inference/diagnostics.js";
 import type { MergeModel } from "#src/layer/segmentation/twig_inference/model.js";
+import type { HostStats } from "#src/layer/segmentation/twig_inference/precomputed_reader.js";
 import {
   IdTable,
   PrecomputedVolume,
+  hostStats,
 } from "#src/layer/segmentation/twig_inference/precomputed_reader.js";
 import type {
   Shape,
@@ -102,6 +104,99 @@ export interface Progress {
  * pipelined (see runTwigCapture), so they need not sum to the wall time:
  * each is the wall time that phase was busy, summed over its calls.
  */
+/**
+ * A run's timeline, by state: whether the model is scoring (gpu), EM
+ * requests are in flight (em), or a region's search is running (search),
+ * accumulated at every change. The model's idle time is split by what the
+ * pipeline was doing meanwhile, which says what kept it waiting. Also the
+ * depth of the queue of patches waiting for the model (time-weighted).
+ */
+export class Timeline {
+  private last = performance.now();
+  readonly t0 = this.last;
+  private active = { gpu: 0, em: 0, search: 0 };
+  readonly ms = { gpu: 0, idle_em: 0, idle_search: 0, idle_other: 0 };
+  private queue = 0;
+  private queueWeighted = 0;
+  queueMax = 0;
+  private mark() {
+    const t = performance.now();
+    const dt = t - this.last;
+    this.last = t;
+    const a = this.active;
+    const k = a.gpu
+      ? "gpu"
+      : a.em
+        ? "idle_em"
+        : a.search
+          ? "idle_search"
+          : "idle_other";
+    this.ms[k] += dt;
+    this.queueWeighted += this.queue * dt;
+  }
+  enter(kind: "gpu" | "em" | "search") {
+    this.mark();
+    this.active[kind]++;
+  }
+  leave(kind: "gpu" | "em" | "search") {
+    this.mark();
+    this.active[kind]--;
+  }
+  async around<T>(kind: "gpu" | "em" | "search", f: () => Promise<T>) {
+    this.enter(kind);
+    try {
+      return await f();
+    } finally {
+      this.leave(kind);
+    }
+  }
+  setQueue(n: number) {
+    this.mark();
+    this.queue = n;
+    if (n > this.queueMax) this.queueMax = n;
+  }
+  summary(hosts: Map<string, HostStats>, before: Map<string, HostStats>) {
+    this.mark();
+    const total = this.last - this.t0;
+    const s = (v: number) => +(v / 1000).toFixed(1);
+    const idle = total - this.ms.gpu;
+    const perHost: Record<string, any> = {};
+    const protocol = new Map<string, string>();
+    for (const e of performance.getEntriesByType("resource") as any[]) {
+      if (e.startTime < this.t0 || !e.nextHopProtocol) continue;
+      try {
+        protocol.set(new URL(e.name).host, e.nextHopProtocol);
+      } catch {
+        // not a URL
+      }
+    }
+    for (const [host, h] of hosts) {
+      const b = before.get(host);
+      const req = h.requests - (b?.requests ?? 0);
+      if (!req) continue;
+      perHost[host] = {
+        requests: req,
+        mb: +((h.bytes - (b?.bytes ?? 0)) / 1e6).toFixed(1),
+        max_in_flight: h.maxInflight,
+        mean_in_flight: +((h.weighted - (b?.weighted ?? 0)) / total).toFixed(1),
+        protocol: protocol.get(host) ?? "unknown",
+      };
+    }
+    return {
+      gpu_busy_s: s(this.ms.gpu),
+      gpu_idle_pct: +((100 * idle) / total).toFixed(1),
+      // While the model was idle: EM in flight; else a region's search
+      // running; else neither (the main thread's own work, or start-up).
+      gpu_idle_waiting_em_s: s(this.ms.idle_em),
+      gpu_idle_waiting_search_s: s(this.ms.idle_search),
+      gpu_idle_other_s: s(this.ms.idle_other),
+      ready_queue_max: this.queueMax,
+      ready_queue_mean: +(this.queueWeighted / total).toFixed(1),
+      hosts: perHost,
+    };
+  }
+}
+
 export class PhaseTimer {
   readonly ms: Record<string, number> = {};
   readonly calls: Record<string, number> = {};
@@ -280,6 +375,16 @@ export async function runTwigCapture(
     found: 0,
   };
   const timer = new PhaseTimer();
+  const tl = new Timeline();
+  const hostsBefore = new Map(
+    [...hostStats].map(([k, v]) => [k, { ...v }] as [string, HostStats]),
+  );
+  for (const h of hostStats.values()) h.maxInflight = h.inflight;
+  try {
+    performance.setResourceTimingBufferSize(100000);
+  } catch {
+    // not supported
+  }
   const gap = opts.contactGap ?? P.contactGap;
   const gapMode = opts.contactGapMode ?? P.contactGapMode;
   const earlyStopP = opts.earlyStopP;
@@ -477,6 +582,8 @@ export async function runTwigCapture(
   let scoring: Promise<void> = Promise.resolve();
   const scoringJobs: { done: Promise<void>; patches: number }[] = [];
   let queuedPatches = 0;
+  /** Patches queued and not yet scored: the model's ready queue. */
+  let waitingPatches = 0;
   const queuedPairs = new Map<string, number>();
   const drainScoring = async () => {
     await scoring;
@@ -640,6 +747,7 @@ export async function runTwigCapture(
     // Contact sites -> patches.
     const built: SiteBuilt[] = [];
     const pending: Float32Array[] = [];
+
     const foundPerPair = new Map<string, number>();
     for (const l of cands) {
       const candId = String(rootTable.ids[l]);
@@ -762,10 +870,8 @@ export async function runTwigCapture(
           b.row._reject = "em_overflow";
           return;
         }
-        const em = (await ctx.em.cutout(
-          lo,
-          [128, 128, 18],
-          signal,
+        const em = (await tl.around("em", () =>
+          ctx.em.cutout(lo, [128, 128, 18], signal),
         )) as Uint8Array;
         let zeros = 0;
         for (let k = 0; k < em.length; ++k) if (em[k] === 0) zeros++;
@@ -828,14 +934,18 @@ export async function runTwigCapture(
           queuedPatches -= job.patches;
         }
         queuedPatches += patches.length;
+        waitingPatches += patches.length;
+        tl.setQueue(waitingPatches);
         scoring = scoring.then(async () => {
           try {
             check();
             prog.phase = `level ${hop}: scoring on ${model.backend === "webgpu" ? "GPU" : "CPU"}`;
             report();
             const p = await timer.time("model", () =>
-              model.scorePatches(patches),
+              tl.around("gpu", () => model.scorePatches(patches)),
             );
+            waitingPatches -= scoreIdx.length;
+            tl.setQueue(waitingPatches);
             patches.length = 0;
             prog.patches += scoreIdx.length;
             prog.msPerPatch = +(timer.ms.model / prog.patches).toFixed(1);
@@ -937,7 +1047,7 @@ export async function runTwigCapture(
       const key = c.join(",");
       let p = prepared.get(key);
       if (!p) {
-        p = prepareRegion(c, object);
+        p = tl.around("search", () => prepareRegion(c, object));
         p.catch(() => {}); // surfaced when the region is finished
         prepared.set(key, p);
       }
@@ -1105,6 +1215,7 @@ export async function runTwigCapture(
       region_errors: regionErrors,
       coverage_regions: coverageRegions,
       early_stop_skipped_sites: skippedSites,
+      timeline: tl.summary(hostStats, hostsBefore),
       coverage_errors: coverageErrors,
       device: model.backend,
     },
