@@ -62,6 +62,21 @@ describe("TwigCaptureState legacy links", () => {
     expect(() => restored("a string")).not.toThrow();
   });
 
+  it("defaults gap to any, and ignores junk", () => {
+    expect(restored({ hideMito: true }).gap).toBe("any");
+    expect(restored({ gap: "nonsense" }).gap).toBe("any");
+    expect(restored({ gap: "only" }).gap).toBe("only");
+  });
+
+  it("round-trips gap through toJSON, and omits it at any", () => {
+    const s = new TwigCaptureState();
+    expect(s.toJSON()).toBeUndefined();
+    s.gap = "hide";
+    const t = new TwigCaptureState();
+    t.restoreState(s.toJSON());
+    expect(t.gap).toBe("hide");
+  });
+
   it("round-trips the new facets through toJSON", () => {
     const s = new TwigCaptureState();
     s.mito = "only";

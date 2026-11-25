@@ -27,8 +27,11 @@
  *
  * Format (version 1), columnar so it gzips well:
  *   { version, generated, n, files: [{file, root_id, timestamp, dataset}],
- *     f, id, seg, p, l2, size, contact, mito, syn, xyz }
- * where every array has length n and `f` indexes `files`. Ids are strings:
+ *     f, id, seg, p, l2, size, contact, mito, syn, xyz, gap? }
+ * where every array has length n and `f` indexes `files`. `gap` (1/0) is
+ * optional and newer: 1 when the candidate was found only through the
+ * runner's --contact_gap (it does not touch the neuron at 32 nm). A table
+ * without it reads as no gap rows. Ids are strings:
  * they exceed 2^53.
  */
 
@@ -54,6 +57,8 @@ export interface TableCandidate {
   cand_size_um3: number | null;
   contact_voxels: number | null;
   likely_mito: boolean;
+  /** Found only through --contact_gap: does not touch the neuron at 32 nm. */
+  gap_contact: boolean;
   cand_synapses_total: number | null;
   coordinate_nm: [number, number, number];
   _file: string;
@@ -130,6 +135,7 @@ export function rowsFromTable(obj: unknown): CandidateTable {
       cand_size_um3: col("size", i),
       contact_voxels: col("contact", i),
       likely_mito: col("mito", i) === 1,
+      gap_contact: col("gap", i) === 1,
       cand_synapses_total: col("syn", i),
       coordinate_nm: Array.isArray(xyz) ? [xyz[0], xyz[1], xyz[2]] : [0, 0, 0],
       _file: file?.file ?? "",

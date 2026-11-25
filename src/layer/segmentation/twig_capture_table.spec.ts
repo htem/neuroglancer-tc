@@ -70,10 +70,17 @@ describe("candidate table", () => {
       _lite: true,
     });
     expect(rows[1].likely_mito).toBe(true);
+    // a table written before the gap column reads as no gap rows
+    expect(rows.every((r) => r.gap_contact === false)).toBe(true);
     expect(rows[2]._root).toBe("576460752705000070");
     expect(rows[2].cand_synapses_total).toBeNull();
     // ids above 2^53 stay exact
     expect(rows[1].target_segment_id).toBe("576460752797177154");
+  });
+
+  it("reads the optional gap column", () => {
+    const { rows } = rowsFromTable({ ...TABLE, gap: [0, 1, 0] });
+    expect(rows.map((r) => r.gap_contact)).toEqual([false, true, false]);
   });
 
   it("rejects a table of another version or with short columns", () => {

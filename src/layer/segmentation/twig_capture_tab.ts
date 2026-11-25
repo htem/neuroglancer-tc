@@ -123,11 +123,13 @@ export const TWIG_CAPTURE_JSON_KEY = "twigCapture";
  *   probOp       ">=" (default) or "<=": which side of minProb is shown.
  *                "<=" is for low-probability fragments that carry many
  *                synapses, which a reviewer may still want to look at.
- *   minProb, mito, review, sortKey
- *                four scalars that decide WHICH rows are shown and in what
+ *   minProb, mito, gap, review, sortKey
+ *                five scalars that decide WHICH rows are shown and in what
  *                order. Share "the top one by orphan synapses" without the
  *                sort and the row you meant is forty down. mito and review
- *                are facets ("any" / ...); mito replaced an older pair of
+ *                are facets ("any" / ...), and so is gap ("any" / "hide" /
+ *                "only": candidates found only through --contact_gap, which
+ *                do not touch the neuron at 32 nm); mito replaced an older pair of
  *                hideMito/mitoOnly booleans, which restoreState still reads
  *                so that links made before 2026-10-06 keep working.
  *   neuron       SeaTable filters on the neuron (super_class, cell_class,
@@ -156,6 +158,8 @@ export class TwigCaptureState {
   probOp: ">=" | "<=" = ">=";
   /** "any" | "hide" | "only" -- replaced the hideMito/mitoOnly pair. */
   mito = "any";
+  /** "any" | "hide" | "only": rows found only through --contact_gap. */
+  gap = "any";
   /** "any" | "none" | "done" | or one of the verdicts. */
   review = "any";
   sortKey = "prob";
@@ -173,6 +177,7 @@ export class TwigCaptureState {
     if (this.minProb !== 0.75) x.minProb = this.minProb;
     if (this.probOp !== ">=") x.probOp = this.probOp;
     if (this.mito !== "any") x.mito = this.mito;
+    if (this.gap !== "any") x.gap = this.gap;
     if (this.review !== "any") x.review = this.review;
     if (this.sortKey !== "prob") x.sortKey = this.sortKey;
     if (hasNeuronFilters(this.neuron)) {
@@ -204,6 +209,7 @@ export class TwigCaptureState {
     this.mito =
       o.hideMito === true ? "hide" : o.mitoOnly === true ? "only" : "any";
     if (["any", "hide", "only"].includes(o.mito)) this.mito = o.mito;
+    this.gap = ["hide", "only"].includes(o.gap) ? o.gap : "any";
     this.review = [
       "any",
       "none",
@@ -277,6 +283,8 @@ interface TwigCandidate {
   enclosure?: number | null;
   cand_em_mean?: number | null;
   likely_mito?: boolean;
+  /** Found only through the runner's --contact_gap (no 32 nm contact). */
+  gap_contact?: boolean;
   description?: string;
   // added 2026-09-24: what the chunkedgraph /merge endpoint needs. Supervoxels
   // are immutable, so these stay valid however much the graph is edited --
@@ -689,6 +697,7 @@ export class TwigCaptureTab extends Tab {
   private catalog: CatalogEntry[] = [];
   private catalogUrl = "";
   private mitoSelect: HTMLSelectElement | undefined;
+  private gapSelect: HTMLSelectElement | undefined;
   private probOpSelect: HTMLSelectElement | undefined;
   private reviewSelect: HTMLSelectElement | undefined;
   private mergeAllButton = document.createElement("button");
@@ -828,6 +837,7 @@ export class TwigCaptureTab extends Tab {
   private minProb = 0.75;
   private probOp: ">=" | "<=" = ">=";
   private mito = "any";
+  private gap = "any";
   private review = "any";
   private sortKey: "prob" | "size" | "contact" | "synapses" = "prob";
 
@@ -845,6 +855,7 @@ export class TwigCaptureTab extends Tab {
     t.minProb = this.minProb;
     t.probOp = this.probOp;
     t.mito = this.mito;
+    t.gap = this.gap;
     t.review = this.review;
     t.sortKey = this.sortKey;
     t.neuron = { ...this.neuronFilters };
@@ -859,6 +870,7 @@ export class TwigCaptureTab extends Tab {
     this.minProb = saved.minProb;
     this.probOp = saved.probOp;
     this.mito = saved.mito;
+    this.gap = saved.gap;
     this.review = saved.review;
     this.sortKey = saved.sortKey as typeof this.sortKey;
     this.neuronFilters = { ...saved.neuron };
@@ -1718,6 +1730,21 @@ export class TwigCaptureTab extends Tab {
       (v) => (this.mito = v),
     );
 
+    this.gapSelect = addFacet(
+      "gap",
+      "gap = found only through the runner's --contact_gap: the candidate " +
+        "does not touch the neuron in the 32 nm cutout, only comes within " +
+        "a voxel of it. Scored by a model trained on touching pairs, so " +
+        "its p is a weak guide; reviews of these rows are new training data.",
+      [
+        ["any", "any"],
+        ["hide", "hide gap"],
+        ["only", "gap only"],
+      ],
+      () => this.gap,
+      (v) => (this.gap = v),
+    );
+
     this.reviewSelect = addFacet(
       "review",
       "Filters on decisions recorded in twig_capture_decisions (CAVE) for " +
@@ -2023,6 +2050,7 @@ export class TwigCaptureTab extends Tab {
    */
   private renderFilters() {
     if (this.mitoSelect !== undefined) this.mitoSelect.value = this.mito;
+    if (this.gapSelect !== undefined) this.gapSelect.value = this.gap;
     if (this.probOpSelect !== undefined) this.probOpSelect.value = this.probOp;
     if (this.reviewSelect !== undefined) {
       this.reviewSelect.value = this.review;
@@ -3485,6 +3513,7 @@ export class TwigCaptureTab extends Tab {
         this.probOp,
         this.minProb,
         this.mito,
+        this.gap,
         this.review,
         this.sortKey,
         this.neuronFiltersActive() ? this.neuronFilters : null,
@@ -3523,6 +3552,9 @@ export class TwigCaptureTab extends Tab {
       const mito = c.likely_mito === true;
       if (this.mito === "hide" && mito) return false;
       if (this.mito === "only" && !mito) return false;
+      const gap = c.gap_contact === true;
+      if (this.gap === "hide" && gap) return false;
+      if (this.gap === "only" && !gap) return false;
       // Review state. Skipped entirely when decisions are not enabled for
       // this layer: this.decisions is then empty by construction, and
       // filtering on it would hide every row while claiming they are all
@@ -4044,6 +4076,17 @@ export class TwigCaptureTab extends Tab {
       tag.textContent = "mito?";
       tag.title =
         "enclosure > 0.6 and mean EM < 100 -- a provisional flag for triage, not a filter";
+      main.appendChild(tag);
+    }
+
+    if (candidate.gap_contact) {
+      const tag = document.createElement("span");
+      tag.classList.add("neuroglancer-twig-capture-tag");
+      tag.textContent = "gap";
+      tag.title =
+        "Does not touch the neuron in the 32 nm cutout; found only within " +
+        "a voxel of it (--contact_gap). The model has not been trained on " +
+        "gaps yet, so judge it from the EM.";
       main.appendChild(tag);
     }
 
