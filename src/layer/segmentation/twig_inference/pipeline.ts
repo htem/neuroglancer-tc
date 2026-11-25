@@ -23,12 +23,15 @@
  * Differences from the cluster runner, all deliberate:
  * - no synapse-density gate (needs a cluster-only grid), so every non-backbone
  *   L2 bin is searched; `maxRegions` caps the work;
- * - EM is the dataset's public 8 nm mip;
+ * - EM is the dataset's public 8 nm mip (FANC 8.6 nm, see datasets.ts);
  * - synapse counts are not computed (no synapse tables in the browser).
  */
 
 import type { TwigDataset } from "#src/layer/segmentation/twig_inference/datasets.js";
-import { TWIG_PARAMS } from "#src/layer/segmentation/twig_inference/datasets.js";
+import {
+  TWIG_PARAMS,
+  gridOf,
+} from "#src/layer/segmentation/twig_inference/datasets.js";
 import { logEvent } from "#src/layer/segmentation/twig_inference/diagnostics.js";
 import type { MergeModel } from "#src/layer/segmentation/twig_inference/model.js";
 import {
@@ -91,6 +94,7 @@ export class DatasetContext {
   readonly svRoot = new Map<bigint, bigint>();
   readonly l2Count = new Map<string, number>();
   constructor(readonly dataset: TwigDataset) {
+    gridOf(dataset); // throws if the EM is not 4x finer than the supervoxels
     this.sv = new PrecomputedVolume(
       dataset.supervoxelUrl,
       dataset.supervoxelResolution,
@@ -194,7 +198,7 @@ export async function runTwigCapture(
 ): Promise<LocalResultJson> {
   const P = TWIG_PARAMS;
   const ds = ctx.dataset;
-  const zRes = ds.supervoxelResolution[2];
+  const { svNm, binNm, zRes, emPerSv } = gridOf(ds);
   const t0 = performance.now();
   const prog: Progress = {
     phase: "L2 graph",
@@ -228,7 +232,7 @@ export async function runTwigCapture(
   };
   const emSize = ctx.em.scale.size;
   const emOff = ctx.em.scale.voxel_offset;
-  const half = [16 * 32, 16 * 32, 9 * zRes];
+  const half = [16 * svNm, 16 * svNm, 9 * zRes];
   let regionErrors = 0;
   let regionsSearched = 0;
   let regionsTotal = 0;
@@ -244,7 +248,12 @@ export async function runTwigCapture(
       check();
       const attrs = await getL2Attributes(graph, leaves);
       check();
-      for (const c of binL2(leaves, attrs, zRes, skipBackbone)) {
+      for (const c of binL2(
+        leaves,
+        attrs,
+        ds.supervoxelResolution,
+        skipBackbone,
+      )) {
         const key = c.join(",");
         if (!seen.has(key)) {
           seen.add(key);
@@ -271,7 +280,8 @@ export async function runTwigCapture(
     object: Set<bigint>,
     hop: number,
   ) => {
-    // Supervoxel cutout, 200 x 200 x 120 at [32, 32, z].
+    // Supervoxel cutout, 200 x 200 x 120 at [svNm, svNm, z] (bins are half
+    // a supervoxel voxel).
     const g = [Math.floor(coord[0] / 2), Math.floor(coord[1] / 2), coord[2]];
     const origin = [g[0] - s[0] / 2, g[1] - s[1] / 2, g[2] - s[2] / 2];
     const svLab = (await ctx.sv.cutout(origin, s, signal)) as Uint32Array;
@@ -366,8 +376,8 @@ export async function runTwigCapture(
         ];
         // v1-style site position for the claim test (_site_nm).
         const q = [
-          (coord[0] + (c[0] - 100) * 2) * 16,
-          (coord[1] + (c[1] - 100) * 2) * 16,
+          (coord[0] + (c[0] - 100) * 2) * binNm,
+          (coord[1] + (c[1] - 100) * 2) * binNm,
           (coord[2] + (c[2] - 60)) * zRes,
         ];
         if (
@@ -383,7 +393,7 @@ export async function runTwigCapture(
         }
         seen.push(q as [number, number, number]);
         const gc = [origin[0] + c[0], origin[1] + c[1], origin[2] + c[2]];
-        const ctrNm = [gc[0] * 32, gc[1] * 32, gc[2] * zRes];
+        const ctrNm = [gc[0] * svNm, gc[1] * svNm, gc[2] * zRes];
         let sinkRoot: bigint | undefined;
         const side = (lab: number) => {
           const pt = voxelNear(rootLab, s, c, lab);
@@ -393,8 +403,8 @@ export async function runTwigCapture(
           return {
             supervoxel_id: String(sv),
             coordinate_nm: [
-              (origin[0] + pt[0]) * 32,
-              (origin[1] + pt[1]) * 32,
+              (origin[0] + pt[0]) * svNm,
+              (origin[1] + pt[1]) * svNm,
               (origin[2] + pt[2]) * zRes,
             ],
           };
@@ -413,7 +423,7 @@ export async function runTwigCapture(
             contact_voxels: stats.contact_voxels,
             cand_voxels: stats.cand_voxels,
             cand_size_um3: +(
-              (stats.cand_voxels * 32 * 32 * zRes) /
+              (stats.cand_voxels * svNm * svNm * zRes) /
               1e9
             ).toFixed(4),
             merge_sink,
@@ -433,7 +443,7 @@ export async function runTwigCapture(
             ...(sinkRoot !== undefined && sinkRoot !== rootBig
               ? { via_root: String(sinkRoot) }
               : {}),
-            _emCentre: [gc[0] * 4, gc[1] * 4, gc[2]],
+            _emCentre: [gc[0] * emPerSv, gc[1] * emPerSv, gc[2]],
           },
         });
         pending.push(x);
@@ -659,7 +669,8 @@ export function spreadRegions(
   if (all.length <= max) return all;
   if (max <= 0) return [];
   const n = all.length;
-  // Bin coordinates are 16 nm in x/y and z slices; compare in bin units,
+  // Bin coordinates are bin units (16 nm; FANC 17.2) in x/y and z slices;
+  // compare in bin units,
   // which is what the search windows are sized in.
   const key = (c: [number, number, number]) => [
     c[0] / 70,
@@ -699,16 +710,19 @@ export function spreadRegions(
 /**
  * Region centres for a set of L2 nodes, one per bin, exactly as a run picks
  * them: backbone/soma nodes (max_dt or size above the runner's limits) are
- * skipped when `skipBackbone`, coordinates are in 16 nm x/y and z-slice
- * units, and the first node in each bin is its centre.
+ * skipped when `skipBackbone`, coordinates are in bin units (half the
+ * supervoxel xy voxel: 16 nm, FANC 17.2 nm) and z slices, and the first node
+ * in each bin is its centre. `svRes` is the dataset's supervoxelResolution.
  */
 export function binL2(
   leaves: string[],
   attrs: Record<string, any>,
-  zRes: number,
+  svRes: [number, number, number],
   skipBackbone: boolean,
 ): [number, number, number][] {
   const P = TWIG_PARAMS;
+  const binNm = svRes[0] / 2;
+  const zRes = svRes[2];
   const bins = new Map<string, [number, number, number]>();
   for (const id of leaves) {
     const a = attrs[id];
@@ -720,8 +734,8 @@ export function binL2(
     )
       continue;
     const c: [number, number, number] = [
-      Math.floor(a.rep_coord_nm[0] / 16),
-      Math.floor(a.rep_coord_nm[1] / 16),
+      Math.floor(a.rep_coord_nm[0] / binNm),
+      Math.floor(a.rep_coord_nm[1] / binNm),
       Math.floor(a.rep_coord_nm[2] / zRes),
     ];
     const key = `${Math.floor(c[0] / P.binXY)},${Math.floor(c[1] / P.binXY)},${Math.floor(c[2] / P.binZ)}`;
@@ -734,12 +748,12 @@ export function binL2(
 export async function neuronSize(
   graph: GraphAccess,
   root: string,
-  zRes: number,
+  svRes: [number, number, number],
 ): Promise<{ l2: number; regions: number }> {
   const leaves = await getLeavesL2(graph, root);
   const attrs = await getL2Attributes(graph, leaves);
   return {
     l2: leaves.length,
-    regions: binL2(leaves, attrs, zRes, true).length,
+    regions: binL2(leaves, attrs, svRes, true).length,
   };
 }

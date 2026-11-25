@@ -26,6 +26,7 @@ then staged. The cursor rests on **Merge staged** without clicking it.*
 | BANC | https://radagast.hms.harvard.edu/twigcapture_banc/ |
 | Aedes | https://radagast.hms.harvard.edu/twigcapture_aedes/ |
 | CRANTb | https://radagast.hms.harvard.edu/twigcapture_crantb/ |
+| FANC | https://radagast.hms.harvard.edu/twigcapture_fanc/ (in-browser only, see below) |
 
 Each link opens its dataset, with the Twig Capture tab connected to the
 cluster results of that dataset's newest model, served beside the viewer
@@ -40,6 +41,24 @@ filters). Today: BANC `banc_v2.0` (banc_finetune 2026-11-13), Aedes
 `aedes_v2.0_test` (aedes_finetune 2026-11-13), CRANTb
 `crantb_test_aedes_v2.1`. When a newer model's results land, relink the
 folder and re-run both scripts.
+
+**FANC** (`fanc_production_mar2021`) is new and in-browser only for now:
+- **No cluster results yet** (no `results_fanc/`), so the viewer opens on
+  the Twig Selector, and the Twig Capture tab lists only what you predict
+  in this browser.
+- **No `twig_capture_decisions` table on FANC yet.** Creating it (twigcapture
+  `scripts/cave/create_twig_capture_tables.py --dataset fanc --create`)
+  awaits approval. Until it exists, FANC is left out of the decisions
+  allowlist (`twig_capture_decisions.ts`). The review tab then hides the
+  verdict buttons (**Not a merge**, **Unsure**, **New neuron**, **Split
+  needed**) and the review filter, and writes nothing to CAVE. **Merge** and
+  **Stage all → Merge staged** still work: they are ordinary chunkedgraph
+  merges, just not recorded as decisions.
+- **Resolution.** FANC has no 32 nm supervoxel mip, so it runs at 34.4 nm
+  (supervoxels) and 8.6 nm (EM), keeping the model's 1:4 ratio. Each patch
+  therefore covers about 7.5% more tissue than in training, and no model has
+  seen FANC yet, so treat FANC probabilities as uncalibrated until a model
+  trained with FANC data (see twigcapture `docs/fanc/PLAN.md`) is published.
 
 ## Predicting merges for your own neurons
 

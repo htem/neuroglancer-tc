@@ -302,7 +302,7 @@ export class TwigSelectorState {
     });
     this.updateRoot(item)
       .catch(() => undefined)
-      .then(() => neuronSize(graph, item.root, ds.supervoxelResolution[2]))
+      .then(() => neuronSize(graph, item.root, ds.supervoxelResolution))
       .then(
         (size) => {
           item.size = size;
@@ -483,7 +483,7 @@ export class TwigSelectorState {
             item.size ??= await neuronSize(
               graph,
               item.root,
-              ds.supervoxelResolution[2],
+              ds.supervoxelResolution,
             );
             const gpu = await this.willUseGpu();
             this.gpuKnown = gpu;
