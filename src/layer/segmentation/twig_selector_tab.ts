@@ -495,7 +495,14 @@ export class TwigSelectorState {
     const signal = this.abort.signal;
     this.changed.dispatch();
     try {
-      for (const item of this.items) {
+      // The live queue, not a snapshot: updateRoot, remove and
+      // clearFinished replace this.items, and neurons queued during the run
+      // must be picked up. Each item is visited once per run.
+      const visited = new Set<QueueItem>();
+      for (;;) {
+        const item = this.items.find((i) => !visited.has(i));
+        if (item === undefined) break;
+        visited.add(item);
         if (signal.aborted) break;
         if (item.status === "running" || item.status === "done") {
           if (!force || item.status === "running") continue;
@@ -711,12 +718,7 @@ export class TwigSelectorState {
     const store = this.layer.localTwigResults;
     store.pendingOpen = r.name;
     store.changed.dispatch();
-    // The side panel owns which tab is shown: pick the panel that holds Twig
-    // Capture (the selected-layer panel unless it was pinned elsewhere).
-    const panels = this.layer.panels.panels;
-    const panel =
-      panels.find((p) => p.tabs.includes("twigCapture")) ?? panels[0];
-    panel.selectedTab.value = "twigCapture";
+    this.showCaptureTab();
   }
 }
 
