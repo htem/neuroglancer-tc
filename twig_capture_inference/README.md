@@ -94,10 +94,10 @@ and so on. Those rows say which suggestion they attach to ("via").
 
 **Speed.** The model runs on Twig Capture's own WebGPU network (adapted
 from Philipp Schlegel's Coda, see Acknowledgements): about 41 ms per patch
-on an Apple M1 Max, against 81 ms with ONNX Runtime. The next regions are
-cut out while the GPU scores the current one. Aedes `648518347555976042`
-(36 regions, 2,477 patches) went from 512 s to about 250 s, with identical
-suggestions. Expect about 7 s per region, so a few minutes for a small
+on an Apple M1 Max, against 81 ms with ONNX Runtime. EM for the next
+regions is fetched and cut out while the GPU scores the current one. Aedes
+`648518347555976042` (36 regions, 2,477 patches) went from 512 s to about
+150 s, with identical suggestions. Expect about 7 s per region, so a few minutes for a small
 neuron and longer for a big one. On the CPU, expect about 3 s per patch.
 There, set sites/pair to 1 and cap max regions. The **device** setting can
 also pick **GPU (ONNX Runtime)**, the previous GPU path.
