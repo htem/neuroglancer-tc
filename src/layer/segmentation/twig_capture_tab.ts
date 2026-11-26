@@ -95,6 +95,10 @@ import {
   LOCAL_RESULT_PREFIX,
   type LocalResultJson,
 } from "#src/layer/segmentation/twig_local_results.js";
+import {
+  isLargeMerge,
+  mergeOrder,
+} from "#src/layer/segmentation/twig_merge_order.js";
 import { StatusMessage } from "#src/status.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { removeChildren } from "#src/util/dom.js";
@@ -246,7 +250,9 @@ function ref0Seed(
   active: { root_id: string } | undefined,
   candidate: TwigCandidate,
 ): string {
-  return active?.root_id ?? candidate._root ?? candidate.parent_root ?? "";
+  // The row's own neuron first: in a combined list the active result's
+  // root_id is not this row's neuron.
+  return candidate._root ?? active?.root_id ?? candidate.parent_root ?? "";
 }
 
 /** One candidate as run_twigcapture.py emits it. */
@@ -1812,22 +1818,20 @@ export class TwigCaptureTab extends Tab {
     local.pendingOpen = undefined;
     const combined = local.pendingCombined;
     local.pendingCombined = undefined;
-    // Drop local results that were deleted from the store.
     // Drop local results deleted from the store or belonging to another
     // dataset; a combined list (members) is not in the store and stays.
-    const ownStack = datasetForUrls(this.sourceUrls())?.datastack;
+    const datastack = datasetForUrls(this.sourceUrls())?.datastack;
     this.results = this.results.filter(
       (r) =>
         !r.name.startsWith(LOCAL_RESULT_PREFIX) ||
         r.members !== undefined ||
         (local.get(r.name) !== undefined &&
-          (ownStack === undefined || r.dataset === ownStack)),
+          (datastack === undefined || r.dataset === datastack)),
     );
     if (this.active && !this.results.includes(this.active))
       this.active = undefined;
     // The local store is per browser origin, and the BANC, Aedes and CRANTb
     // viewers share one (radagast): list only this layer's dataset.
-    const datastack = datasetForUrls(this.sourceUrls())?.datastack;
     for (const json of local.results) {
       if (datastack !== undefined && json.dataset !== datastack) continue;
       const existing = this.results.find((r) => r.name === json.name);
@@ -2521,7 +2525,7 @@ export class TwigCaptureTab extends Tab {
         created: Date.now(),
       };
       // Both views: the single-neuron map only if this is the neuron shown.
-      if (this.active === result) {
+      if (this.isShown(result)) {
         this.decisions.set(candidate.target_segment_id, row);
       }
       this.allDecisions.set(candidate.target_segment_id, row);
@@ -2725,7 +2729,28 @@ export class TwigCaptureTab extends Tab {
       const neuron = batch
         ? undefined
         : await this.neuronRootConsensus(result, candidate);
-      const fromAll = this.active !== result;
+      // A level-2 row attaches to an earlier suggestion: until that is
+      // merged its contact is on the suggestion, which is not a split.
+      const parent = candidate.via_root;
+      if (
+        !batch &&
+        parent !== undefined &&
+        neuron !== undefined &&
+        neuron.root !== sinkRoot
+      ) {
+        StatusMessage.showTemporaryMessage(
+          `Twig Capture: NOT merged. ${candidate.target_segment_id} attaches to ` +
+            `suggestion ${parent}, which is not merged into the neuron yet. ` +
+            "Merge that one first.",
+          8000,
+        );
+        this.mergeStatus.delete(key);
+        this.render();
+        return "cancelled";
+      }
+      // A combined list ("Open ticked together") shows its member neurons
+      // as the one-neuron view does, not as the all-neurons table.
+      const fromAll = !this.isShown(result);
       if (neuron !== undefined && neuron.root !== sinkRoot) {
         const why =
           `This candidate's contact is on segment ${sinkRoot}, but ` +
@@ -3204,6 +3229,19 @@ export class TwigCaptureTab extends Tab {
   }
 
   /**
+   * Whether this result is shown as a neuron: the active result itself, or
+   * one of the members of an active combined list ("Open ticked together").
+   * Anything else came from the all-neurons table.
+   */
+  private isShown(result: TwigResult): boolean {
+    const active = this.active;
+    if (active === undefined) return false;
+    return (
+      active === result || (active.members?.includes(result.name) ?? false)
+    );
+  }
+
+  /**
    * Merge the ticked staged candidates, one after another.
    *
    * Sequential because each merge gives the neuron a new root, which the
@@ -3230,6 +3268,9 @@ export class TwigCaptureTab extends Tab {
       if (g === undefined) groups.set(file, (g = []));
       g.push(c);
     }
+    // Level-2 rows after the suggestion they attach to (mergeOrder), or
+    // their contact is not on the neuron yet and they would be skipped.
+    for (const [file, rows] of groups) groups.set(file, mergeOrder(rows));
     // Each neuron's root today, and whether it is safe to proceed. Safe
     // means: not split since inference. A changed root alone (a test merge,
     // someone else's merges) is expected and only warned about; a split may
@@ -3292,7 +3333,7 @@ export class TwigCaptureTab extends Tab {
       expectedRoot.set(file, root);
     }
     const syn = picks.reduce((a, c) => a + (c.cand_synapses_total ?? 0), 0);
-    const large = picks.filter((c) => (c.num_l2_nodes ?? 0) > LARGE_MERGE_L2);
+    const large = picks.filter((c) => isLargeMerge(c));
     const into =
       groups.size === 1
         ? `neuron ${(await this.resultForFile([...groups.keys()][0]))?.root_id ?? result.root_id}`
@@ -3311,7 +3352,7 @@ export class TwigCaptureTab extends Tab {
         (large.length
           ? `\n\nWARNING, ${large.length} LARGE MERGE(S): partner(s) above ` +
             `${LARGE_MERGE_L2} L2 nodes (largest ` +
-            `${Math.max(...large.map((c) => c.num_l2_nodes ?? 0))}), bigger ` +
+            `${Math.max(...large.map((c) => c.num_l2_nodes ?? 0)) || "unknown"}), bigger ` +
             "than the model was trained on. Untick any you have not looked at."
           : "") +
         (warnings.length
@@ -4056,13 +4097,18 @@ export class TwigCaptureTab extends Tab {
 
     // Bigger than any partner the model was trained on. Never hidden: the
     // reviewer decides, but should look at the whole fragment first.
-    if ((candidate.num_l2_nodes ?? 0) > LARGE_MERGE_L2) {
+    if (isLargeMerge(candidate)) {
       const tag = document.createElement("span");
       tag.classList.add("neuroglancer-twig-capture-tag");
       tag.classList.add("neuroglancer-twig-capture-tag-warn");
-      tag.textContent = "large merge";
+      const unknown = candidate.num_l2_nodes == null;
+      tag.textContent = unknown ? "unknown size" : "large merge";
       tag.title =
-        `This partner has ${candidate.num_l2_nodes} L2 nodes. The model was ` +
+        (unknown
+          ? "This partner's size could not be looked up, so treat it as a " +
+            "possibly large merge. "
+          : `This partner has ${candidate.num_l2_nodes} L2 nodes. `) +
+        `The model was ` +
         `trained on partners of up to ${LARGE_MERGE_L2} and sees only ~1 um ` +
         "around the contact, not the fragment's size, so a wrong large " +
         "merge does the most damage. Look at the whole fragment before " +

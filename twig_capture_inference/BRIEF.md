@@ -140,6 +140,12 @@ needed.
 
 See PR #2 for the numbers.
 
+**Deferred from the PR #2 code review (notes, not changes):**
+- `precomputed_reader.ts` has the reviewer's nits.
+- ONNX Runtime still loads from the jsDelivr CDN rather than being
+  bundled. Bundling would let it use ORT's own worker proxy, but it adds
+  ~20 MB to the build.
+
 **Round 4: scheduling (2026-11-25).**
 - Every result's `benchmark.timeline` says how long the GPU was idle and
   what it waited for.
