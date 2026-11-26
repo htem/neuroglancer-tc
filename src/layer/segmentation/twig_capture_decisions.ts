@@ -168,8 +168,11 @@ const CTR_VOXEL_NM = [8, 8, 45];
  */
 const CTR_VOXEL_NM_BY_DATASTACK: Record<string, readonly number[]> = {
   kronauer_ant: [8, 8, 42],
-  // FANC's EM base grid (4.3 x 4.3 x 45), what its Neuroglancer state uses.
-  fanc_production_mar2021: [4.3, 4.3, 45],
+  // FANC: 8.6 x 8.6 x 45, twice its native 4.3 nm EM like BANC's 8 nm on
+  // 4 nm; the agreed ctr grid, stated in the FANC decisions table's
+  // description (twigcapture banc-fragments 9396d37, be083f3). FANC stays
+  // out of DECISION_ALLOWLIST until that table exists.
+  fanc_production_mar2021: [8.6, 8.6, 45],
 };
 
 function ctrVoxels(nm: readonly number[], datastack?: string): string {
