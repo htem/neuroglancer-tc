@@ -251,6 +251,9 @@ class LRU<V> {
     }
     return v;
   }
+  clear() {
+    this.map.clear();
+  }
   set(k: string, v: V) {
     this.map.delete(k);
     this.map.set(k, v);
@@ -260,10 +263,58 @@ class LRU<V> {
   }
 }
 
+/**
+ * A Map without the engine's size limit. A JS Map holds at most 2^24
+ * (16,777,216) entries and then throws "RangeError: Map maximum size
+ * exceeded"; one long run (a 242-L2 Aedes neuron at level 2) passes that in
+ * supervoxels seen. Entries go into the newest of several Maps, a new one
+ * started every LARGE_MAP_SHARD entries, so the common small case is one
+ * Map and one lookup.
+ */
+export const LARGE_MAP_SHARD = 1 << 23;
+export class LargeMap<K, V> {
+  private maps: Map<K, V>[] = [new Map()];
+  constructor(private shard = LARGE_MAP_SHARD) {}
+  get size() {
+    let n = 0;
+    for (const m of this.maps) n += m.size;
+    return n;
+  }
+  get(k: K): V | undefined {
+    const ms = this.maps;
+    for (let i = ms.length - 1; i >= 0; --i) {
+      const v = ms[i].get(k);
+      if (v !== undefined || ms[i].has(k)) return v;
+    }
+    return undefined;
+  }
+  has(k: K): boolean {
+    for (const m of this.maps) if (m.has(k)) return true;
+    return false;
+  }
+  set(k: K, v: V): this {
+    for (const m of this.maps)
+      if (m.has(k)) {
+        m.set(k, v);
+        return this;
+      }
+    let last = this.maps[this.maps.length - 1];
+    if (last.size >= this.shard) this.maps.push((last = new Map()));
+    last.set(k, v);
+    return this;
+  }
+  clear() {
+    this.maps = [new Map()];
+  }
+}
+
 /** Shared table of uint64 ids for label-index volumes; index 0 is id 0. */
 export class IdTable {
   ids: bigint[] = [0n];
-  private index = new Map<bigint, number>([[0n, 0]]);
+  private index = new LargeMap<bigint, number>();
+  constructor() {
+    this.index.set(0n, 0);
+  }
   get(id: bigint): number {
     let i = this.index.get(id);
     if (i === undefined) {
@@ -281,7 +332,8 @@ export class PrecomputedVolume {
   readonly objectUrl: (path: string) => string;
   info!: VolumeInfo;
   scale!: ScaleInfo;
-  readonly idTable = new IdTable();
+  /** Replaced (with the chunk cache) by resetIds(); read it afresh each time. */
+  idTable = new IdTable();
   private chunks: LRU<Promise<Chunk | null>>;
   private shardIndex = new Map<string, Promise<Uint8Array>>();
   private minishards = new Map<
@@ -297,6 +349,18 @@ export class PrecomputedVolume {
   ) {
     this.objectUrl = objectUrlFn(url);
     this.chunks = new LRU(cacheChunks);
+  }
+
+  /**
+   * Forget every label index: a new id table and an empty chunk cache (the
+   * cached chunks hold indices into the old table). Only safe when no cutout
+   * is in flight, i.e. between runs; runTwigCapture calls it first, so the
+   * table no longer grows across a session's runs until it hits the Map
+   * limit (every region then failed, "Map maximum size exceeded").
+   */
+  resetIds() {
+    this.idTable = new IdTable();
+    this.chunks.clear();
   }
 
   init(): Promise<void> {

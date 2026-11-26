@@ -39,6 +39,7 @@ import type { MergeModel } from "#src/layer/segmentation/twig_inference/model.js
 import type { HostStats } from "#src/layer/segmentation/twig_inference/precomputed_reader.js";
 import {
   IdTable,
+  LargeMap,
   PrecomputedVolume,
   hostStats,
 } from "#src/layer/segmentation/twig_inference/precomputed_reader.js";
@@ -239,7 +240,7 @@ interface L2Attr {
 export class DatasetContext {
   readonly sv: PrecomputedVolume;
   readonly em: PrecomputedVolume;
-  readonly svRoot = new Map<bigint, bigint>();
+  readonly svRoot = new LargeMap<bigint, bigint>();
   readonly l2Count = new Map<string, number>();
   constructor(readonly dataset: TwigDataset) {
     gridOf(dataset); // throws if the EM is not 4x finer than the supervoxels
@@ -398,10 +399,12 @@ export async function runTwigCapture(
   };
   // Roots and partner sizes change with every edit, so they are cached for
   // one run only: a re-run after an edit must see today's segmentation.
-  // (ctx.sv's id table maps label indices to supervoxel ids, which never
-  // change, so it and the cached cutouts stay valid across runs.)
   ctx.svRoot.clear();
   ctx.l2Count.clear();
+  // Label indices from earlier runs are not needed again: start the id
+  // table (and the supervoxel chunk cache that refers to it) afresh, so it
+  // cannot fill up over a session (a JS Map caps at 2^24 entries).
+  ctx.sv.resetIds();
   const timer = new PhaseTimer();
   const tl = new Timeline();
   const hostsBefore = new Map(
@@ -491,7 +494,7 @@ export async function runTwigCapture(
   // Coverage (see coverageCentres): the L2 nodes this level searches, and
   // cells of their voxels that a region saw outside its search band.
   let keptL2 = new Set<bigint>();
-  const svL2 = new Map<bigint, bigint>();
+  const svL2 = new LargeMap<bigint, bigint>();
   let coverageCells = new Set<string>();
   let coverageRegions = 0;
   let coverageErrors = 0;
