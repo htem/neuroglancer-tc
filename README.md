@@ -1,13 +1,15 @@
 ## Twig Capture (this fork)
 
-![Twig Capture: an undertraced BANC neuron is queued in the Twig Selector, merge candidates are predicted in the browser, and the confident ones are staged for review](twig_capture_inference/docs/twig_selector_demo.gif)
+![Twig Capture: a small CRANTb neuron is queued in the Twig Selector, merge candidates are predicted in the browser, and 84 fragments are staged for review](twig_capture_inference/docs/twig_selector_crantb_small_neuron.gif)
 
 _Merge suggestions for undertraced neurons, predicted in your browser and
-reviewed in neuroglancer. Above, BANC SNpp47 has 100 L2 nodes against a
-median of 150 for its type. It is queued in the **Twig Selector**, and merges
-are predicted on this laptop's GPU in 13 min (real time on the clock; the GIF
-is a time-lapse). The 63 candidates at p ≥ 0.9 are staged in **Twig
-Capture**, ready for **Merge staged**._
+reviewed in neuroglancer. Above, CRANTb `576460752752552273` is a small
+neuron (177 L2 nodes). Merges are predicted on this laptop's GPU (the GIF is
+a time-lapse of about 70 min). The 85 candidates at p ≥ 0.75 are staged in
+**Twig Capture**; one tagged **large merge** is not part of the neuron and
+is unticked, and the other 84 fill in branches all along it, ready for
+**Merge staged**. An Aedes example is in
+[`twig_capture_inference/README.md`](twig_capture_inference/README.md)._
 
 | dataset | viewer                                               |
 | ------- | ---------------------------------------------------- |

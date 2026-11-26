@@ -1,23 +1,23 @@
 # Twig Capture: merge suggestions in the browser
 
-![Twig Selector demo: an undertraced BANC neuron (SNpp47) is queued, merges are predicted in the browser, and the confident candidates are staged for review](docs/twig_selector_demo.gif)
+![Twig Selector demo on Aedes: a small neuron is predicted in the browser, a large-merge suggestion is unticked, and 16 large fragments are staged](docs/twig_selector_aedes_small_neuron.gif)
 
-*BANC SNpp47 `720575941544177124` has 100 L2 nodes, against a median of 150
-for the 30 other neurons of its type. The neuron is queued in the **Twig
-Selector**, and merge candidates are predicted on this laptop's GPU. The
-clock shows real time: 13:05 for all 57 regions. The GIF is a time-lapse
-while the model runs. The 63 candidates at p ≥ 0.9 are then staged with
-**Stage all**. The cursor rests on **Merge staged** without clicking it.*
+*Aedes `648518347598210451`, a small neuron (166 L2 nodes). Merge candidates
+are predicted on this laptop's GPU at level 1: 107 regions in about 20
+minutes, 266 suggestions. The GIF is a time-lapse while the model runs. The
+17 at p ≥ 0.75 are staged with **Stage all**. One, tagged **large merge**,
+is a whole other neuron with its own soma, so it is unticked. The other 16
+add large pieces of the neuron's terminal arbor. The cursor rests on
+**Merge staged** without clicking it.*
 
-![Twig Selector demo on CRANTb: a neuron is queued, merges are predicted in the browser, and the confident candidates are staged for review](docs/twig_capture_crantb_demo.gif)
+![Twig Selector demo on CRANTb: a small neuron is predicted in the browser, a large-merge suggestion is unticked, and 84 fragments are staged](docs/twig_selector_crantb_small_neuron.gif)
 
-*CRANTb `576460752626597271` (410 L2 nodes), the same flow on the ant
-dataset. The neuron is queued in the **Twig Selector** and merge candidates
-are predicted on this laptop's GPU. The clock shows real time: 35:09 for all
-237 regions, 604 suggestions. The GIF is a time-lapse while the model runs.
-The 22 candidates at p ≥ 0.9 (pieces of up to 19 L2 nodes) are then staged
-with **Stage all**. The cursor rests on **Merge staged** without clicking
-it.*
+*CRANTb `576460752752552273` (177 L2 nodes), the same flow on the ant
+dataset: 120 regions in about 70 minutes, 958 suggestions. The 85 at
+p ≥ 0.75 are staged. One, tagged **large merge** (2,453 synapses), is a
+bushy mass that is not part of this neuron and is unticked. The other 84
+(3,872 synapses) fill in branches all along the neuron. The cursor rests on
+**Merge staged** without clicking it.*
 
 ## Links
 
