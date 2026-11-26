@@ -24,6 +24,15 @@ import { asyncComputation } from "#src/async_computation/index.js";
 
 export type ContactSites = Array<[number, [number, number, number]]>;
 
+export interface ContactSearch {
+  sites: ContactSites;
+  /**
+   * The pair has a one-voxel interface somewhere in the crop (the runner's
+   * pair_touches). When it does not, its sites came from the widened one.
+   */
+  touches: boolean;
+}
+
 export const twigContactSites = asyncComputation<
   (
     /** The candidate's crop of the label cutout, x fastest. */
@@ -38,5 +47,5 @@ export const twigContactSites = asyncComputation<
     fallbackGap: number | undefined,
     /** The crop's corner in the cutout, added to the centroids. */
     origin: [number, number, number],
-  ) => ContactSites
+  ) => ContactSearch
 >("twigContactSites");

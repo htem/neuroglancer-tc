@@ -31,29 +31,22 @@ registerAsyncComputation(
     fallbackGap,
     origin,
   ) => {
-    let sites = findContactSites(
-      lab,
-      shape,
-      target,
-      candidate,
-      minVoxels,
-      maxSites,
-      gap,
-      undefined,
-      origin,
-    );
-    if (!sites.length && fallbackGap !== undefined)
-      sites = findContactSites(
+    const find = (g: number) =>
+      findContactSites(
         lab,
         shape,
         target,
         candidate,
         minVoxels,
         maxSites,
-        fallbackGap,
+        g,
         undefined,
         origin,
       );
-    return { value: sites };
+    let sites = find(gap);
+    // gap 0 finds sites iff the pair has a one-voxel interface here.
+    const touches = gap === 0 ? sites.length > 0 : find(0).length > 0;
+    if (!sites.length && fallbackGap !== undefined) sites = find(fallbackGap);
+    return { value: { sites, touches } };
   },
 );

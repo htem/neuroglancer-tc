@@ -434,6 +434,46 @@ export async function runTwigCapture(
     string,
     SiteBuilt & { p: number; found: number; scored: number; hop: number }
   >();
+  // Every scored site of each pair, in the order scores were applied.
+  // GAP-NESS IS A PROPERTY OF THE PAIR (the runner's reduction): regions are
+  // decided apart, so a pair can touch in one and only gap in another. It is
+  // a gap pair only if no region saw it touch, and in "nontouching" mode a
+  // pair that touches anywhere keeps only its touching sites. `best` is
+  // that reduction over the sites so far: the first site with the highest
+  // p, as before (with gap 0 nothing is dropped, so it is unchanged).
+  const pairSites = new Map<
+    string,
+    { b: SiteBuilt; p: number; hop: number; gap: boolean }[]
+  >();
+  const pairFound = new Map<string, number>();
+  const kept = <T extends { gap: boolean }>(list: T[]): T[] => {
+    if (!gap) return list;
+    const touching = list.filter((x) => !x.gap);
+    return touching.length && gapMode === "nontouching" ? touching : list;
+  };
+  const applySite = (b: SiteBuilt, p: number, hop: number, found: number) => {
+    let list = pairSites.get(b.pair);
+    if (!list) pairSites.set(b.pair, (list = []));
+    list.push({ b, p, hop, gap: !!b.row.gap_contact });
+    pairFound.set(b.pair, Math.max(pairFound.get(b.pair) ?? 0, found));
+    const use = kept(list);
+    let top = use[0];
+    for (const x of use) if (x.p > top.p) top = x;
+    const isGap = gap > 0 && list.every((x) => x.gap);
+    best.set(b.pair, {
+      ...top.b,
+      row: { ...top.b.row, gap_contact: isGap },
+      p: top.p,
+      found: pairFound.get(b.pair)!,
+      scored: use.length,
+      hop: top.hop,
+    });
+  };
+  const gapSitesDropped = () => {
+    let n = 0;
+    for (const list of pairSites.values()) n += list.length - kept(list).length;
+    return n;
+  };
   const reject = (cand: string, why: string, extra: any = {}) => {
     if (rejectedOnce.has(cand)) return;
     rejectedOnce.add(cand);
@@ -696,7 +736,10 @@ export async function runTwigCapture(
     // only its crop: its box +- (2 + gap), clipped to the cutout, which is
     // exactly what findContactSites crops to itself, so the sites are the
     // same (offset back by the crop's corner).
-    const sitesFor = new Map<number, ReturnType<typeof findContactSites>>();
+    const sitesFor = new Map<
+      number,
+      { sites: ReturnType<typeof findContactSites>; touches: boolean }
+    >();
     const boxes = labelBoxes(rootLab, s, keepIds);
     const first = gapMode === "all" ? gap : 0;
     const fallback = gap > 0 && gapMode !== "all" ? gap : undefined;
@@ -705,7 +748,7 @@ export async function runTwigCapture(
       keepIds.map(async (l) => {
         const [blo, bhi] = boxes.get(l)!;
         if (bhi[0] < 0) {
-          sitesFor.set(l, []);
+          sitesFor.set(l, { sites: [], touches: false });
           return;
         }
         const lo = blo.map((v) => Math.max(0, v - margin));
@@ -724,7 +767,7 @@ export async function runTwigCapture(
               cs[0] * (y + cs[1] * z),
             );
           }
-        const sites = await requestAsyncComputation(
+        const found = await requestAsyncComputation(
           twigContactSites,
           signal,
           [crop.buffer],
@@ -738,7 +781,7 @@ export async function runTwigCapture(
           fallback,
           lo as [number, number, number],
         );
-        sitesFor.set(l, sites);
+        sitesFor.set(l, found);
       }),
     );
     timer.add("contacts", performance.now() - tCpu);
@@ -747,7 +790,7 @@ export async function runTwigCapture(
     // are scored is decided later, in region order (claims); this only
     // warms the cache, so the result cannot change. em_overflow sites are
     // skipped, as finishRegion skips them.
-    for (const sites of sitesFor.values())
+    for (const { sites } of sitesFor.values())
       for (const [, centroid] of sites) {
         const c = centroid.map((v) => Math.trunc(v));
         const e = [
@@ -811,7 +854,7 @@ export async function runTwigCapture(
         reject(candId, "candidate_l2", { ...stats, num_l2_nodes: nL2 });
         continue;
       }
-      const sites = prep.sitesFor.get(l)!;
+      const { sites, touches } = prep.sitesFor.get(l)!;
       if (!sites.length) {
         reject(candId, "no_contact", stats);
         continue;
@@ -877,7 +920,11 @@ export async function runTwigCapture(
             cand_voxels: stats.cand_voxels,
             // Found only because contact_gap_voxels widened the search: the
             // two do not touch at supervoxel resolution (as the runner).
-            gap_contact: stats.gap_contact,
+            // The runner's pair_touches: gap only if the pair has no
+            // one-voxel contact anywhere in this cutout (its bbox crop), not
+            // just in the centre box. Made pair-wide across regions when
+            // scores are applied (`applySite`).
+            gap_contact: gap > 0 && !touches,
             cand_size_um3: +(
               (stats.cand_voxels * svNm * svNm * zRes) /
               1e9
@@ -1016,18 +1063,14 @@ export async function runTwigCapture(
             patches.length = 0;
             prog.patches += scoreIdx.length;
             prog.msPerPatch = +(timer.ms.model / prog.patches).toFixed(1);
-            scoreIdx.forEach((i, k) => {
-              const b = built[i];
-              const prev = best.get(b.pair);
-              const scored = (prev?.scored ?? 0) + 1;
-              const found = Math.max(
-                prev?.found ?? 0,
-                foundPerPair.get(b.pair) ?? 0,
-              );
-              if (!prev || p[k] > prev.p)
-                best.set(b.pair, { ...b, p: p[k], found, scored, hop });
-              else Object.assign(prev, { found, scored });
-            });
+            scoreIdx.forEach((i, k) =>
+              applySite(
+                built[i],
+                p[k],
+                hop,
+                foundPerPair.get(built[i].pair) ?? 0,
+              ),
+            );
             prog.found = [...best.values()].filter(
               (b) => b.p > P.reportThreshold,
             ).length;
@@ -1205,6 +1248,8 @@ export async function runTwigCapture(
       prob_merge: +b.p.toFixed(4),
       contact_voxels: b.row.contact_voxels,
       cand_voxels: b.row.cand_voxels,
+      // Reviewed and re-thresholded too, so keep the flag (as the runner).
+      gap_contact: b.row.gap_contact ?? false,
     });
   }
 
@@ -1246,6 +1291,8 @@ export async function runTwigCapture(
     connectivity: 3,
     contact_gap_voxels: gap,
     contact_gap_mode: gapMode,
+    // Widened sites dropped because the pair touches in another region.
+    gap_sites_dropped_touching_pair: gapSitesDropped(),
     model_precision: model.precision,
     // Early stop: rows at or above this p may have unscored sites, so their
     // p is a lower bound. null when off.
