@@ -396,6 +396,12 @@ export async function runTwigCapture(
     patches: 0,
     found: 0,
   };
+  // Roots and partner sizes change with every edit, so they are cached for
+  // one run only: a re-run after an edit must see today's segmentation.
+  // (ctx.sv's id table maps label indices to supervoxel ids, which never
+  // change, so it and the cached cutouts stay valid across runs.)
+  ctx.svRoot.clear();
+  ctx.l2Count.clear();
   const timer = new PhaseTimer();
   const tl = new Timeline();
   const hostsBefore = new Map(
@@ -674,7 +680,8 @@ export async function runTwigCapture(
           try {
             ctx.l2Count.set(id, (await getLeavesL2(graph, id)).length);
           } catch {
-            ctx.l2Count.set(id, 0);
+            // Unknown, not 0: left uncached so a later region can retry, and
+            // a row without a size is flagged as a large or unknown merge.
           }
         }
       }),
@@ -795,8 +802,12 @@ export async function runTwigCapture(
     for (const l of cands) {
       const candId = String(rootTable.ids[l]);
       const stats = keep.get(l)!;
-      const nL2 = ctx.l2Count.get(candId) ?? 0;
-      if (nL2 > (opts.maxCandidateL2 ?? P.maxCandidateL2)) {
+      // undefined: the size lookup failed. Never treated as small.
+      const nL2 = ctx.l2Count.get(candId);
+      if (
+        nL2 !== undefined &&
+        nL2 > (opts.maxCandidateL2 ?? P.maxCandidateL2)
+      ) {
         reject(candId, "candidate_l2", { ...stats, num_l2_nodes: nL2 });
         continue;
       }
@@ -860,7 +871,8 @@ export async function runTwigCapture(
           row: {
             target_segment_id: candId,
             coordinate_nm: ctrNm,
-            num_l2_nodes: nL2,
+            num_l2_nodes: nL2 ?? null,
+            ...(nL2 === undefined ? { l2_unknown: true } : {}),
             contact_voxels: stats.contact_voxels,
             cand_voxels: stats.cand_voxels,
             // Found only because contact_gap_voxels widened the search: the
@@ -1173,6 +1185,15 @@ export async function runTwigCapture(
     for (const id of frontier) object.add(BigInt(id));
   }
 
+  // A pair rejected in one region (e.g. its window overflowed there) but
+  // scored in another is not a rejected pair: drop it from the rejection
+  // log and counts, so every pair is accounted for exactly once.
+  for (let k = rejectLog.length - 1; k >= 0; --k) {
+    const r = rejectLog[k];
+    if (!best.has(r.target_segment_id)) continue;
+    rejectLog.splice(k, 1);
+    if (--rejected[r.reason] === 0) delete rejected[r.reason];
+  }
   // Pairs that were scored but fall at or below the report threshold are not
   // rows; log them so the result accounts for every pair it looked at.
   for (const [id, b] of best) {
