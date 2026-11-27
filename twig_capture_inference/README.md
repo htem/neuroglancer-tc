@@ -19,6 +19,28 @@ bushy mass that is not part of this neuron and is unticked. The other 84
 (3,872 synapses) fill in branches all along the neuron. The cursor rests on
 **Merge staged** without clicking it.*
 
+**BANC.** Every BANC neuron with cluster results is large, so these two
+show the review tab on those results (model `banc_v2.0`) rather than a
+prediction in the browser. Neither neuron has been edited since its run.
+
+![Twig Capture on BANC: an FB2B_b neuron's cluster suggestions are filtered and 37 fragments are staged](docs/twig_capture_banc_fb2b.gif)
+
+*BANC FB2B_b `720575941536769512` (226 L2 nodes searched, 448
+suggestions). The **mito** filter is set to **hide mito**, and the 37
+remaining suggestions at p ≥ 0.75 (173 synapses, 9 with 5 or more L2
+nodes) are staged with **Stage all**. The view then zooms in on the
+dendrites, where most of them sit. The cursor rests on **Merge staged**
+without clicking it.*
+
+![Twig Capture on BANC: a Delta7 neuron with 1,030 cluster suggestions, 83 fragments staged](docs/twig_capture_banc_delta7.gif)
+
+*BANC Delta7 `720575941535847139` (403 L2 nodes searched, 1,030
+suggestions, 204 of them at p ≥ 0.75). With mito hidden, the 83 at
+p ≥ 0.8 are staged (240 synapses, up to 20 L2 nodes each). The list shows
+at most 100 rows, so a higher threshold keeps the whole set in one stage.
+The view zooms in on the arbour, where a large fragment (light blue) and
+many smaller ones are added. Nothing is merged.*
+
 ## Links
 
 | dataset | viewer |

@@ -8,7 +8,7 @@ neuron (177 L2 nodes). Merges are predicted on this laptop's GPU (the GIF is
 a time-lapse of about 70 min). The 85 candidates at p ≥ 0.75 are staged in
 **Twig Capture**; one tagged **large merge** is not part of the neuron and
 is unticked, and the other 84 fill in branches all along it, ready for
-**Merge staged**. An Aedes example is in
+**Merge staged**. Aedes and BANC examples are in
 [`twig_capture_inference/README.md`](twig_capture_inference/README.md)._
 
 | dataset | viewer                                               |
