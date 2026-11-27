@@ -1,0 +1,51 @@
+{
+ "title": "Twig Capture: BANC",
+ "dimensions": {
+  "x": [
+   8e-09,
+   "m"
+  ],
+  "y": [
+   8e-09,
+   "m"
+  ],
+  "z": [
+   4.5e-08,
+   "m"
+  ]
+ },
+ "position": [
+  53124.5,
+  11300.5,
+  3785.5
+ ],
+ "crossSectionScale": 1,
+ "projectionScale": 262144,
+ "layers": [
+  {
+   "type": "image",
+   "source": "precomputed://https://bossdb-open-data.s3.amazonaws.com/bates_phelps_kim_yang2025/banc/cns_001_alignment_aligned_v0",
+   "tab": "source",
+   "name": "em"
+  },
+  {
+   "type": "segmentation",
+   "source": "graphene://middleauth+https://cave.fanc-fly.com/segmentation/table/wclee_fly_cns_001",
+   "toolBindings": {
+    "M": "grapheneMergeSegments",
+    "C": "grapheneMulticutSegments",
+    "F": "grapheneFindPath"
+   },
+   "tab": "twigCapture",
+   "twigCapture": {
+    "catalogUrl": "https://radagast.hms.harvard.edu/twigcapture_banc/results/"
+   },
+   "name": "seg"
+  }
+ ],
+ "selectedLayer": {
+  "visible": true,
+  "layer": "seg"
+ },
+ "layout": "xy-3d"
+}

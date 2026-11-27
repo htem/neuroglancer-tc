@@ -179,10 +179,10 @@ jobs:
           - os: "windows-2025-vs2026"
             cibw_build: "*"
             wheel_identifier: "windows"
-          - os: "macos-14"
+          - os: "macos-15"
             cibw_build: "*_x86_64"
             wheel_identifier: "macos_x86_64"
-          - os: "macos-14"
+          - os: "macos-15"
             cibw_build: "*_arm64"
             wheel_identifier: "macos_arm64"
     runs-on: ${{ matrix.os }}
@@ -241,6 +241,7 @@ jobs:
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           enable-cache: false
+          python-version: "3.13"
       - name: Setup Graphviz
         uses: ts-graphviz/setup-graphviz@b1de5da23ed0a6d14e0aeee8ed52fdd87af2363c # v2.0.2
         with:

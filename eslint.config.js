@@ -20,6 +20,7 @@ export default tseslint.config(
       "lib",
       "**/python",
       "**/config",
+      "twig_capture_inference",
       "**/typings",
       "src/mesh/draco/stub.js",
       "**/tsconfig.tsbuildinfo",

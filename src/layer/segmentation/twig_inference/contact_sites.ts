@@ -1,0 +1,52 @@
+/**
+ * @license
+ * Copyright 2026 Google Inc.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { registerAsyncComputation } from "#src/async_computation/handler.js";
+import { twigContactSites } from "#src/layer/segmentation/twig_inference/contact_sites_request.js";
+import { findContactSites } from "#src/layer/segmentation/twig_inference/volume_ops.js";
+
+registerAsyncComputation(
+  twigContactSites,
+  async (
+    lab,
+    shape,
+    target,
+    candidate,
+    minVoxels,
+    maxSites,
+    gap,
+    fallbackGap,
+    origin,
+  ) => {
+    const find = (g: number) =>
+      findContactSites(
+        lab,
+        shape,
+        target,
+        candidate,
+        minVoxels,
+        maxSites,
+        g,
+        undefined,
+        origin,
+      );
+    let sites = find(gap);
+    // gap 0 finds sites iff the pair has a one-voxel interface here.
+    const touches = gap === 0 ? sites.length > 0 : find(0).length > 0;
+    if (!sites.length && fallbackGap !== undefined) sites = find(fallbackGap);
+    return { value: { sites, touches } };
+  },
+);

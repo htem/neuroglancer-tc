@@ -1,3 +1,40 @@
+## Twig Capture (this fork)
+
+![Twig Capture: a small CRANTb neuron is queued in the Twig Selector, merge candidates are predicted in the browser, and 84 fragments are staged for review](twig_capture_inference/docs/twig_selector_crantb_small_neuron.gif)
+
+_Merge suggestions for undertraced neurons, predicted in your browser and
+reviewed in neuroglancer. Above, CRANTb `576460752752552273` is a small
+neuron (177 L2 nodes). Merges are predicted on this laptop's GPU (the GIF is
+a time-lapse of about 70 min). The 85 candidates at p ≥ 0.75 are staged in
+**Twig Capture**; one tagged **large merge** is not part of the neuron and
+is unticked, and the other 84 fill in branches all along it, ready for
+**Merge staged**. Aedes and BANC examples are in
+[`twig_capture_inference/README.md`](twig_capture_inference/README.md)._
+
+| dataset | viewer                                               |
+| ------- | ---------------------------------------------------- |
+| BANC    | https://radagast.hms.harvard.edu/twigcapture_banc/   |
+| Aedes   | https://radagast.hms.harvard.edu/twigcapture_aedes/  |
+| CRANTb  | https://radagast.hms.harvard.edu/twigcapture_crantb/ |
+
+How it works:
+
+1. Select a neuron (or several) and open the **Twig Selector** tab.
+2. **Add visible segments**, or point at a neuron and press **Alt+T**, then
+   **Run**. The model runs on your GPU, or your CPU if there is none. Results
+   are cached in your browser.
+3. **Open in Twig Capture** to review the suggestions:
+   - one at a time, with **Merge**, **Not a merge**, **Unsure**, **New neuron**
+     or **Split needed**;
+   - or in bulk, with **Stage all → Merge staged**.
+
+   Verdicts are recorded in the dataset's CAVE `twig_capture_decisions` table.
+
+Guide: [`twig_capture_inference/README.md`](twig_capture_inference/README.md).
+How it works and what was measured: [`twig_capture_inference/BRIEF.md`](twig_capture_inference/BRIEF.md).
+
+---
+
 ## Neuroglancer: Web-based volumetric data visualization
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)

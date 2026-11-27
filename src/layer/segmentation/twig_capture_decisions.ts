@@ -16,8 +16,25 @@
  *
  *   pt    bound point on the NEURON    position in NANOMETRES
  *   pt2   bound point on the ORPHAN
- *   tag   merge | no_merge | unsure
+ *   tag   merge | no_merge | unsure | new_neuron | split_needed
+ *
+ *         The last two are about ONE side of the pair, named in tag2 by
+ *         cell=<root id at review>;side=sink|source; the cell is at pt (sink)
+ *         or pt2 (source). In a neuron-first result the sink is the neuron
+ *         under review and the source the candidate. In an orphan-first
+ *         result (run_twigcapture_v2_orph.py) the sink is the growing SEED and
+ *         the source the candidate.
+ *
+ *         new_neuron    that cell is a whole neuron of its own, so the two
+ *                       must not be merged. Training: a no_merge. Annotation:
+ *                       a new cell for the dataset's table (and backbone
+ *                       proofread) at that side's point. Neuron-first: only
+ *                       the candidate can be it.
+ *         split_needed  that cell contains a false merge to resolve before
+ *                       this pair can be judged. Either side. Training: left
+ *                       out, like unsure. Not staged by Stage all.
  *   tag2  src=<result file stem>;cand=<target_segment_id>;ctr=<x,y,z>[;op=<id>]
+ *         [;cell=<root id>;side=sink|source]   (new_neuron, split_needed)
  *
  * `ctr` is in 8 x 8 x 45 nm VOXELS while pt/pt2 are nm. Different units, on
  * purpose, and the table description says so.
@@ -68,7 +85,29 @@ export const DECISION_ALLOWLIST: readonly string[] = [
   "https://cave.fanc-fly.com/segmentation/table/wclee_fly_cns_001",
   // Aedes -- twig_capture_decisions created 2026-10-06
   "https://cave.fanc-fly.com/segmentation/table/wclee_aedes_brain",
+  // CRANTb (kronauer_ant) -- twig_capture_decisions created by
+  // twigcapture branch crantb, scripts/cave/create_twig_capture_tables.py
+  // --dataset crantb. Leave this entry out of a deployment until that table
+  // exists: without it the writer has nowhere to post.
+  "https://data.proofreading.zetta.ai/segmentation/table/kronauer_ant_x1",
+  // FANC (fanc_production_mar2021) -- twig_capture_decisions created
+  // 2026-11-27 (twigcapture scripts/cave/create_twig_capture_tables.py
+  // --dataset fanc --create), ctr grid 8.6 x 8.6 x 45.
+  "https://cave.fanc-fly.com/segmentation/table/mar2021_prod",
 ];
+
+/**
+ * Annotation tables live under the datastack's ALIGNED VOLUME, which is
+ * usually named after the datastack but not always: FANC's is fanc_v4.
+ * Posting to aligned_volume/fanc_production_mar2021 would fail.
+ */
+const ALIGNED_VOLUME_BY_DATASTACK: Record<string, string> = {
+  fanc_production_mar2021: "fanc_v4",
+};
+
+export function alignedVolume(datastack: string): string {
+  return ALIGNED_VOLUME_BY_DATASTACK[datastack] ?? datastack;
+}
 
 /**
  * May decisions be recorded for a layer with these data source URLs?
@@ -87,7 +126,24 @@ export function decisionsAllowed(urls: readonly string[]): boolean {
   return false;
 }
 
-export type Verdict = "merge" | "no_merge" | "unsure";
+export type Verdict =
+  | "merge"
+  | "no_merge"
+  | "unsure"
+  | "new_neuron"
+  | "split_needed";
+
+/** Verdicts about one side of the pair; they carry cell= and side=. */
+export const SIDED_VERDICTS: readonly Verdict[] = [
+  "new_neuron",
+  "split_needed",
+];
+
+/** Verdicts that say "do not join these two": no_merge, and new_neuron (the
+ * orphan is a neuron of its own, so it is also not part of this one). */
+export function isNotAMerge(tag: string | undefined): boolean {
+  return tag === "no_merge" || tag === "new_neuron";
+}
 
 export interface DecisionRow {
   id: number;
@@ -109,13 +165,31 @@ export interface DecisionTarget {
   cand: string;
   /** The result file stem, <root_id>_<timestamp>. */
   src: string;
+  /** Sided verdicts only: which side is meant, and its root id at review. */
+  cell?: { side: "sink" | "source"; root: string };
 }
 
 /** The voxel grid `ctr` is written in -- what you paste into Neuroglancer. */
 const CTR_VOXEL_NM = [8, 8, 45];
 
-function ctrVoxels(nm: readonly number[]): string {
-  return nm.map((v, i) => Math.floor(v / CTR_VOXEL_NM[i])).join(",");
+/**
+ * Per-datastack exceptions to CTR_VOXEL_NM. CRANTb's sections are 42 nm, so
+ * its 8 x 8 x 45 grid would put every ctr z ~7% off the section a reviewer
+ * would paste it into.
+ */
+const CTR_VOXEL_NM_BY_DATASTACK: Record<string, readonly number[]> = {
+  kronauer_ant: [8, 8, 42],
+  // FANC: 8.6 x 8.6 x 45, twice its native 4.3 nm EM like BANC's 8 nm on
+  // 4 nm; the agreed ctr grid, stated in the FANC decisions table's
+  // description (twigcapture banc-fragments 9396d37, be083f3).
+  fanc_production_mar2021: [8.6, 8.6, 45],
+};
+
+function ctrVoxels(nm: readonly number[], datastack?: string): string {
+  const grid =
+    (datastack !== undefined && CTR_VOXEL_NM_BY_DATASTACK[datastack]) ||
+    CTR_VOXEL_NM;
+  return nm.map((v, i) => Math.floor(v / grid[i])).join(",");
 }
 
 /** Pull `cand=...` out of a tag2 string. Empty when absent. */
@@ -210,9 +284,15 @@ export class DecisionStore {
     const parts = [
       `src=${target.src}`,
       `cand=${target.cand}`,
-      `ctr=${ctrVoxels(target.coordinate_nm)}`,
+      `ctr=${ctrVoxels(target.coordinate_nm, this.datastack)}`,
     ];
     if (op !== undefined && op !== "") parts.push(`op=${op}`);
+    if (SIDED_VERDICTS.includes(verdict)) {
+      if (target.cell === undefined) {
+        throw new Error(`a ${verdict} decision must say which side it means`);
+      }
+      parts.push(`cell=${target.cell.root}`, `side=${target.cell.side}`);
+    }
 
     const body = {
       annotations: [
@@ -225,7 +305,7 @@ export class DecisionStore {
       ],
     };
     const url =
-      `${this.server}/annotation/api/v2/aligned_volume/${this.datastack}` +
+      `${this.server}/annotation/api/v2/aligned_volume/${alignedVolume(this.datastack)}` +
       `/table/${TABLE}/annotations`;
     const response = await fetch(url, {
       method: "POST",
@@ -254,17 +334,65 @@ export class DecisionStore {
    * When a candidate has been reviewed more than once the LATEST row wins.
    */
   async fetchForNeuron(rootId: string): Promise<Map<string, DecisionRow>> {
+    // Built by hand, not JSON.stringify: rootId is above 2^53 and would be
+    // rounded if it ever became a JS number.
+    return this.fetchRows(
+      `,"filter_equal_dict":{"${TABLE}":{"pt_root_id":${rootId}}}`,
+    );
+  }
+
+  /**
+   * Every decision in the table, keyed by candidate id, latest winning --
+   * for the all-neurons view, which lists candidates of every neuron at once.
+   * One query: the tables hold tens of thousands of rows at most (Aedes,
+   * 2026-11-20: ~27k).
+   */
+  async fetchAll(): Promise<Map<string, DecisionRow>> {
+    return this.fetchRows("");
+  }
+
+  /**
+   * Rows of any table in this datastack, from the live query endpoint, as of
+   * `timestamp`. `extra` is a JSON fragment (`,"filter_in_dict":...`) built
+   * by hand, so 64-bit ids are never rounded. 16+ digit numbers in the reply
+   * come back as strings for the same reason.
+   */
+  async liveQuery(
+    table: string,
+    timestamp: string,
+    extra: string,
+    signal?: AbortSignal,
+  ): Promise<any[]> {
+    const url =
+      `${this.server}/materialize/api/v3/datastack/${this.datastack}/query` +
+      "?return_pyarrow=false&arrow_format=false&merge_reference=false" +
+      "&allow_missing_lookups=true";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: await this.headers(),
+      body: `{"table":"${table}","timestamp":"${timestamp}"${extra}}`,
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(
+        `CAVE query on ${table} failed (${response.status}): ` +
+          (await caveError(response)),
+      );
+    }
+    const text = await response.text();
+    return JSON.parse(text.replace(/(:\s*)(\d{16,})/g, '$1"$2"'));
+  }
+
+  private async fetchRows(filter: string): Promise<Map<string, DecisionRow>> {
     const url =
       `${this.server}/materialize/api/v3/datastack/${this.datastack}/query` +
       "?return_pyarrow=false&arrow_format=false&merge_reference=false" +
       "&allow_missing_lookups=true&direct_sql_pandas=true";
 
-    // Built by hand, not JSON.stringify: rootId is above 2^53 and would be
-    // rounded if it ever became a JS number.
     const body =
       `{"table":"${TABLE}",` +
-      `"timestamp":"${new Date().toISOString()}",` +
-      `"filter_equal_dict":{"${TABLE}":{"pt_root_id":${rootId}}}}`;
+      `"timestamp":"${new Date().toISOString()}"` +
+      `${filter}}`;
 
     const response = await fetch(url, {
       method: "POST",

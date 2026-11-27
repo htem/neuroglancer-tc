@@ -298,3 +298,100 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* All-neurons view: which neuron a row would join. Muted, since it repeats. */
+.neuroglancer-twig-capture-tag-neuron {
+  opacity: 0.7;
+  font-family: monospace;
+}
+
+/* All-neurons view: the next-page button under the list. */
+.neuroglancer-twig-capture-more {
+  display: block;
+  width: 100%;
+  margin: 6px 0;
+}
+
+/* v1.2: SeaTable neuron filters, a second filter row. */
+.neuroglancer-twig-capture-neuron-filters {
+  border-top: 1px dotted #444;
+  padding-top: 2px;
+}
+.neuroglancer-twig-capture-neuron-head {
+  font-weight: bold;
+  opacity: 0.8;
+}
+.neuroglancer-twig-capture-neuron-filters select {
+  max-width: 11em;
+}
+.neuroglancer-twig-capture-neuron-count {
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+/* v1.2: Stage all -> Merge staged. */
+.neuroglancer-twig-capture-stagebox {
+  margin: 0 4px 0 0;
+  cursor: pointer;
+}
+.neuroglancer-twig-capture-row-unstaged {
+  opacity: 0.45;
+}
+.neuroglancer-twig-capture-stage-note {
+  border-left: 3px solid #c90;
+  padding-left: 6px;
+}
+
+/* v1.3: the staged row whose fragment the mouse points at in the 3D view. */
+.neuroglancer-twig-capture-row-hover {
+  outline: 2px solid #fc6;
+  outline-offset: -2px;
+  background: rgba(255, 204, 102, 0.16);
+}
+
+/* One-cell verdicts (new neuron, split needed): a line under the row with a
+   group per cell -- the cell's role and id, then the buttons about it -- so
+   it is never a question which end of the suggested merge a button marks. */
+.neuroglancer-twig-capture-sides {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 0 2px 2px 0;
+}
+.neuroglancer-twig-capture-side {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.neuroglancer-twig-capture-side-label {
+  font-family: monospace;
+  opacity: 0.8;
+  margin-right: 2px;
+}
+
+/* Orphan-first chains (run_twigcapture_v2_orph.py).
+   A hop whose ancestry a reviewer has already rejected is dimmed rather than
+   hidden: the row still has to explain why it stopped mattering, and hiding
+   it would make the chain look shorter than it was. */
+.neuroglancer-twig-capture-row-blocked {
+  opacity: 0.45;
+}
+.neuroglancer-twig-capture-row-blocked .neuroglancer-twig-capture-id {
+  text-decoration: line-through;
+}
+
+/* A chain hop. The tee makes the parent relationship explicit: indentation
+   alone cannot distinguish two hops at the same depth on different branches. */
+.neuroglancer-twig-capture-row-chain {
+  border-left: 1px solid #3a3a3a;
+}
+.neuroglancer-twig-capture-chain-tee {
+  color: #8a8a8a;
+  font-family: monospace;
+  margin-right: 2px;
+}
+
+/* In-browser results, level 2+: a suggestion that attaches to an earlier one. */
+.neuroglancer-twig-capture-tag-hop {
+  background: #2a3a4a;
+}

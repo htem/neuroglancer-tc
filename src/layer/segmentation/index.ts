@@ -37,6 +37,20 @@ import { layerDataSourceSpecificationFromJson } from "#src/layer/layer_data_sour
 import * as json_keys from "#src/layer/segmentation/json_keys.js";
 import { registerLayerControls } from "#src/layer/segmentation/layer_controls.js";
 import {
+  MVB_REVIEW_JSON_KEY,
+  MvbReviewState,
+} from "#src/layer/segmentation/mvb_review_tab.js";
+import {
+  TWIG_CAPTURE_JSON_KEY,
+  TwigCaptureState,
+  TwigCaptureTab,
+} from "#src/layer/segmentation/twig_capture_tab.js";
+import { LocalTwigResults } from "#src/layer/segmentation/twig_local_results.js";
+import {
+  TwigSelectorState,
+  TwigSelectorTab,
+} from "#src/layer/segmentation/twig_selector_tab.js";
+import {
   MeshLayer,
   MeshSource,
   MultiscaleMeshLayer,
@@ -73,11 +87,6 @@ import type {
   SegmentationGraphSource,
   SegmentationGraphSourceConnection,
 } from "#src/segmentation_graph/source.js";
-import {
-  TWIG_CAPTURE_JSON_KEY,
-  TwigCaptureState,
-  TwigCaptureTab,
-} from "#src/layer/segmentation/twig_capture_tab.js";
 import { SegmentationGraphSourceTab } from "#src/segmentation_graph/source.js";
 import { SharedDisjointUint64Sets } from "#src/shared_disjoint_sets.js";
 import { SharedWatchableValue } from "#src/shared_watchable_value.js";
@@ -629,6 +638,12 @@ const Base = UserLayerWithAnnotationsMixin(UserLayer);
 export class SegmentationUserLayer extends Base {
   /** Shareable Twig Capture state; see TwigCaptureState. */
   twigCapture = new TwigCaptureState();
+  /** Shareable MVB review state (queue URL, current object); see MvbReviewState. */
+  mvbReview = new MvbReviewState();
+  /** Twig Capture results computed in this browser (IndexedDB-backed). */
+  localTwigResults = new LocalTwigResults();
+  /** Twig Selector queue and settings; per browser, never serialised. */
+  twigSelector = new TwigSelectorState(this);
   sliceViewRenderScaleHistogram = new RenderScaleHistogram();
   sliceViewRenderScaleTarget = trackableRenderScaleTarget(1);
   codeVisible = new TrackableBoolean(true);
@@ -766,10 +781,19 @@ export class SegmentationUserLayer extends Base {
     // tab is built lazily below and so may never exist, while the layer must
     // serialise regardless. See TwigCaptureState for what it holds and why.
     this.twigCapture.changed.add(this.specificationChanged.dispatch);
+    this.mvbReview.changed.add(this.specificationChanged.dispatch);
     this.tabs.add("twigCapture", {
       label: "Twig Capture",
       order: -20,
       getter: () => new TwigCaptureTab(this),
+      hidden: hideGraphTab,
+    });
+    // In-browser Twig Capture: choose objects, run the merge model locally,
+    // results appear in the Twig Capture tab.
+    this.tabs.add("twigSelector", {
+      label: "Twig Selector",
+      order: -19,
+      getter: () => new TwigSelectorTab(this),
       hidden: hideGraphTab,
     });
     this.tabs.default = "rendering";
@@ -918,6 +942,7 @@ export class SegmentationUserLayer extends Base {
                 this.localPosition,
               );
               this.graphConnection.value = graphConnection;
+              this.bindDefaultGraphTools();
               for (const renderLayer of graphRenderLayers) {
                 loadedSubsource.addRenderLayer(renderLayer);
               }
@@ -1031,9 +1056,34 @@ export class SegmentationUserLayer extends Base {
     return specs;
   }
 
+  /**
+   * Spelunker's proofreading shortcuts, so that this build behaves like the
+   * CAVE viewers people already use: M merge, C multicut (split), F find
+   * path. Spelunker carries them as per-layer toolBindings in its links; a
+   * graphene layer added here by hand, or opened from a link without them,
+   * gets the same keys. A key already bound -- by the link, by the user, or
+   * by another layer -- is left alone.
+   */
+  private bindDefaultGraphTools() {
+    const isGraphene = this.dataSources.some((ds) =>
+      ds.spec.url.startsWith("graphene://"),
+    );
+    if (!isGraphene) return;
+    const binder = this.toolBinder;
+    for (const [key, tool] of [
+      ["M", "grapheneMergeSegments"],
+      ["C", "grapheneMulticutSegments"],
+      ["F", "grapheneFindPath"],
+    ]) {
+      if (binder.globalBinder.get(key) !== undefined) continue;
+      binder.setJson(key, tool);
+    }
+  }
+
   restoreState(specification: any) {
     super.restoreState(specification);
     this.twigCapture.restoreState(specification[TWIG_CAPTURE_JSON_KEY]);
+    this.mvbReview.restoreState(specification[MVB_REVIEW_JSON_KEY]);
     this.displayState.selectedAlpha.restoreState(
       specification[json_keys.SELECTED_ALPHA_JSON_KEY],
     );
@@ -1144,6 +1194,8 @@ export class SegmentationUserLayer extends Base {
     }
     const twig = this.twigCapture.toJSON();
     if (twig !== undefined) x[TWIG_CAPTURE_JSON_KEY] = twig;
+    const mvb = this.mvbReview.toJSON();
+    if (mvb !== undefined) x[MVB_REVIEW_JSON_KEY] = mvb;
     x[json_keys.EQUIVALENCES_JSON_KEY] =
       this.displayState.originalSegmentationGroupState.localGraph.toJSON();
     if (linkedSegmentationGroup.root.value === this) {
@@ -1174,6 +1226,20 @@ export class SegmentationUserLayer extends Base {
       case "clear-segments": {
         if (!this.pick.value) break;
         this.displayState.segmentationGroupState.value.visibleSegments.clear();
+        break;
+      }
+      case "twig-predict": {
+        // Alt+T: the neuron under the mouse (else every visible one) into
+        // the Twig Selector, and run. Only the selected layer answers, so
+        // one keypress never queues the same neuron on several layers.
+        if (this.manager.root.selectedLayer.layer?.layer !== this) break;
+        const { segmentSelectionState } = this.displayState;
+        const roots = segmentSelectionState.hasSelectedSegment
+          ? [String(segmentSelectionState.selectedSegment)]
+          : [
+              ...this.displayState.segmentationGroupState.value.visibleSegments,
+            ].map(String);
+        void this.twigSelector.predictFromHotkey(roots);
         break;
       }
       case "select":

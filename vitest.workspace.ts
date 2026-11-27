@@ -16,6 +16,7 @@
 
 import path from "node:path";
 import mswPlugin from "@iodigital/vite-plugin-msw";
+import type { Plugin } from "vite";
 import type { ViteUserConfig } from "vitest/config";
 import { defineWorkspace, mergeConfig } from "vitest/config";
 import { getFakeGcsServerBin } from "./build_tools/vitest/build_fake_gcs_server.js";
@@ -36,6 +37,25 @@ const commonDefines: Record<string, string> = {
 };
 
 const browserDefines = { ...commonDefines };
+
+// Vitest 3.2 browser mode rewrites every dynamic `import()` into
+// `__vitest_browser_runner__.wrapDynamicImport(...)`. It defines that global in
+// workers only when Vite tags them `?worker_file`, which our `*.bundle.js`
+// workers (started with `new Worker(new URL(...))`) are not, so e.g. the zstd
+// decoder's `import("numcodecs/zstd")` throws inside the worker. Define the same
+// pass-through shim at the top of each worker bundle.
+const workerDynamicImportShim: Plugin = {
+  name: "neuroglancer:vitest-worker-dynamic-import-shim",
+  transform(code, id) {
+    if (!/\/src\/[^/]+\.bundle\.js(?:\?|$)/.test(id)) return;
+    return {
+      code:
+        "globalThis.__vitest_browser_runner__ ??= { wrapDynamicImport: (f) => f() };\n" +
+        code,
+      map: null,
+    };
+  },
+};
 const nodeDefines = {
   FAKE_GCS_SERVER_BIN: JSON.stringify(fakeGcsServerBin),
   ...commonDefines,
@@ -104,7 +124,10 @@ export default defineWorkspace([
     esbuild: {
       target: "es2022",
     },
-    plugins: [mswPlugin({ mode: "browser", handlers: [] })],
+    plugins: [
+      mswPlugin({ mode: "browser", handlers: [] }),
+      workerDynamicImportShim,
+    ],
     optimizeDeps: {
       entries: [
         "src/**/*.browser_test.ts",

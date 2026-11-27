@@ -1,0 +1,51 @@
+{
+ "title": "Twig Capture: CRANTb",
+ "dimensions": {
+  "x": [
+   8e-09,
+   "m"
+  ],
+  "y": [
+   8e-09,
+   "m"
+  ],
+  "z": [
+   4.2e-08,
+   "m"
+  ]
+ },
+ "position": [
+  8316.5,
+  24044.5,
+  4375.5
+ ],
+ "crossSectionScale": 1,
+ "projectionScale": 262144,
+ "layers": [
+  {
+   "type": "image",
+   "source": "precomputed://gs://dkronauer-ant-001-alignment-final/aligned",
+   "tab": "source",
+   "name": "em"
+  },
+  {
+   "type": "segmentation",
+   "source": "graphene://middleauth+https://data.proofreading.zetta.ai/segmentation/table/kronauer_ant_x1",
+   "toolBindings": {
+    "M": "grapheneMergeSegments",
+    "C": "grapheneMulticutSegments",
+    "F": "grapheneFindPath"
+   },
+   "tab": "twigCapture",
+   "twigCapture": {
+    "catalogUrl": "https://radagast.hms.harvard.edu/twigcapture_crantb/results/"
+   },
+   "name": "seg"
+  }
+ ],
+ "selectedLayer": {
+  "visible": true,
+  "layer": "seg"
+ },
+ "layout": "xy-3d"
+}

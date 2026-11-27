@@ -62,6 +62,21 @@ describe("TwigCaptureState legacy links", () => {
     expect(() => restored("a string")).not.toThrow();
   });
 
+  it("defaults gap to any, and ignores junk", () => {
+    expect(restored({ hideMito: true }).gap).toBe("any");
+    expect(restored({ gap: "nonsense" }).gap).toBe("any");
+    expect(restored({ gap: "only" }).gap).toBe("only");
+  });
+
+  it("round-trips gap through toJSON, and omits it at any", () => {
+    const s = new TwigCaptureState();
+    expect(s.toJSON()).toBeUndefined();
+    s.gap = "hide";
+    const t = new TwigCaptureState();
+    t.restoreState(s.toJSON());
+    expect(t.gap).toBe("hide");
+  });
+
   it("round-trips the new facets through toJSON", () => {
     const s = new TwigCaptureState();
     s.mito = "only";
@@ -75,5 +90,37 @@ describe("TwigCaptureState legacy links", () => {
 
   it("emits nothing for an untouched tab", () => {
     expect(new TwigCaptureState().toJSON()).toBeUndefined();
+  });
+
+  it("round-trips probOp, and leaves it out at the default", () => {
+    const s = new TwigCaptureState();
+    expect(s.probOp).toBe(">=");
+    s.probOp = "<=";
+    const json = s.toJSON()!;
+    expect(json.probOp).toBe("<=");
+    expect(restored(json).probOp).toBe("<=");
+    s.probOp = ">=";
+    expect(s.toJSON()).toBeUndefined();
+  });
+
+  it("reads links without probOp, or with junk, as >=", () => {
+    expect(restored({ minProb: 0.5 }).probOp).toBe(">=");
+    expect(restored({ probOp: "<" }).probOp).toBe(">=");
+  });
+});
+
+describe("TwigCaptureState neuron filters", () => {
+  it("round-trips set filters and omits empty ones", () => {
+    const s = new TwigCaptureState();
+    expect(s.toJSON()).toBeUndefined();
+    s.neuron = { super_class: "descending", flow: "" };
+    expect(s.toJSON()).toEqual({ neuron: { super_class: "descending" } });
+    expect(restored(s.toJSON()).neuron).toEqual({ super_class: "descending" });
+  });
+  it("drops unknown fields and non-string values", () => {
+    expect(
+      restored({ neuron: { super_class: 3, bogus: "x", status: "OK" } }).neuron,
+    ).toEqual({ status: "OK" });
+    expect(restored({ neuron: "descending" }).neuron).toEqual({});
   });
 });
