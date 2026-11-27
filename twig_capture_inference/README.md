@@ -48,7 +48,7 @@ many smaller ones are added. Nothing is merged.*
 | BANC | https://radagast.hms.harvard.edu/twigcapture_banc/ |
 | Aedes | https://radagast.hms.harvard.edu/twigcapture_aedes/ |
 | CRANTb | https://radagast.hms.harvard.edu/twigcapture_crantb/ |
-| FANC | https://radagast.hms.harvard.edu/twigcapture_fanc/ (in-browser only, see below) |
+| FANC | https://radagast.hms.harvard.edu/twigcapture_fanc/ (new, see below) |
 
 Each link opens its dataset, with the Twig Capture tab connected to the
 cluster results of that dataset's newest model, served beside the viewer
@@ -64,10 +64,18 @@ filters). Today: BANC `banc_v2.0` (banc_finetune 2026-11-13), Aedes
 `crantb_test_aedes_v2.1`. When a newer model's results land, relink the
 folder and re-run both scripts.
 
-**FANC** (`fanc_production_mar2021`) is new and in-browser only for now:
-- **No cluster results yet** (no `results_fanc/`), so the viewer opens on
-  the Twig Selector, and the Twig Capture tab lists only what you predict
-  in this browser.
+**FANC** (`fanc_production_mar2021`) is new:
+- **Cluster results** (`results_fanc/` -> `twig_capture/fanc_v1`): 297
+  proofread FANC neurons (in `proofread_first_pass` or
+  `proofread_second_pass`), drawn from the cell-info table
+  `neuron_information` by twigcapture `scripts/fanc/select_inference_neurons.py`:
+  150 central (50 ascending, 50 descending, 50 other), 80 sensory, 60 motor
+  and 7 efferent non-motor, each 50-1,500 L2 nodes. Run on O2 CPUs with
+  the joint model (`joint_finetune_20261123_105038` ep8), threshold 0.05.
+  The list and its labels are `inference_v1.txt` / `.csv` in that folder.
+  Neuron filters come from `neuron_information` (identity, primary class,
+  hemilineage), proofreading status from the two proofread tables, and
+  flow from primary class (ascending / descending from the projection tag).
 - **Decisions are recorded.** FANC's `twig_capture_decisions` table was
   created on 2026-11-27 (twigcapture
   `scripts/cave/create_twig_capture_tables.py --dataset fanc --create`), and

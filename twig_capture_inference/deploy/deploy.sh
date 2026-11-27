@@ -7,8 +7,8 @@
 #   https://radagast.hms.harvard.edu/twigcapture_crantb/
 #   https://radagast.hms.harvard.edu/twigcapture_fanc/
 #
-# FANC has no cluster results yet (no results_fanc/ to link), so its Twig
-# Capture tab starts empty and the viewer opens on the Twig Selector.
+# FANC's cluster results are results_fanc -> twig_capture/fanc_v1 (297
+# proofread neurons, joint model); like the others it opens on Twig Capture.
 #
 # One build, copied into each folder with that folder's default_state.json
 # (a link with no state opens the folder's dataset; see
