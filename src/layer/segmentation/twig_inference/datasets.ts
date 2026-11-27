@@ -125,8 +125,7 @@ export const TWIG_DATASETS: TwigDataset[] = [
     note:
       "FANC has no 32 nm supervoxel mip: cutouts are at 34.4 nm and EM at " +
       "8.6 nm, so the model sees ~7.5% more tissue per patch than it was " +
-      "trained on (no FANC training data yet). There is no " +
-      "twig_capture_decisions table on FANC yet, so verdicts cannot be saved.",
+      "trained on (no FANC training data yet).",
   },
 ];
 

@@ -68,14 +68,13 @@ folder and re-run both scripts.
 - **No cluster results yet** (no `results_fanc/`), so the viewer opens on
   the Twig Selector, and the Twig Capture tab lists only what you predict
   in this browser.
-- **No `twig_capture_decisions` table on FANC yet.** Creating it (twigcapture
-  `scripts/cave/create_twig_capture_tables.py --dataset fanc --create`)
-  awaits approval. Until it exists, FANC is left out of the decisions
-  allowlist (`twig_capture_decisions.ts`). The review tab then hides the
-  verdict buttons (**Not a merge**, **Unsure**, **New neuron**, **Split
-  needed**) and the review filter, and writes nothing to CAVE. **Merge** and
-  **Stage all → Merge staged** still work: they are ordinary chunkedgraph
-  merges, just not recorded as decisions.
+- **Decisions are recorded.** FANC's `twig_capture_decisions` table was
+  created on 2026-11-27 (twigcapture
+  `scripts/cave/create_twig_capture_tables.py --dataset fanc --create`), and
+  FANC is on the decisions allowlist (`twig_capture_decisions.ts`), so the
+  verdict buttons work as on the other datasets. `ctr` is written on an
+  8.6 × 8.6 × 45 nm grid. FANC's aligned volume is `fanc_v4`, not its
+  datastack name, so the writer maps it (`alignedVolume`).
 - **Resolution.** FANC has no 32 nm supervoxel mip, so it runs at 34.4 nm
   (supervoxels) and 8.6 nm (EM), keeping the model's 1:4 ratio. Each patch
   therefore covers about 7.5% more tissue than in training, and no model has

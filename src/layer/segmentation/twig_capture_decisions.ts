@@ -90,13 +90,24 @@ export const DECISION_ALLOWLIST: readonly string[] = [
   // --dataset crantb. Leave this entry out of a deployment until that table
   // exists: without it the writer has nowhere to post.
   "https://data.proofreading.zetta.ai/segmentation/table/kronauer_ant_x1",
-  // FANC (fanc_production_mar2021, table mar2021_prod) is deliberately NOT
-  // listed: it has no twig_capture_decisions table yet. Creating one
-  // (twigcapture scripts/cave/create_twig_capture_tables.py --dataset fanc
-  // --create) awaits approval; add
-  //   "https://cave.fanc-fly.com/segmentation/table/mar2021_prod"
-  // here only after it exists.
+  // FANC (fanc_production_mar2021) -- twig_capture_decisions created
+  // 2026-11-27 (twigcapture scripts/cave/create_twig_capture_tables.py
+  // --dataset fanc --create), ctr grid 8.6 x 8.6 x 45.
+  "https://cave.fanc-fly.com/segmentation/table/mar2021_prod",
 ];
+
+/**
+ * Annotation tables live under the datastack's ALIGNED VOLUME, which is
+ * usually named after the datastack but not always: FANC's is fanc_v4.
+ * Posting to aligned_volume/fanc_production_mar2021 would fail.
+ */
+const ALIGNED_VOLUME_BY_DATASTACK: Record<string, string> = {
+  fanc_production_mar2021: "fanc_v4",
+};
+
+export function alignedVolume(datastack: string): string {
+  return ALIGNED_VOLUME_BY_DATASTACK[datastack] ?? datastack;
+}
 
 /**
  * May decisions be recorded for a layer with these data source URLs?
@@ -170,8 +181,7 @@ const CTR_VOXEL_NM_BY_DATASTACK: Record<string, readonly number[]> = {
   kronauer_ant: [8, 8, 42],
   // FANC: 8.6 x 8.6 x 45, twice its native 4.3 nm EM like BANC's 8 nm on
   // 4 nm; the agreed ctr grid, stated in the FANC decisions table's
-  // description (twigcapture banc-fragments 9396d37, be083f3). FANC stays
-  // out of DECISION_ALLOWLIST until that table exists.
+  // description (twigcapture banc-fragments 9396d37, be083f3).
   fanc_production_mar2021: [8.6, 8.6, 45],
 };
 
@@ -295,7 +305,7 @@ export class DecisionStore {
       ],
     };
     const url =
-      `${this.server}/annotation/api/v2/aligned_volume/${this.datastack}` +
+      `${this.server}/annotation/api/v2/aligned_volume/${alignedVolume(this.datastack)}` +
       `/table/${TABLE}/annotations`;
     const response = await fetch(url, {
       method: "POST",
